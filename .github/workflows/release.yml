@@ -125,7 +125,7 @@ jobs:
                    so-guard/nc_guard_paths.c so-guard/nc_guard_probe.c \
                    so-guard/nc_guard_layout.h so-guard/so-section-lock.py \
                    fixtures/sample.c fixtures/sample.apk example/run.sh; do
-            unzip -l "$Z" | grep -q "nox-${{ steps.ver.outputs.version }}/$f" \
+            unzip -l "$Z" | grep -q "nox/$f" \
               || { echo "✗ 包内缺: $f"; exit 1; }
           done
           echo "✔ 必需文件齐全"
@@ -147,7 +147,7 @@ jobs:
           T=$(mktemp -d)
           cd "$T"
           unzip -q "$GITHUB_WORKSPACE/dist/nox-${{ steps.ver.outputs.version }}.zip"
-          cd "nox-${{ steps.ver.outputs.version }}"
+          cd nox
           ./test.sh
 
           # 再用临时用户代码验一次完整链路
