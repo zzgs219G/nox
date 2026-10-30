@@ -106,10 +106,18 @@ _host_arch() {
     esac
 }
 _static_lib() {
-    for c in "$ROOT/lib/$(_host_arch)/libnox.a" \
-             "$ROOT/lib/arm64-v8a/libnox.a" \
-             "$ROOT/lib/libnox.a"; do
-        [ -f "$c" ] && { echo "$c"; return; }
+    # ⚠️ 只接受【与宿主架构匹配】的 .a（实测踩过）：
+    #    在 x86-64 runner 上回落到 lib/arm64-v8a/libnox.a 会导致
+    #        V1 编译失败（库是 AArch64，编译目标是 x86-64）
+    #    正确行为是"没有匹配的就改用源码"，而不是硬凑一个架构不对的。
+    local h; h=$(_host_arch)
+    for c in "$ROOT/lib/$h/libnox.a" "$ROOT/lib/libnox.a"; do
+        [ -f "$c" ] || continue
+        local m
+        m=$(readelf -h "$c" 2>/dev/null | grep -m1 Machine | sed 's/ *Machine: *//')
+        case "$h:$m" in
+            x86_64:*X86-64*|aarch64:*AArch64*|arm:*ARM*) echo "$c"; return ;;
+        esac
     done
 }
 _LIB=$(_static_lib)
