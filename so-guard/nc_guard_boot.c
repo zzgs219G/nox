@@ -24,6 +24,17 @@
  * 历史：本文件取代 nc_guard_unlock.c（后者已移入 archive/，逐条过期，
  *   不参与任何构建）。
  */
+/* ⚠️ 跨平台：Linux（glibc）下 Dl_info / dladdr 是 GNU 扩展，必须先定义
+ *    _GNU_SOURCE 才可见；Android 的 bionic 默认暴露它们，所以本文件
+ *    在 Termux / NDK 上一直编译通过，到 Ubuntu CI 才炸：
+ *        error: use of undeclared identifier 'Dl_info'
+ *    这是典型的"本地永远绿的"盲区，靠 CI 在别的环境跑一次才暴露。
+ *    必须写在【任何头文件之前】——glibc 的 feature_test_macros 只认
+ *    第一次 include 时的定义。 */
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE 1
+#endif
+
 #include <elf.h>
 #include <dlfcn.h>
 #include <fcntl.h>
