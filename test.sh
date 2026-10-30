@@ -92,10 +92,31 @@ echo ""
 #    → 加密段从 5 个剩 1 个。
 GUARD_LINK=""
 GUARD_INC=""
-if [ -f "$ROOT/lib/libnox.a" ] && [ ! -f "$ROOT/so-guard/nc_guard_boot.c" ]; then
-    GUARD_LINK="__WHOLE__$ROOT/lib/libnox.a"
+# ⚠️ 按【宿主架构】选 .a，不能无脑用 lib/libnox.a（实测踩过）：
+#    发布包里的 lib/libnox.a 是 CI runner 编的 x86-64，而用户在
+#    aarch64 上跑必然失败：
+#        is incompatible with aarch64linux
+#    nox 已按 ABI 分目录，这里保持一致：优先 lib/<宿主架构>/。
+_host_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo x86_64 ;;
+        aarch64|arm64) echo aarch64 ;;
+        armv7l|armv8l) echo arm ;;
+        *) uname -m ;;
+    esac
+}
+_static_lib() {
+    for c in "$ROOT/lib/$(_host_arch)/libnox.a" \
+             "$ROOT/lib/arm64-v8a/libnox.a" \
+             "$ROOT/lib/libnox.a"; do
+        [ -f "$c" ] && { echo "$c"; return; }
+    done
+}
+_LIB=$(_static_lib)
+if [ -n "$_LIB" ] && [ ! -f "$ROOT/so-guard/nc_guard_boot.c" ]; then
+    GUARD_LINK="__WHOLE__$_LIB"
     GUARD_INC="-I$ROOT/so-guard"
-    GUARD_MODE="静态库 lib/libnox.a"
+    GUARD_MODE="静态库 ${_LIB#$ROOT/}"
 else
     GUARD_INC="-I."
     GUARD_MODE="源码 so-guard/*.c"

@@ -97,6 +97,9 @@ echo ""
 echo "自查（对方链接时这些符号可见）："
 nm "$OUTDIR/libnox.a" 2>/dev/null | grep -c " T \| D " | sed 's/^/  全局符号数: /'
 echo ""
+# 中间产物不留在包里
+rm -rf "$OUTDIR/bld"
+
 echo "对方这样用："
 echo "  clang -fPIC -shared -Oz your.c \\"
 echo "        -Wl,--whole-archive $OUTDIR/libnox.a -Wl,--no-whole-archive \\"
