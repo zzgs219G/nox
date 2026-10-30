@@ -113,29 +113,97 @@ jobs:
           chmod +x make-zip.sh
           ./make-zip.sh "${{ steps.ver.outputs.version }}"
 
+      - name: 生成静态库
+        run: |
+          chmod +x make-static-lib.sh
+          ./make-static-lib.sh host
+
+      - name: 打包
+        run: |
+          chmod +x make-zip.sh
+          ./make-zip.sh "${{ steps.ver.outputs.version }}"
+
       - name: 校验包内容
         run: |
           # 防止"包是空的"或"漏了关键文件"这类静默失败
           Z="dist/nox-${{ steps.ver.outputs.version }}.zip"
           test -f "$Z" || { echo "✗ 包不存在"; exit 1; }
           echo "包大小: $(stat -c%s "$Z") 字节"
+          # 默认形态：静态库分发。关键文件里应有 .a、不该有 .c
           for f in nox test.sh README.md QUICKSTART.md \
-                   so-guard/nc_guard_boot.c so-guard/so-section-lock.py \
+                   lib/libnox.a \
+                   so-guard/nc_guard_layout.h \
+                   so-guard/so-section-lock.py \
                    fixtures/sample.c fixtures/sample.apk example/run.sh; do
             unzip -l "$Z" | grep -q "nox-${{ steps.ver.outputs.version }}/$f" \
               || { echo "✗ 包内缺: $f"; exit 1; }
           done
           echo "✔ 关键文件齐全"
 
-      - name: 冒烟测试（解压后能否零参数自测）
+          # ── 断言：静态库形态下，设施 .c 源码不得出现在包里 ──
+          # 目的：防止有人误开 SOURCE_MODE 把源码发出去。
+          # 注意这是【分发策略】检查，不是安全保证 ——
+          # Python 工具仍是源码（无法二进制化），锁箱格式始终公开。
+          BAD=$(unzip -l "$Z" \
+                | grep -E "so-guard/nc_guard_(boot|key|paths|probe)\.c$" || true)
+          if [ -n "$BAD" ]; then
+            echo "✗ 包内含加密设施的 C 源码（应为静态库形态）:"
+            echo "$BAD"
+            echo "  若确需发源码，请显式设 SOURCE_MODE=1 并在提交信息里说明理由。"
+            exit 1
+          fi
+          echo "✔ 未含加密设施 C 源码（静态库形态正确）"
+
+      - name: 冒烟测试（解压后能否零参数自测 + 静态库可用）
         run: |
-          # 这一步是"包真的能用"的唯一证据：在干净目录解压并跑自测。
-          # 不跑这一步的话，打包脚本漏文件也发现不了。
+          # 两步：① 包内 fixture 自测  ② 用包里的 .a 编一个业务 so
+          # ② 是"静态库形态真的可用"的唯一证据。不做的话，
+          #    .a 内容错误或参数漏写 --whole-archive 都发现不了。
           T=$(mktemp -d)
           cd "$T"
           unzip -q "$GITHUB_WORKSPACE/dist/nox-${{ steps.ver.outputs.version }}.zip"
           cd "nox-${{ steps.ver.outputs.version }}"
+
+          echo "── ① fixture 自测 ──"
           ./test.sh
+
+          echo "── ② 用包内 .a 编译并加密 ──"
+          cat > user.c <<'EOF'
+          __attribute__((section(".ncx"), used, retain))
+          int my_secret(int a) { return (a ^ 0x5A) * 3; }
+          __attribute__((visibility("default")))
+          int demo_call(int a) { return my_secret(a); }
+          EOF
+          # --use-static-lib：用 la 而非源码（包的默认形态）
+          ./nox protect user.c --use-static-lib \
+                  --apk fixtures/sample.apk --package com.nox.ci \
+                  -o libuser.so
+
+          # 断言产物含 .ncx 段，且确实是用 .a 链出来的（没带源码也能成）
+          readelf -SW libuser.so | grep -q '\.ncx ' \
+            || { echo "✗ 产物缺 .ncx 段"; exit 1; }
+          echo "✔ 静态库链接成功，产物含加密段"
+
+          # 运行验证：解密后代码要算得对
+          cat > drv.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int c, char **v) {
+              void *h = dlopen(v[1], RTLD_NOW);
+              if (!h) { printf("FAIL:%s\n", dlerror()); return 2; }
+              int (*f)(int) = dlsym(h, "demo_call");
+              if (!f) { printf("NOSYM\n"); return 3; }
+              printf("%d\n", f(0));
+              return 0;
+          }
+          EOF
+          clang drv.c -o drv -ldl
+          mkdir -p run/com.nox.ci/lib/arm64-v8a
+          cp libuser.so run/com.nox.ci/lib/arm64-v8a/libt.so
+          cp fixtures/sample.apk run/com.nox.ci/base.apk
+          GOT=$( cd run/com.nox.ci && bash -c "exec -a com.nox.ci '$T/nox-${{ steps.ver.outputs.version }}/drv' ./lib/arm64-v8a/libt.so" 2>/dev/null )
+          [ "$GOT" = "270" ] || { echo "✗ 运行结果: '$GOT'（期望 270）"; exit 1; }
+          echo "✔ 静态库产物可正常解锁并执行（值=270）"
 
       - name: 生成校验和
         run: |

@@ -14,10 +14,12 @@
 #   test.sh             自测
 #   README.md           使用说明
 #
-# ⚠️ 本包【包含 C 源码】。若要不暴露实现，把 so-guard/*.c 换成预编译的
-#    .o 并改 nox 的 GUARD_SRCS —— 但注意实测结论：给 .a 必须配
-#    -Wl,--whole-archive，否则没被引用的成员会被链接器整个丢弃
-#    （实测：35464 字节 → 5368 字节，加密段从 5 个剩 1 个）。
+# ⚠️ 分发形态：默认用 lib/libnox.a（预编译静态库），不发 C 源码。
+#    这么做是有取舍的：
+#      · C 实现藏住了（拿不到 .c）
+#      · Python 工具仍是源码（无法二进制化），所以锁箱格式仍公开
+#      · .a 与编译器版本绑定，对方必须用匹配的 clang
+#    用 SOURCE_MODE=1 可改回发源码（给要改代码的人）。
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
@@ -37,8 +39,25 @@ chmod +x "$STAGE/nox"
 
 # ── 设施源码 ──
 mkdir -p "$STAGE/so-guard"
-cp so-guard/*.c so-guard/*.h so-guard/*.py "$STAGE/so-guard/"
-rm -rf "$STAGE/so-guard/__pycache__"
+if [ "${SOURCE_MODE:-0}" = "1" ]; then
+    echo "分发形态: 源码（SOGURCE_MODE=1）"
+    cp so-guard/*.c so-guard/*.h so-guard/*.py "$STAGE/so-guard/"
+    rm -rf "$STAGE/so-guard/__pycache__"
+    # 源码模式也要带 .a，方便不想编的人
+    if [ -f lib/libnox.a ]; then cp lib/libnox.a "$STAGE/lib/"; fi
+else
+    echo "分发形态: 静态库（C 源码不外泄）"
+    # 只发头文件（.ncx/.ncxr 标记需要）+ Python 工具 + .a
+    cp so-guard/*.h "$STAGE/so-guard/"
+    cp so-guard/*.py "$STAGE/so-guard/"
+    rm -rf "$STAGE/so-guard/__pycache__"
+    if [ ! -f lib/libnox.a ]; then
+        echo "  lib/libnox.a 不存在，先跑 ./make-static-lib.sh"
+        ./make-static-lib.sh host >/dev/null 2>&1 || true
+    fi
+    mkdir -p "$STAGE/lib"
+    cp lib/libnox.a "$STAGE/lib/"
+fi
 
 # ── 样本与示例 ──
 mkdir -p "$STAGE/fixtures"

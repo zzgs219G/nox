@@ -39,6 +39,9 @@ GUARD_SRCS = [
     'nc_guard_paths.c',    # 路径密文表
 ]
 
+# 预编译的静态库（若存在，优先用它而非源码，见 --use-static-lib）
+STATIC_LIB = os.path.join(HERE, 'lib', 'libnox.a')
+
 # 生产构建参数。逐个说明，因为任何一个漏掉都会让防护失效或产物不可用：
 #   -fPIC              共享库必须
 #   -shared            产出 .so
@@ -138,8 +141,29 @@ def do_build(args, workdir):
     with open(vs, 'w') as f:
         f.write(VERSION_SCRIPT)
 
-    cmd = [clang] + extra + CFLAGS_BASE + ['-I', GUARD]
-    cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+    cmd = [clang] + extra + CFLAGS_BASE
+
+    use_lib = getattr(args, 'use_static_lib', False)
+    if use_lib:
+        if not os.path.isfile(STATIC_LIB):
+            die('--use-static-lib 指定了静态库，但 %s 不存在。\n'
+                '  先执行: ./make-static-lib.sh 生成它。' % STATIC_LIB)
+        # ⚠️ --whole-archive 不能省：
+        #   静态库只链接「被引用」的成员，而 nc_guard_boot.o 无人直接
+        #   调用（入口是 constructor），会被整个丢弃 → 加密段从 5 个
+        #   剩 1 个，连 ncguard_unlock 都没了。实测：
+        #       不加：35464 字节 → 5368 字节，段 5→1
+        #       加了：正常
+        cmd += ['-Wl,--whole-archive', STATIC_LIB,
+                '-Wl,--no-whole-archive']
+        # 头文件仍需能找到（.ncxr 等标记用）
+        cmd += ['-I', GUARD]
+        where = '静态库 %s' % os.path.basename(STATIC_LIB)
+    else:
+        cmd += ['-I', GUARD]
+        cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+        where = '源码 %d 个 .c' % len(GUARD_SRCS)
+
     cmd += [os.path.abspath(s) for s in args.sources]
     cmd += LDFLAGS_BASE
     if not args.no_version_script:
@@ -149,7 +173,8 @@ def do_build(args, workdir):
         cmd += args.link.split()
     cmd += ['-o', out_so]
 
-    print('[1/1] 编译 %d 个源文件 → %s' % (len(args.sources), os.path.basename(out_so)))
+    print('[1/1] 编译 %d 个源文件 + %s → %s'
+          % (len(args.sources), where, os.path.basename(out_so)))
     run(cmd)
     if not os.path.isfile(out_so):
         die('编译声称成功但产物不存在: %s' % out_so)
@@ -305,6 +330,9 @@ def main():
         p.add_argument('--link', help='额外的链接参数，如 "-llog"')
         p.add_argument('--no-version-script', action='store_true',
                        help='不生成 version script（调试用；生产不要加）')
+        p.add_argument('--use-static-lib', action='store_true',
+                       help='链接预编译的 libnox.a 而非源码（C 实现不外泄，'
+                            '但 ABI 必须与 NDK/编译器匹配）')
 
     p_protect = sub.add_parser('protect', help='编译 + 加密（一条命令）')
     common(p_protect)
