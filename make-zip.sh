@@ -106,6 +106,7 @@ chmod +x "$STAGE/example/run.sh"
 cp test.sh "$STAGE/"
 chmod +x "$STAGE/test.sh"
 cp README.md "$STAGE/"
+cp AGENTS.md "$STAGE/"   # AI 接手维护时的必读契约
 
 # ── 包内单独的快速上手说明 ──
 cat > "$STAGE/QUICKSTART.md" <<'EOF'
