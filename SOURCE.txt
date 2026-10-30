@@ -1,0 +1,14 @@
+来源仓库: apk-protect-action
+来源提交: ed72a40 docs(so-guard): 独立化改造计划（供监督方审查）
+来源路径: scripts/so-guard/
+同步日期: 2026-10-30
+
+文件校验（sha256）:
+fb2ef73a50562efb91730f33242abfe6660b2592f3a01c773da9c354589b0210  nc_guard_boot.c
+b00108fcb458d2dc85a476123f41719bd6af371f4c12e1a6b1af75fba08c3797  nc_guard_jni.c
+83bb4a85686ba1dd304830860f8c8b2f2ba72a7498bfffeff3f7fc5233cc1ee0  nc_guard_key.c
+40d23267882df9494e2cd4ff21cc9c5d0dc6a422868110c7839c6119fce0966f  nc_guard_probe.c
+e2161482ad61665ca18165d5a325efe4c397e7ac039287b6da4c7779754ee139  nc_guard_key.h
+1d9914805d8bb8253d4fc8b3aa08d679479f89ac9b61fa679cae28544523a2bb  nc_guard_layout.h
+8c3c6764575ff029a60c62d9bf54e28131e4b0253c27197901abb257a46f8cd0  so-section-lock.py
+2aaacd8a2fb79a981a9929774f17c7d603a04e96ca2f49195fd1402c36b424c0  so_section_mark.py
