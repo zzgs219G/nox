@@ -22,18 +22,25 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
 
 APK="${1:-}"
+SAMPLE_C="$ROOT/fixtures/sample.c"
 LOCK="$ROOT/so-guard/so-section-lock.py"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $*"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ✗ $*"; }
 skip() { echo "  ⚠ $*（跳过）"; }
 
-if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-    echo "用法: ./test.sh <已签名APK>"
-    echo ""
-    echo "需要一个真实 APK 的原因：密钥由它的证书派生，"
-    echo "没有 APK 就无法验证解密链路（V6 会跳过，其他项仍可跑）。"
-    exit 1
+# 未传参时自动用仓库内的 fixture（专用测试包，与任何真实发布包无关）
+if [ -z "$APK" ]; then
+    APK="$ROOT/fixtures/sample.apk"
+    if [ ! -f "$APK" ]; then
+        echo "缺少 $APK，先生成："
+        echo "  python3 fixtures/make-fixture-apk.py fixtures/sample.apk"
+        exit 1
+    fi
+    echo "（未指定 APK，使用 fixtures/sample.apk）"
+fi
+if [ ! -f "$APK" ]; then
+    echo "✗ APK 不存在: $APK"; exit 1
 fi
 if ! command -v clang >/dev/null 2>&1; then
     echo "✗ 缺 clang，无法测试"; exit 1
@@ -43,14 +50,23 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 
 # 测试用的业务代码：一个函数进加密段，一个不进
-cat > "$W/biz.c" <<'EOF'
-#include <stdint.h>
-/* 要被保护的：加标记，进 .ncx 段 */
-__attribute__((section(".ncx"), used, retain, visibility("default")))
-int secret_calc(int a) { return (a ^ 0x5A) * 3; }
-/* 不保护的：留在 .text */
+# 业务代码用 fixtures/sample.c（与文档示例同一份，避免"文档与测试不一致"）
+if [ ! -f "$SAMPLE_C" ]; then
+    echo "✗ 缺 $SAMPLE_C"; exit 1
+fi
+cp "$SAMPLE_C" "$W/biz.c"
+# sample.c 里的函数没加 visibility("default")（那是对的——纯内部函数不该
+# 导出，否则函数名会留在 .dynstr 里被 strings 扫到）。
+# 但测试要用 dlsym 拿函数指针来验证"解密后的代码算得对"，
+# 故额外附加一个仅测试用的导出表，不动 sample.c 本身。
+cat >> "$W/biz.c" <<'EOF'
+
+/* ── 以下仅测试用：把内部函数暴露成可 dlsym 的符号 ──
+ * 生产代码不需要这一段。 */
 __attribute__((visibility("default")))
-int plain_calc(int a) { return a + 1; }
+int test_call_secret_calc(int a) { return secret_calc(a); }
+__attribute__((visibility("default")))
+int test_call_plain_add(int a, int b) { return plain_add(a, b); }
 EOF
 
 echo "=== nox 自测（$(basename "$APK")）==="
@@ -90,7 +106,12 @@ fi
 # ── V3 锁箱：.ncx 必须变成密文 ──
 echo "── V3 锁箱（代码段加密）──"
 cd "$W" || exit 2
-if python3 "$LOCK" raw.so l1.so --section .ncx --from-apk "$APK" >l1.log 2>&1; then
+# ⚠️ fixture APK 的 AndroidManifest 是最小占位（无 string pool），
+#    无法解析包名。故显式传 --package；真实 APK 可不传（自动从 AXML 解析）。
+#    包名必须与运行期 /proc/self/cmdline 取到的一致，否则 fail-closed(-12)。
+PKG_FIX="com.nox.fixture"
+if python3 "$LOCK" raw.so l1.so --section .ncx --from-apk "$APK" \
+        --package "$PKG_FIX" >l1.log 2>&1; then
     ok "V3 一级锁箱成功"
     ENTR=$(python3 - <<'PY'
 import struct, math
@@ -177,12 +198,7 @@ EOF
         if clang drv.c -o drv -ldl 2>/dev/null; then
             # 包名：运行期从 /proc/self/cmdline 取并截到首个 ":"，
             # 假目录名必须与真实包名一致，否则 fail-closed(-12)
-            PKG=$(python3 -c "
-import importlib.util
-spec=importlib.util.spec_from_file_location('lock','$LOCK')
-m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-print(m.manifest_package('$APK'))
-" 2>/dev/null)
+            PKG="$PKG_FIX"
             if [ -n "$PKG" ]; then
                 mkdir -p "fake/$PKG/lib/arm64-v8a"
                 cp "$APK" "fake/$PKG/base.apk"
@@ -209,10 +225,10 @@ int main(int c, char **v) {
     if (!h) return 2;
     int (*u)(void) = dlsym(h, "ncguard_unlock");
     if (u) u();
-    int (*s)(int) = dlsym(h, "secret_calc");
-    int (*p)(int) = dlsym(h, "plain_calc");
+    int (*s)(int) = dlsym(h, "test_call_secret_calc");
+    int (*p)(int,int) = dlsym(h, "test_call_plain_add");
     if (!s || !p) { printf("NOSYM\n"); return 3; }
-    int a = s(0), b = p(0);
+    int a = s(0), b = p(0, 1);
     printf("%d %d\n", a, b);
     return 0;
 }
