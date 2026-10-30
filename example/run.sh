@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # run.sh — 完整演示：编译 → 加密 → 验证效果
 #
 # 用法：

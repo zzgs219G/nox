@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # test.sh — nox 自测（不需要外部项目，不需要编造数据）
 #
 # 用法：
