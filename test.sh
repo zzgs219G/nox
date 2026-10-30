@@ -59,18 +59,56 @@ cp "$SAMPLE_C" "$W/biz.c"
 # 导出，否则函数名会留在 .dynstr 里被 strings 扫到）。
 # 但测试要用 dlsym 拿函数指针来验证"解密后的代码算得对"，
 # 故额外附加一个仅测试用的导出表，不动 sample.c 本身。
-cat >> "$W/biz.c" <<'EOF'
+# ⚠️ 测试壳必须放在【独立编译单元】里（实测踩过两次）：
+#   ① 不加 noinline → -Oz 把 secret_calc 整个内联进壳，壳变成明文实现，
+#      调壳永远成功，篡改也测不出来（假绿）
+#   ② 加了 noinline 仍不够 → 同一个 TU 内编译器照样跨函数内联，实测
+#      编译产物里仍是 `mov w8,#0x5a; eor; add; ret`，没有 bl
+#   只有拆到另一个 .c（这里用 extern 声明 + 单独编译）才会真正
+#   在链接期解析到 .ncx 里的实现，产物是 `b <secret_calc@plt>`。
+cat > "$W/tshell.c" <<'EOF'
+/* 仅测试用：把加密段里的函数暴露成可 dlsym 的符号。
+ * extern 声明 + 独立 TU，确保不被内联。生产代码不需要这一段。 */
+extern int secret_calc(int a);
+extern int plain_add(int a, int b);
 
-/* ── 以下仅测试用：把内部函数暴露成可 dlsym 的符号 ──
- * 生产代码不需要这一段。 */
-__attribute__((visibility("default")))
+__attribute__((visibility("default"), noinline))
 int test_call_secret_calc(int a) { return secret_calc(a); }
-__attribute__((visibility("default")))
+
+__attribute__((visibility("default"), noinline))
 int test_call_plain_add(int a, int b) { return plain_add(a, b); }
 EOF
 
 echo "=== nox 自测（$(basename "$APK")）==="
 echo ""
+
+# ── 设施链接方式（2026-10-30）──────────────────────────────────
+# 分发包默认只带 lib/libnox.a（不含设施 .c），而源码仓库有 .c。
+# 两种布局都要能测，否则"包内自测"在发布形态下必然失败
+# （实测踩过：CI 里 V1 报 no such file or directory: nc_guard_boot.c）。
+#
+# ⚠️ 用 .a 时必须加 --whole-archive：静态库只链接被引用的成员，
+#    而 nc_guard_boot.o 的入口是 constructor，无人显式调用 → 整个丢弃
+#    → 加密段从 5 个剩 1 个。
+GUARD_LINK=""
+GUARD_INC=""
+if [ -f "$ROOT/lib/libnox.a" ] && [ ! -f "$ROOT/so-guard/nc_guard_boot.c" ]; then
+    GUARD_LINK="__WHOLE__$ROOT/lib/libnox.a"
+    GUARD_INC="-I$ROOT/so-guard"
+    GUARD_MODE="静态库 lib/libnox.a"
+else
+    GUARD_INC="-I."
+    GUARD_MODE="源码 so-guard/*.c"
+fi
+# 展开成 clang 能吃的形式（--whole-archive 必须包住 .a 路径）
+clang_guard() {
+    if [ -n "$GUARD_LINK" ]; then
+        printf '%s\n%s\n%s' "-Wl,--whole-archive" "${GUARD_LINK#__WHOLE__}" "-Wl,--no-whole-archive"
+    else
+        printf '%s\n' nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c
+    fi
+}
+echo "设施链接方式: $GUARD_MODE"
 
 # ── V1 编译（只拷本目录的源文件，不加任何外部代码）──
 echo "── V1 独立编译 ──"
@@ -78,9 +116,9 @@ cp "$ROOT"/so-guard/*.c "$ROOT"/so-guard/*.h "$W"/ 2>/dev/null
 cd "$W" || exit 2
 # ⚠️ 测试不做 -fvisibility=hidden：那会把 ncguard_unlock 藏进 hidden，
 #    dlsym 拿不到，无法验证解锁链路。生产构建才需要 hidden（见 README）。
-if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I. \
-        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
-        biz.c -o raw.so 2>build.log; then
+# shellcheck disable=SC2046
+if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
+        $(clang_guard) biz.c tshell.c -o raw.so 2>build.log; then
     ok "V1 编译通过（$(stat -c%s raw.so) B）"
 else
     bad "V1 编译失败"; head -15 build.log; echo; echo "结果: $PASS 通过, $FAIL 失败"; exit 1
@@ -174,24 +212,45 @@ d = bytearray(open(p,'rb').read())
 sh = struct.unpack('<Q', d[0x28:0x30])[0]; es = struct.unpack('<H', d[0x3a:0x3c])[0]
 en = struct.unpack('<H', d[0x3c:0x3e])[0]; si = struct.unpack('<H', d[0x3e:0x40])[0]
 so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+# ⚠️ 改段【中间】而不是段首：段首可能是别的函数（实测踩过 ——
+#    改首字节不影响被测试的 secret_calc，于是篡改"没生效"，
+#    V5 假绿）。改中间必落在某个函数体内。
 for i in range(en):
     o = sh + i*es; no = struct.unpack('<I', d[o:o+4])[0]
     nm = d[so+no: d.index(b'\0', so+no)].decode()
     if nm == '.ncx':
         fo = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
-        d[fo] ^= 0x01      # 改密文第一个字节
+        sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
+        d[fo + sz // 2] ^= 0x01     # 改段中点
         break
 open(p,'wb').write(d)
 PY
         # 用 dlopen 验证：篡改后应解锁失败
+        # ⚠️ 不通过 dlsym("ncguard_unlock") 判断解锁结果：
+        #    该符号在静态库形态下是 GLOBAL HIDDEN（编译 .a 时用了
+        #    -fvisibility=hidden），dlsym 必然拿不到 —— 而那是【正确的】
+        #    生产行为，外部本来就不该调它。
+        #    改判据：dlopen 后能否取到加密段里的业务符号。
+        #    解锁成功 → .ncx 已解成明文 → 函数可被 dlsym 到；
+        #    解锁失败 → 段仍是密文 → 调用会 SIGILL / 取不到。
         cat > drv.c <<'EOF'
 #include <dlfcn.h>
 #include <stdio.h>
 int main(int c, char **v) {
     void *h = dlopen(v[1], RTLD_NOW);
     if (!h) { printf("NOOPEN\n"); return 0; }
-    int (*u)(void) = dlsym(h, "ncguard_unlock");
-    printf("%d\n", u ? u() : -999);
+
+    /* ⚠️ 不能只靠 dlsym 判断解锁状态（实测踩过）：
+     *    符号在 .dynsym 里，跟段是否已解密无关 —— 篡改后段仍是密文，
+     *    dlsym 照样成功，于是误判成"解锁成功"（假绿）。
+     *    必须【真的调用】加密段里的函数：段未解密时调用 = 执行密文 = 崩。
+     *
+     * test_call_secret_calc 带 noinline，确保它真去 bl 到 .ncx 里，
+     * 而不是被编译器内联成明文副本。 */
+    int (*f)(int) = dlsym(h, "test_call_secret_calc");
+    if (!f) { printf("NOSYM\n"); return 0; }
+    fflush(stdout);
+    printf("%d\n", f(0));      /* 期望 270；段未解密则进程直接死 */
     return 0;
 }
 EOF
@@ -204,18 +263,21 @@ EOF
                 cp "$APK" "fake/$PKG/base.apk"
                 cp tampered.so "fake/$PKG/lib/arm64-v8a/libtest.so"
                 RC_T=$( cd "fake/$PKG" && bash -c "exec -a $PKG '$W/drv' ./lib/arm64-v8a/libtest.so" 2>/dev/null )
-                if [ "$RC_T" = "0" ] || [ "$RC_T" = "59" ]; then
-                    bad "V5 篡改密文后仍然解锁成功（rc=$RC_T）—— MAC 未生效"
+                # 判据：篡改后必须【不能】得到 270。
+                # 可能表现：空输出（调用密文 → 崩）、NOOPEN、NOSYM。
+                # 只要不是 270，就说明加密段没被解密（MAC 生效）。
+                if [ "$RC_T" = "270" ]; then
+                    bad "V5 篡改密文后加密段仍可执行（得到 270）—— MAC 未生效"
                 else
-                    ok "V5 篡改密文 → 拒绝解密（rc=$RC_T）"
+                    ok "V5 篡改密文 → 加密段不可执行（$RC_T）"
                 fi
 
                 # ── V6 完整链路：未篡改应能解开 ──
                 echo "── V6 完整解锁链路 ──"
                 cp l2.so "fake/$PKG/lib/arm64-v8a/libtest.so"
                 RC_OK=$( cd "fake/$PKG" && bash -c "exec -a $PKG '$W/drv' ./lib/arm64-v8a/libtest.so" 2>/dev/null )
-                if [ "$RC_OK" = "0" ]; then
-                    ok "V6 未篡改 → 解锁成功（rc=0）"
+                if [ "$RC_OK" = "270" ]; then
+                    ok "V6 未篡改 → 解锁成功且加密段可执行"
                     # 验证加密段代码真的能执行
                     cat > t2.c <<'EOF'
 #include <dlfcn.h>
@@ -223,8 +285,6 @@ EOF
 int main(int c, char **v) {
     void *h = dlopen(v[1], RTLD_NOW);
     if (!h) return 2;
-    int (*u)(void) = dlsym(h, "ncguard_unlock");
-    if (u) u();
     int (*s)(int) = dlsym(h, "test_call_secret_calc");
     int (*p)(int,int) = dlsym(h, "test_call_plain_add");
     if (!s || !p) { printf("NOSYM\n"); return 3; }
@@ -245,7 +305,7 @@ EOF
                         skip "V6 无法编译执行驱动"
                     fi
                 else
-                    bad "V6 未篡改却解锁失败（rc=$RC_OK）—— 正常包也会挂"
+                    bad "V6 未篡改却拿不到正确结果（$RC_OK，期望 270）—— 正常包也会挂"
                 fi
             else
                 skip "V5/V6 无法提取包名"
@@ -282,9 +342,9 @@ __attribute__((visibility("default")))
 int demo_v7_sum(void) { return v7_sum(); }
 V7EOF
 cd "$W" || exit 2
-if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I. \
-        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
-        biz2.c -o v7raw.so 2>v7build.log; then
+# shellcheck disable=SC2046
+if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
+        $(clang_guard) biz2.c -o v7raw.so 2>v7build.log; then
     # 关键：两段都要锁（--section .ncx,.ncxr）
     if python3 "$LOCK" v7raw.so v7l1.so --section .ncx,.ncxr \
             --from-apk "$APK" --package "$PKG_FIX" >v7l1.log 2>&1 \
