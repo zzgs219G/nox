@@ -27,9 +27,17 @@ OUT="dist/nox-${VER}.zip"
 
 echo "打包 $OUT ..."
 rm -rf dist build-zip
-mkdir -p dist build-zip/nox-${VER}
+mkdir -p dist build-zip/nox
 
-STAGE="build-zip/nox-${VER}"
+# ⚠️ 包内顶层目录固定为 nox/，【不带版本号】。
+# 版本号只出现在 zip 文件名上（dist/nox-<VER>.zip）——
+# 两者职责不同：
+#   · 文件名带版本 → 下载/归档时能区分版本
+#   · 内层目录固定 → 解压路径稳定，消费方（如 artifact-pipeline 的
+#     tools/nox.zip）可以硬编码 "$TOOLS/nox/so-guard"，换版零改动
+# 这与 tools/dex2c.zip→Dex2C/、tools/dpt-shell.zip→executable/ 的约定一致。
+# 历史：原为 nox-${VER}，导致换版后解压路径变化、引用全失效。
+STAGE="build-zip/nox"
 
 # ── 工具 ──
 cp nox "$STAGE/"
@@ -65,7 +73,7 @@ cat > "$STAGE/QUICKSTART.md" <<'EOF'
 
 ## 1. 解压
 
-    unzip nox-*.zip && cd nox-*
+    unzip nox-*.zip && cd nox
 
 ## 2. 先跑自测，确认工具链正常
 
@@ -150,10 +158,10 @@ EOF
 # ── 打包 ──
 cd build-zip
 if command -v zip >/dev/null 2>&1; then
-    zip -qr "../$OUT" "nox-${VER}"
+    zip -qr "../$OUT" "nox"
 else
     # 没有 zip 命令时用 python 的 zipfile
-    python3 - "$OUT" "nox-${VER}" <<'PY'
+    python3 - "$OUT" "nox" <<'PY'
 import os, sys, zipfile
 out, base = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(os.path.join('..', out), 'w', zipfile.ZIP_DEFLATED) as z:
