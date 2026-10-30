@@ -1,0 +1,229 @@
+name: release
+
+# 两个触发入口，共用同一套打包与验证流程：
+#   ① 打 tag（v*）        → 自动出 release
+#   ② 手动（workflow_dispatch）→ 可指定版本号；也可只打包不发布（试运行）
+#
+# 为什么必须共用：两条路如果各写一份打包逻辑，迟早会漂移——
+# 手动发的包和 tag 发的包内容不一致，是这类项目最容易出错的地方。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v0.2.0）。留空则用 0.0.0-dev-<短SHA>'
+        required: false
+        type: string
+      publish:
+        description: '是否创建 Release（取消勾选 = 只跑验证并上传 artifact）'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write    # 创建 Release 需要
+
+jobs:
+  # ── 第一关：验证。任何一步失败都不打包 ──────────────────────────
+  # 为什么先验证再打包：先打包后验证的话，验证失败时 zip 已经存在，
+  # 容易被误拿。本项目在构建期踩过同类坑（熵值安检必须在写盘之前）。
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang binutils zip unzip python3
+
+      - name: 生成 fixture APK（包内自测用）
+        run: |
+          # fixtures/sample.apk 已随仓库提交；若缺失则重新生成。
+          # 它是【专用测试证书】的包，与任何真实发布包无关。
+          if [ ! -f fixtures/sample.apk ]; then
+            python3 fixtures/make-fixture-apk.py fixtures/sample.apk
+          fi
+          ls -la fixtures/sample.apk
+
+      - name: 自测（13 项）
+        run: |
+          chmod +x test.sh
+          ./test.sh
+
+      - name: 完整例子
+        run: |
+          chmod +x example/run.sh
+          cd example && ./run.sh
+
+      - name: 用自己的代码跑一次 protect
+        run: |
+          cat > /tmp/user_code.c <<'EOF'
+          __attribute__((section(".ncx"), used, retain))
+          int my_algo(int x) {
+              int a = x;
+              for (int i = 0; i < 5; i++) a = (a * 7 + 13) & 0xFFFF;
+              return a;
+          }
+          __attribute__((visibility("default")))
+          int api_run(int x) { return my_algo(x); }
+          EOF
+          ./nox protect /tmp/user_code.c \
+                --apk fixtures/sample.apk --package com.nox.fixture \
+                -o /tmp/libuser.so
+          # 必须真的有 .ncx 段，否则说明加密没生效
+          readelf -SW /tmp/libuser.so | grep -q '\.ncx ' \
+            || { echo "✗ 产物缺 .ncx 段"; exit 1; }
+          echo "✔ 产物含 .ncx 段"
+
+  # ── 第二关：打包 ────────────────────────────────────────────────
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          # tag 触发 → 用 tag 名
+          # 手动触发 → 用输入的版本号，留空则用 0.0.0-dev-<SHA>
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="0.0.0-dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "版本号: $V"
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip unzip python3
+
+      - name: 打包
+        run: |
+          chmod +x make-zip.sh
+          ./make-zip.sh "${{ steps.ver.outputs.version }}"
+
+      - name: 校验包内容
+        run: |
+          # 防止"包是空的"或"漏了关键文件"这类静默失败
+          Z="dist/nox-${{ steps.ver.outputs.version }}.zip"
+          test -f "$Z" || { echo "✗ 包不存在"; exit 1; }
+          echo "包大小: $(stat -c%s "$Z") 字节"
+          for f in nox test.sh README.md QUICKSTART.md \
+                   so-guard/nc_guard_boot.c so-guard/so-section-lock.py \
+                   fixtures/sample.c fixtures/sample.apk example/run.sh; do
+            unzip -l "$Z" | grep -q "nox-${{ steps.ver.outputs.version }}/$f" \
+              || { echo "✗ 包内缺: $f"; exit 1; }
+          done
+          echo "✔ 关键文件齐全"
+
+      - name: 冒烟测试（解压后能否零参数自测）
+        run: |
+          # 这一步是"包真的能用"的唯一证据：在干净目录解压并跑自测。
+          # 不跑这一步的话，打包脚本漏文件也发现不了。
+          T=$(mktemp -d)
+          cd "$T"
+          unzip -q "$GITHUB_WORKSPACE/dist/nox-${{ steps.ver.outputs.version }}.zip"
+          cd "nox-${{ steps.ver.outputs.version }}"
+          ./test.sh
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nox-${{ steps.ver.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+
+  # ── 第三关：发布 ────────────────────────────────────────────────
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    # tag 推送必定发布；手动触发按 publish 勾选决定
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nox-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.build.outputs.version }}
+        run: |
+          # 版本号可能不带 v 前缀（手动输入 "0.2.0"），tag 补上 v
+          case "$V" in
+            v*) TAG="$V" ;;
+            *)  TAG="v$V" ;;
+          esac
+
+          # 若 tag 已存在（手动重跑同一版本），先删再建，避免 Release 创建失败
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git tag -d "$TAG" 2>/dev/null || true
+
+          NOTES=$(cat <<EOF
+          nox $V — so 段加密设施
+
+          ## 快速开始
+
+          \`\`\`bash
+          unzip nox-*.zip && cd nox-*
+          ./test.sh                 # 13 项自测，验证工具链
+          cd example && ./run.sh    # 完整演示：加密前后对比
+          \`\`\`
+
+          用你自己的代码：
+
+          \`\`\`bash
+          ./nox protect 你的代码.c --apk 你的签名APK -o libyour.so
+          \`\`\`
+
+          ## 必须知道的四条
+
+          1. **必须提供已签名的 APK** —— 密钥由 APK 证书派生，运行期从已安装的 APK
+             重读证书。没有 APK 就解不开，只能保护 Android App 里的 so。
+          2. **只能保护加过标记的函数** ——
+             \`__attribute__((section(".ncx"), used, retain))\`，必须重新编译。
+             不能加密已编好的成品 so。
+          3. **用错 APK 会解不开** —— \`--apk\` 必须是最终签名用的那个证书。
+             换 keystore 重签后旧产物失效，这是设计不是 bug。
+          4. **挡的是静态分析，不是动态调试** —— 代码要执行就必然有明文的一刻，
+             有 Frida 的人可以蹲到那个瞬间。这套的作用是让 \`strings\`、
+             反汇编、静态审计失效。
+
+          ## 强度边界（如实）
+
+          目标是**抬高成本**，不是不可破解。详见包内 README.md。
+
+          ## 校验和
+
+          \`\`\`
+          $(cat dist/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+          )
+
+          gh release create "$TAG" \
+             --title "nox $V" \
+             --notes "$NOTES" \
+             dist/*.zip dist/SHA256SUMS.txt
