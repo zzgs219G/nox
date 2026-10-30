@@ -65,9 +65,22 @@ else
         cp "$d/libnox.a" "$STAGE/lib/$abi/"
         _n=$((_n+1))
     done
-    # 单架构兜底布局（老路径，某些用户可能只有这一个）
-    if [ -f lib/libnox.a ]; then
-        cp lib/libnox.a "$STAGE/lib/libnox.a"
+    # ⚠️ 【不】打包 lib/libnox.a（单架构兜底路径）—— 实测踩过：
+    #    发布包里的 lib/libnox.a 是 CI runner 编的 x86-64。
+    #    用户在 aarch64 上会先找到它、发现架构不对、回落到源码模式，
+    #    而包里没有源码 → 自测必然失败，且报错信息指向"缺 .c"，
+    #    完全不提"拿错了架构"这个真因。
+    #    只发按架构分目录的，让选择逻辑干净：有匹配的用，没有就明说。
+    #    （源码仓库里保留 lib/libnox.a 供本地开发，只是不进发布包）
+    # ── 宿主架构别名（让包内 ./test.sh 能跑起来）──────────────
+    # arm64-v8a 与 aarch64 是同一架构的两个名字：前者是 Android ABI 名，
+    # 后者是 uname -m 的返回值。包里只有前者时，在 ARM Linux/macOS 上
+    # test.sh 的 _host_arch() 会返回 aarch64 → 找不到 → 回落源码模式
+    # → 包里无源码 → 失败。
+    # 补一份别名目录，两个名字都能命中（内容相同，多占 47KB，值得）。
+    if [ -f "$STAGE/lib/arm64-v8a/libnox.a" ] && [ ! -d "$STAGE/lib/aarch64" ]; then
+        mkdir -p "$STAGE/lib/aarch64"
+        cp "$STAGE/lib/arm64-v8a/libnox.a" "$STAGE/lib/aarch64/"
         _n=$((_n+1))
     fi
     echo "  已打包 $_n 个静态库（按架构分目录）"
