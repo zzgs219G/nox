@@ -7,3 +7,7 @@ build/
 # 分发形态实验产物，不入库
 *.a
 *.o
+dist/
+build-zip/
+example/run/
+example/build/

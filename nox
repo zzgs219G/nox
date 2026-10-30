@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""nox — 一条命令完成：编译 → 加密 → 去符号
+
+为什么需要它：直接用本模块需要记住 4 件事（拷哪些 .c、4 个编译参数、
+两次锁箱的不同参数、最后 strip）。任何一步记错都会得到"看起来成功但
+跑不起来"的产物。本脚本把这些固化成一条命令。
+
+用法：
+    ./nox protect <你的代码.c> --apk <已签名APK> -o <输出.so>
+
+    # 多个源文件
+    ./nox protect a.c b.c --apk app.apk -o libfoo.so
+
+    # 指定 ABI（默认用宿主机的 clang）
+    ./nox protect code.c --apk app.apk -o libfoo.so --abi arm64-v8a
+
+    # 只编译不加密（调试用，看看 .ncx 段生成了没）
+    ./nox build code.c -o libfoo.so
+
+    # 自检
+    ./nox test --apk app.apk
+
+产物：加了密的 so，可直接放进 APK 的 lib/<abi>/ 目录。
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GUARD = os.path.join(HERE, 'so-guard')
+
+# 加密设施必须一起编译的源文件（顺序无关，但一个都不能少）
+GUARD_SRCS = [
+    'nc_guard_boot.c',     # 自解谜引导
+    'nc_guard_probe.c',    # .ncx/.nck 段唯一定义处
+    'nc_guard_key.c',      # SHA256/HMAC/HKDF
+    'nc_guard_paths.c',    # 路径密文表
+]
+
+# 生产构建参数。逐个说明，因为任何一个漏掉都会让防护失效或产物不可用：
+#   -fPIC              共享库必须
+#   -shared            产出 .so
+#   -Oz                体积优先（stub 是明文，越小暴露越少）
+#   -fvisibility=hidden 内部符号不外泄 —— 但 JNIEXPORT 自带 default，对它无效
+#   -fno-ident         去掉编译器指纹
+#   -ffunction-sections -fdata-sections  配合 --gc-sections 瘦身
+#   -DNC_GUARD_SECTIONED 启用段标记（不加这个，__attribute__((section)) 全不生效）
+CFLAGS_BASE = [
+    '-fPIC', '-shared', '-Oz',
+    '-fvisibility=hidden',
+    '-fno-ident',
+    '-ffunction-sections', '-fdata-sections',
+    '-DNC_GUARD_SECTIONED',
+]
+
+LDFLAGS_BASE = [
+    '-Wl,--gc-sections',
+    '-Wl,--build-id=none',
+]
+
+# 版本脚本：只导出 JNI 短名绑定必需的符号，其余全 local。
+# ⚠️ 必须是 Java_* 而不是 Java_com_nc_*：protect.sh 调 dex2c 时不传
+#    --dynamic-register，产物走 JNIEXPORT 短名绑定，收窄会导致 ULE。
+#    本工具用于「自己写的 C 代码」，通常没有 JNI 入口，但保留规则更安全。
+VERSION_SCRIPT = """{
+  global:
+    Java_*;
+    nox_api_*;
+    demo_*;
+  local:
+    *;
+};
+"""
+
+
+def die(msg):
+    print('✗ %s' % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, **kw):
+    """跑一条命令，失败时打印完整输出（不静默吞错）"""
+    if os.environ.get('NOX_VERBOSE'):
+        print('  $ ' + ' '.join(cmd), file=sys.stderr)
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        print('✗ 命令失败: %s' % ' '.join(cmd), file=sys.stderr)
+        if r.stdout:
+            print('--- stdout ---\n' + r.stdout, file=sys.stderr)
+        if r.stderr:
+            print('--- stderr ---\n' + r.stderr, file=sys.stderr)
+        sys.exit(r.returncode)
+    return r
+
+
+def find_clang(abi):
+    """找 clang。优先用 NDK 的交叉编译器（指定 ABI 时），否则用系统 clang。"""
+    if abi:
+        target = {
+            'arm64-v8a': 'aarch64-linux-android',
+            'armeabi-v7a': 'armv7a-linux-androideabi',
+            'x86_64': 'x86_64-linux-android',
+            'x86': 'i686-linux-android',
+        }.get(abi)
+        if not target:
+            die('不支持的 ABI: %s（可选: %s）' % (abi, ', '.join(
+                ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'])))
+        ndk = os.environ.get('ANDROID_NDK_HOME') or os.environ.get('ANDROID_NDK_ROOT')
+        if not ndk:
+            die('指定了 --abi 但没有 ANDROID_NDK_HOME 环境变量。\n'
+                '  要么 export ANDROID_NDK_HOME=/path/to/ndk，要么去掉 --abi 用系统 clang。')
+        api = os.environ.get('NOX_ANDROID_API', '21')
+        for pre in ('linux-x86_64', 'darwin-x86_64', 'linux-aarch64'):
+            cand = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', pre, 'bin',
+                                '%s%s-clang' % (target, api))
+            if os.path.isfile(cand):
+                return cand, ['--target=%s%s' % (target, api)]
+        die('在 NDK 里找不到 %s%s-clang（试过 linux-x86_64 / darwin-x86_64 / linux-aarch64）'
+            % (target, api))
+    clang = shutil.which('clang') or shutil.which('gcc')
+    if not clang:
+        die('找不到 clang。装一个，或者设 ANDROID_NDK_HOME 后加 --abi。')
+    return clang, []
+
+
+def do_build(args, workdir):
+    """只编译，不加密。用于调试和 V1 类验证。"""
+    clang, extra = find_clang(args.abi)
+    out_so = os.path.abspath(args.output)
+    # 输出目录可能不存在（首次使用、或 zip 解压后没有空目录）
+    out_dir = os.path.dirname(out_so)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    vs = os.path.join(workdir, 'nox.map')
+    with open(vs, 'w') as f:
+        f.write(VERSION_SCRIPT)
+
+    cmd = [clang] + extra + CFLAGS_BASE + ['-I', GUARD]
+    cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+    cmd += [os.path.abspath(s) for s in args.sources]
+    cmd += LDFLAGS_BASE
+    if not args.no_version_script:
+        cmd += ['-Wl,--version-script=%s' % vs]
+    # 用户自带的链接参数（如 -llog / -landroid）
+    if args.link:
+        cmd += args.link.split()
+    cmd += ['-o', out_so]
+
+    print('[1/1] 编译 %d 个源文件 → %s' % (len(args.sources), os.path.basename(out_so)))
+    run(cmd)
+    if not os.path.isfile(out_so):
+        die('编译声称成功但产物不存在: %s' % out_so)
+    return out_so
+
+
+def do_protect(args, workdir):
+    """编译 → 一级锁箱 → 二级锁箱 → strip"""
+    if not args.apk:
+        die('protect 需要 --apk（密钥由 APK 证书派生，这是设计不是限制）')
+    if not os.path.isfile(args.apk):
+        die('APK 不存在: %s' % args.apk)
+
+    lock_py = os.path.join(GUARD, 'so-section-lock.py')
+    if not os.path.isfile(lock_py):
+        die('缺少锁箱工具: %s' % lock_py)
+
+    # ── 1. 编译 ──
+    raw = os.path.join(workdir, 'raw.so')
+    saved_out = args.output
+    args.output = raw
+    do_build(args, workdir)
+    args.output = saved_out
+
+    # ── 2. 探测有哪些加密段 ──
+    # ⚠️ 必须自动探测，不能硬写 ".ncx"：
+    #    构建期 MAC 覆盖 --section 列出的段，运行期却会自动探测 .ncxr
+    #    等段并全部纳入。两边不一致 → MAC 不匹配 → 运行期返回 -11。
+    #    （实测踩过：只锁 .ncx 时 unlock=0，带上 .ncxr 就 -11）
+    sections = detect_sections(raw)
+
+    # ── 3. 一级锁箱（业务段）──
+    step1 = os.path.join(workdir, 'step1.so')
+    print('[2/4] 一级锁箱（%s）' % ','.join(sections))
+    run([sys.executable, lock_py, raw, step1,
+         '--section', ','.join(sections),
+         '--from-apk', os.path.abspath(args.apk)] +
+        (['--package', args.package] if args.package else []))
+
+    # ── 4. 二级锁箱（解锁本体）──
+    step2 = os.path.join(workdir, 'step2.so')
+    print('[3/4] 二级锁箱（unlock 本体）')
+    run([sys.executable, lock_py, step1, step2, '--lock-head'])
+
+    # ── 5. strip ──
+    # 为什么必须 strip：.symtab 里有 ncg_frag_* / ncg_bl_* 等内部符号名，
+    # 攻击者据此能定位解密链路。--strip-all 只删 .symtab/.strtab，
+    # 删不掉 .dynsym（JNI 短名绑定需要）—— 所以导出的函数名仍可见，
+    # 那部分靠调用方自己控制（别给内部函数加 visibility("default")）。
+    out_so = os.path.abspath(args.output)
+    out_dir = os.path.dirname(out_so)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    print('[4/4] 去除符号表')
+    strip_cmd = [shutil.which('llvm-strip') or shutil.which('strip') or 'strip',
+                 '--strip-all', step2, '-o', out_so]
+    if not (shutil.which('llvm-strip') or shutil.which('strip')):
+        shutil.copy2(step2, out_so)
+        print('  ⚠ 找不到 strip，跳过（符号表未清除）')
+    else:
+        run(strip_cmd)
+
+    if not os.path.isfile(out_so):
+        die('产物不存在: %s' % out_so)
+
+    print('')
+    print('✅ 完成: %s (%d 字节)' % (os.path.basename(out_so), os.path.getsize(out_so)))
+    print('   放进 APK 的 lib/%s/ 目录' % (args.abi or 'arm64-v8a'))
+    return out_so
+
+
+def detect_sections(so_path):
+    """读 ELF 段表，返回所有 NC_SEC_* 加密段名（按段表顺序）。
+
+    为什么按段表顺序：MAC 是「所有段密文按顺序拼接」算的，顺序错了
+    运行期对不上。锁箱器内部用 --section 的给出顺序，运行期用段表顺序，
+    两者必须一致 —— 本函数就按段表顺序返回，天然对齐。
+    """
+    import struct
+    d = open(so_path, 'rb').read()
+    if d[:4] != b'\x7fELF':
+        die('不是 ELF 文件: %s' % so_path)
+    is64 = d[4] == 2
+    if is64:
+        sh_off = struct.unpack_from('<Q', d, 0x28)[0]
+        sh_es = struct.unpack_from('<H', d, 0x3A)[0]
+        sh_num = struct.unpack_from('<H', d, 0x3C)[0]
+        sh_str = struct.unpack_from('<H', d, 0x3E)[0]
+    else:
+        sh_off = struct.unpack_from('<I', d, 0x20)[0]
+        sh_es = struct.unpack_from('<H', d, 0x2E)[0]
+        sh_num = struct.unpack_from('<H', d, 0x30)[0]
+        sh_str = struct.unpack_from('<H', d, 0x32)[0]
+
+    def shdr(i):
+        o = sh_off + i * sh_es
+        if is64:
+            name, = struct.unpack_from('<I', d, o)
+            size, = struct.unpack_from('<Q', d, o + 0x20)
+        else:
+            name, = struct.unpack_from('<I', d, o)
+            size, = struct.unpack_from('<I', d, o + 0x14)
+        return name, size
+
+    strtab_off = shdr(sh_str)[0]  # 这里拿到的是 name 偏移，还要再取段的 offset
+    # 重新取 shstrtab 的文件偏移
+    o = sh_off + sh_str * sh_es
+    if is64:
+        strtab_off = struct.unpack_from('<Q', d, o + 0x18)[0]
+    else:
+        strtab_off = struct.unpack_from('<I', d, o + 0x10)[0]
+
+    found = []
+    seen = set()
+    for i in range(sh_num):
+        name_off, size = shdr(i)
+        end = d.find(b'\0', strtab_off + name_off)
+        if end < 0:
+            continue
+        nm = d[strtab_off + name_off:end].decode('utf-8', 'replace')
+        # 三个业务段：.ncx 代码、.ncxr 常量表。.ncxh/.ncks/.nck 由二级锁箱处理
+        if nm in ('.ncx', '.ncxr') and nm not in seen:
+            seen.add(nm)
+            found.append(nm)
+
+    if '.ncx' not in found:
+        die('产物里没有 .ncx 段 —— 你的代码没标 __attribute__((section(".ncx")))。\n'
+            '  参考 fixtures/sample.c 的写法：\n'
+            '    __attribute__((section(".ncx"), used, retain))\n'
+            '    int my_func(void) { ... }')
+    return found
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog='nox',
+        description='so 段加密：把标记过的 C 函数加密进 .ncx 段',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''例子:
+  ./nox protect mycode.c --apk app.apk -o libmy.so
+  ./nox protect a.c b.c --apk app.apk -o libfoo.so --abi arm64-v8a
+  ./nox build mycode.c -o libmy.so          # 只编译，不加密（调试用）
+  ./nox test --apk app.apk                  # 跑自测
+
+加密后 APK 启动时要能读到自己 -> 必须真的装进 APK 里跑，不能单独 dlopen。''')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    def common(p):
+        p.add_argument('sources', nargs='+', help='你的 C 源文件')
+        p.add_argument('-o', '--output', required=True, help='输出 .so 路径')
+        p.add_argument('--abi', choices=['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'],
+                       help='目标 ABI（需 ANDROID_NDK_HOME；不给则用系统 clang）')
+        p.add_argument('--link', help='额外的链接参数，如 "-llog"')
+        p.add_argument('--no-version-script', action='store_true',
+                       help='不生成 version script（调试用；生产不要加）')
+
+    p_protect = sub.add_parser('protect', help='编译 + 加密（一条命令）')
+    common(p_protect)
+    p_protect.add_argument('--apk', required=True, help='已签名的 APK（密钥来源）')
+    p_protect.add_argument('--package', help='包名（默认从 APK 的 AXML 解析）')
+
+    p_build = sub.add_parser('build', help='只编译不加密（调试用）')
+    common(p_build)
+
+    p_test = sub.add_parser('test', help='跑自测')
+    p_test.add_argument('--apk', help='用指定 APK，默认用 fixtures/sample.apk')
+
+    args = ap.parse_args()
+
+    if args.cmd == 'test':
+        test_sh = os.path.join(HERE, 'test.sh')
+        if not os.path.isfile(test_sh):
+            die('缺少 test.sh')
+        cmd = [test_sh] + ([args.apk] if args.apk else [])
+        os.execv(test_sh, cmd)
+        return
+
+    # 校验源文件存在
+    for s in args.sources:
+        if not os.path.isfile(s):
+            die('源文件不存在: %s' % s)
+    if not os.path.isdir(GUARD):
+        die('缺少 so-guard 目录（本工具不完整）')
+
+    import tempfile
+    workdir = tempfile.mkdtemp(prefix='nox.')
+    try:
+        if args.cmd == 'build':
+            do_build(args, workdir)
+            print('✅ 编译完成: %s' % os.path.abspath(args.output))
+            print('   （未加密。加 --apk 改用 protect）')
+        else:
+            do_protect(args, workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    main()
