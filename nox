@@ -297,13 +297,29 @@ def do_protect(args, workdir):
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
     print('[4/4] 去除符号表')
-    strip_cmd = [shutil.which('llvm-strip') or shutil.which('strip') or 'strip',
-                 '--strip-all', step2, '-o', out_so]
-    if not (shutil.which('llvm-strip') or shutil.which('strip')):
+    # ⚠️ 交叉编译时必须用【目标架构】的 strip（实测踩过）：
+    #    用宿主 /usr/bin/strip 处理 ARM 产物会报
+    #        Unable to recognise the architecture of the input file
+    #    因为它是 x86 版的 binutils，不认识 ELF AArch64。
+    #    优先取 NDK 里的 llvm-strip（llvm 版跨架构通用）。
+    stripper = None
+    if getattr(args, 'abi', None):
+        ndk = os.environ.get('ANDROID_NDK_HOME') or os.environ.get('ANDROID_NDK_ROOT')
+        if ndk:
+            # NDK 的 llvm-strip 在 prebuilt/<host>/bin/ 下
+            for pre in ('linux-x86_64', 'darwin-x86_64', 'linux-aarch64'):
+                cand = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt',
+                                    pre, 'bin', 'llvm-strip')
+                if os.path.isfile(cand):
+                    stripper = cand
+                    break
+    if not stripper:
+        stripper = shutil.which('llvm-strip') or shutil.which('strip')
+    if not stripper:
         shutil.copy2(step2, out_so)
         print('  ⚠ 找不到 strip，跳过（符号表未清除）')
     else:
-        run(strip_cmd)
+        run([stripper, '--strip-all', step2, '-o', out_so])
 
     if not os.path.isfile(out_so):
         die('产物不存在: %s' % out_so)
