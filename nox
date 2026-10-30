@@ -41,52 +41,19 @@ GUARD_SRCS = [
 
 # 预编译静态库。按目标 ABI 分目录存放 —— .a 是机器码，与 CPU 架构绑死，
 # 一个 x86-64 的 .a 在 aarch64 上链接会直接报
-# "is incompatible with aarch64linux"。
-# 布局：
-#   lib/arm64-v8a/libnox.a
-#   lib/armeabi-v7a/libnox.a
-#   lib/<host-arch>/libnox.a
-#   lib/libnox.a            （单架构兜底，老布局）
-LIB_DIR = os.path.join(HERE, 'lib')
-
-
-def _host_arch():
-    import platform
-    m = platform.machine().lower()
-    return {'x86_64': 'x86_64', 'amd64': 'x86_64',
-            'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(m, m)
-
-
-def find_static_lib(abi):
-    """按目标 ABI 找对应的 .a。找不到返回 None。
-
-    为什么必须按 ABI 分：.a 里是目标架构的机器码。用错架构的症状是
-        ld.lld: error: xxx.a(nc_guard_boot.o) is incompatible with aarch64linux
-    —— 报错在链接期，且信息不指向"你拿错了架构"这个真因。
-    """
-    cands = []
-    if abi:
-        cands.append(os.path.join(LIB_DIR, abi, 'libnox.a'))
-    else:
-        cands.append(os.path.join(LIB_DIR, _host_arch(), 'libnox.a'))
-    cands.append(os.path.join(LIB_DIR, 'libnox.a'))   # 老布局兜底
-    for c in cands:
-        if os.path.isfile(c):
-            return c, _lib_arch(c)
-    return None, None
-
-
-def _lib_arch(path):
-    """读 .a 第一个成员的 ELF 头，返回架构名（仅用于提示信息）。"""
-    try:
-        d = open(path, 'rb').read(2048)
-        i = d.find(b'\x7fELF')
-        if i < 0:
-            return '?'
-        m = int.from_bytes(d[i + 18:i + 20], 'little')
-        return {0x3E: 'x86_64', 0xB7: 'aarch64', 0x28: 'arm'}.get(m, '0x%x' % m)
-    except Exception:
-        return '?'
+# 分发形态：源码。
+#
+# 历史：2026-10 曾改为分发预编译静态库（lib/<abi>/libnox.a），想藏住 C 实现。
+# 已废弃，原因有二：
+#  ① .a 是机器码，与 CPU 架构绑死。CI 在 x86-64 上编，用户在 aarch64 /
+#     Android 上用不了（报 is incompatible with aarch64linux）。要做对就得
+#     为每个目标架构各发一份，而"选哪份"的决策会散落在 nox / test.sh /
+#     make-zip.sh / CI 四处 —— 实测为此连续踩了 5 个坑。
+#  ② 更根本的：源码本来就公开在 GitHub 上。藏 .a 只能挡住"下载 zip 的人"，
+#     挡不住"看仓库的人"。为这点收益引入架构矩阵和四处漂移，不值。
+#
+# 若将来确需藏源码，正确做法是服务化（对方上传 so，服务器加密后返回），
+# 而不是发 .a。
 
 
 # 生产构建参数。逐个说明，因为任何一个漏掉都会让防护失效或产物不可用：
@@ -190,47 +157,11 @@ def do_build(args, workdir):
 
     cmd = [clang] + extra + CFLAGS_BASE
 
-    use_lib = getattr(args, 'use_static_lib', False)
-    if use_lib:
-        lib, lib_arch = find_static_lib(getattr(args, 'abi', None))
-        if not lib:
-            want = args.abi or _host_arch()
-            die('--use-static-lib 找不到匹配的静态库。\n'
-                '  期望: lib/%s/libnox.a\n'
-                '  现有: %s\n'
-                '  生成: ./make-static-lib.sh %s\n'
-                '  （或改用源码模式：去掉 --use-static-lib）'
-                % (want,
-                   ', '.join(sorted(os.listdir(LIB_DIR))) if os.path.isdir(LIB_DIR) else '（无 lib/ 目录）',
-                   want))
-        # ⚠️ 架构必须匹配（实测踩过）：
-        #    CI runner 是 x86-64，编出的 .a 拿到 aarch64 上链接会报
-        #        is incompatible with aarch64linux
-        #    报错在链接期，且不指向"拿错架构"这个真因。
-        #    这里提前检查并给出人话提示。
-        want_arch = {'arm64-v8a': 'aarch64', 'x86_64': 'x86_64',
-                     'armeabi-v7a': 'arm'}.get(args.abi, _host_arch())
-        if lib_arch not in ('?', want_arch):
-            die('静态库架构不匹配：\n'
-                '  文件 %s 是 %s\n'
-                '  目标 %s 需要 %s\n'
-                '  生成: ./make-static-lib.sh %s'
-                % (lib, lib_arch, args.abi or 'host', want_arch,
-                   args.abi or _host_arch()))
-        # ⚠️ --whole-archive 不能省：
-        #   静态库只链接「被引用」的成员，而 nc_guard_boot.o 无人直接
-        #   调用（入口是 constructor），会被整个丢弃 → 加密段从 5 个
-        #   剩 1 个，连 ncguard_unlock 都没了。实测：
-        #       不加：35464 字节 → 5368 字节，段 5→1
-        #       加了：正常
-        cmd += ['-Wl,--whole-archive', lib, '-Wl,--no-whole-archive']
-        # 头文件仍需能找到（.ncxr 等标记用）
-        cmd += ['-I', GUARD]
-        where = '静态库 %s (%s)' % (os.path.relpath(lib, HERE), lib_arch)
-    else:
-        cmd += ['-I', GUARD]
-        cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
-        where = '源码 %d 个 .c' % len(GUARD_SRCS)
+    # 恒用源码编译设施。不再有静态库分支（见文件头"分发形态"的说明）。
+    cmd += ['-I', GUARD]
+    cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+    where = '源码 %d 个 .c' % len(GUARD_SRCS)
+    where = '源码 %d 个 .c' % len(GUARD_SRCS)
 
     cmd += [os.path.abspath(s) for s in args.sources]
     cmd += LDFLAGS_BASE
@@ -414,9 +345,6 @@ def main():
         p.add_argument('--link', help='额外的链接参数，如 "-llog"')
         p.add_argument('--no-version-script', action='store_true',
                        help='不生成 version script（调试用；生产不要加）')
-        p.add_argument('--use-static-lib', action='store_true',
-                       help='链接预编译的 libnox.a 而非源码（C 实现不外泄，'
-                            '但 ABI 必须与 NDK/编译器匹配）')
 
     p_protect = sub.add_parser('protect', help='编译 + 加密（一条命令）')
     common(p_protect)

@@ -14,12 +14,10 @@
 #   test.sh             自测
 #   README.md           使用说明
 #
-# ⚠️ 分发形态：默认用 lib/libnox.a（预编译静态库），不发 C 源码。
-#    这么做是有取舍的：
-#      · C 实现藏住了（拿不到 .c）
-#      · Python 工具仍是源码（无法二进制化），所以锁箱格式仍公开
-#      · .a 与编译器版本绑定，对方必须用匹配的 clang
-#    用 SOURCE_MODE=1 可改回发源码（给要改代码的人）。
+# 分发形态：源码。
+#   SOURCE_MODE 已不再需要判断 —— 只有源码一种形态（.a 方案已废弃，
+#   原因见 nox 文件头：架构矩阵代价高，且源码本来就公开）。
+#
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
@@ -39,55 +37,8 @@ chmod +x "$STAGE/nox"
 
 # ── 设施源码 ──
 mkdir -p "$STAGE/so-guard"
-if [ "${SOURCE_MODE:-0}" = "1" ]; then
-    echo "分发形态: 源码（SOGURCE_MODE=1）"
-    cp so-guard/*.c so-guard/*.h so-guard/*.py "$STAGE/so-guard/"
-    rm -rf "$STAGE/so-guard/__pycache__"
-    # 源码模式也要带 .a，方便不想编的人
-    if [ -f lib/libnox.a ]; then cp lib/libnox.a "$STAGE/lib/"; fi
-else
-    echo "分发形态: 静态库（C 源码不外泄）"
-    # 只发头文件（.ncx/.ncxr 标记需要）+ Python 工具 + .a
-    cp so-guard/*.h "$STAGE/so-guard/"
-    cp so-guard/*.py "$STAGE/so-guard/"
-    rm -rf "$STAGE/so-guard/__pycache__"
-    # ⚠️ .a 是机器码，必须按架构分别提供（实测踩过：
-    #    只发 host 架构的 .a，用户在 aarch64 上链接报
-    #    "is incompatible with aarch64linux"，整个包不可用）。
-    #    这里把所有已生成的架构都打进去；缺的由 CI/用户自行补。
-    mkdir -p "$STAGE/lib"
-    _n=0
-    for d in lib/*/; do
-        [ -d "$d" ] || continue
-        abi=$(basename "$d")
-        [ -f "$d/libnox.a" ] || continue
-        mkdir -p "$STAGE/lib/$abi"
-        cp "$d/libnox.a" "$STAGE/lib/$abi/"
-        _n=$((_n+1))
-    done
-    # ⚠️ 【不】打包 lib/libnox.a（单架构兜底路径）—— 实测踩过：
-    #    发布包里的 lib/libnox.a 是 CI runner 编的 x86-64。
-    #    用户在 aarch64 上会先找到它、发现架构不对、回落到源码模式，
-    #    而包里没有源码 → 自测必然失败，且报错信息指向"缺 .c"，
-    #    完全不提"拿错了架构"这个真因。
-    #    只发按架构分目录的，让选择逻辑干净：有匹配的用，没有就明说。
-    #    （源码仓库里保留 lib/libnox.a 供本地开发，只是不进发布包）
-    # ── 宿主架构别名（让包内 ./test.sh 能跑起来）──────────────
-    # arm64-v8a 与 aarch64 是同一架构的两个名字：前者是 Android ABI 名，
-    # 后者是 uname -m 的返回值。包里只有前者时，在 ARM Linux/macOS 上
-    # test.sh 的 _host_arch() 会返回 aarch64 → 找不到 → 回落源码模式
-    # → 包里无源码 → 失败。
-    # 补一份别名目录，两个名字都能命中（内容相同，多占 47KB，值得）。
-    if [ -f "$STAGE/lib/arm64-v8a/libnox.a" ] && [ ! -d "$STAGE/lib/aarch64" ]; then
-        mkdir -p "$STAGE/lib/aarch64"
-        cp "$STAGE/lib/arm64-v8a/libnox.a" "$STAGE/lib/aarch64/"
-        _n=$((_n+1))
-    fi
-    echo "  已打包 $_n 个静态库（按架构分目录）"
-    if [ "$_n" = "0" ]; then
-        echo "  ⚠ 没有任何 libnox.a —— 对方只能自己跑 make-static-lib.sh"
-    fi
-fi
+cp so-guard/*.c so-guard/*.h so-guard/*.py "$STAGE/so-guard/"
+rm -rf "$STAGE/so-guard/__pycache__"
 
 # ── 样本与示例 ──
 mkdir -p "$STAGE/fixtures"

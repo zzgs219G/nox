@@ -113,131 +113,57 @@ jobs:
           chmod +x make-zip.sh
           ./make-zip.sh "${{ steps.ver.outputs.version }}"
 
-      - name: 安装 NDK（交叉编译 arm 静态库用）
-        uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r27c
-
-      - name: 生成静态库（按架构）
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: |
-          # ⚠️ .a 是机器码，必须按目标架构分别生成。
-          #    只出 host（x86-64）的话，用户在 aarch64 / Android 上链接会报
-          #        is incompatible with aarch64linux
-          #    整个包等于不可用 —— 这是 v0.2.0 实际踩到的坑。
-          chmod +x make-static-lib.sh
-          echo "── host ──"
-          ./make-static-lib.sh host
-          echo "── arm64-v8a ──"
-          ./make-static-lib.sh arm64-v8a
-          echo "── armeabi-v7a ──"
-          ./make-static-lib.sh armeabi-v7a
-          echo ""
-          echo "生成结果："
-          for f in lib/libnox.a lib/*/libnox.a; do
-            [ -f "$f" ] && printf "  %-30s %s\n" "$f" \
-                "$(readelf -h "$f" | grep -m1 Machine | sed 's/ *Machine: *//')"
-          done
-
-      - name: 打包
-        run: |
-          chmod +x make-zip.sh
-          ./make-zip.sh "${{ steps.ver.outputs.version }}"
-
       - name: 校验包内容
         run: |
-          # 防止"包是空的"或"漏了关键文件"这类静默失败
           Z="dist/nox-${{ steps.ver.outputs.version }}.zip"
           test -f "$Z" || { echo "✗ 包不存在"; exit 1; }
           echo "包大小: $(stat -c%s "$Z") 字节"
-          # 默认形态：静态库分发。关键文件里应有 .a、不该有 .c
-          for f in nox test.sh README.md QUICKSTART.md \
-                   lib/arm64-v8a/libnox.a \
-                   so-guard/nc_guard_layout.h \
-                   so-guard/so-section-lock.py \
+
+          # 源码形态：必需文件
+          for f in nox test.sh README.md AGENTS.md QUICKSTART.md \
+                   so-guard/nc_guard_boot.c so-guard/nc_guard_key.c \
+                   so-guard/nc_guard_paths.c so-guard/nc_guard_probe.c \
+                   so-guard/nc_guard_layout.h so-guard/so-section-lock.py \
                    fixtures/sample.c fixtures/sample.apk example/run.sh; do
             unzip -l "$Z" | grep -q "nox-${{ steps.ver.outputs.version }}/$f" \
               || { echo "✗ 包内缺: $f"; exit 1; }
           done
-          echo "✔ 关键文件齐全"
+          echo "✔ 必需文件齐全"
 
-          # ── 断言：静态库形态下，设施 .c 源码不得出现在包里 ──
-          # 目的：防止有人误开 SOURCE_MODE 把源码发出去。
-          # 注意这是【分发策略】检查，不是安全保证 ——
-          # Python 工具仍是源码（无法二进制化），锁箱格式始终公开。
-          BAD=$(unzip -l "$Z" \
-                | grep -E "so-guard/nc_guard_(boot|key|paths|probe)\.c$" || true)
+          # 断言：不得含预编译静态库（.a 方案已废弃）
+          # 原因：.a 与 CPU 架构绑死，跨架构分发要维护架构矩阵，
+          # 而源码本来就公开 —— 收益不抵成本。详见 nox 文件头。
+          BAD=$(unzip -l "$Z" | grep -E '\.a$' || true)
           if [ -n "$BAD" ]; then
-            echo "✗ 包内含加密设施的 C 源码（应为静态库形态）:"
+            echo "✗ 包内含 .a（已废弃的静态库形态）:"
             echo "$BAD"
-            echo "  若确需发源码，请显式设 SOURCE_MODE=1 并在提交信息里说明理由。"
             exit 1
           fi
-          echo "✔ 未含加密设施 C 源码（静态库形态正确）"
+          echo "✔ 未含 .a（源码形态正确）"
 
-          # ── 断言：arm64-v8a 的 .a 必须是 aarch64 架构 ──
-          # 防"误把 host 的 .a 塞进 arm64 目录"——那样对方链接时才炸，
-          # 而且报错信息不指向真因（is incompatible with aarch64linux）。
-          T=$(mktemp -d)
-          unzip -q -o "$Z" -d "$T"
-          A="$T/nox-${{ steps.ver.outputs.version }}/lib/arm64-v8a/libnox.a"
-          M=$(readelf -h "$A" 2>/dev/null | grep -m1 Machine | sed 's/ *Machine: *//')
-          if [ "$M" != "AArch64" ]; then
-            echo "✗ lib/arm64-v8a/libnox.a 架构是 '$M'，应为 AArch64"
-            exit 1
-          fi
-          echo "✔ arm64-v8a 静态库架构正确（AArch64）"
-          rm -rf "$T"
-
-      - name: 冒烟测试（包内静态库可用于目标架构）
+      - name: 冒烟测试（解压后零参数自测）
         run: |
-          # ⚠️ 为什么不在 CI 上跑 ./test.sh：
-          #    包内只有 arm64-v8a / armeabi-v7a 的 .a（给 Android 用），
-          #    不含 host(x86-64) 的。而 CI runner 是 x86-64，
-          #    test.sh 找不到匹配架构的 .a、回落到源码模式 —— 但包里
-          #    也没有源码（静态库形态），于是必然失败。
-          #    那是【预期行为】：包是给 Android 用户的，不是给 CI 的。
-          #
-          #    这里改为验证真正重要的事：用包内 arm64 的 .a，
-          #    交叉编译出 arm64 的 so，并确认加密段正常生成。
+          # 源码形态下，任意架构都能直接编 —— 这正是它比 .a 强的地方。
           T=$(mktemp -d)
           cd "$T"
           unzip -q "$GITHUB_WORKSPACE/dist/nox-${{ steps.ver.outputs.version }}.zip"
           cd "nox-${{ steps.ver.outputs.version }}"
+          ./test.sh
 
-          echo "── 用包内 arm64 静态库交叉编译 + 加密 ──"
+          # 再用临时用户代码验一次完整链路
           cat > user.c <<'EOF'
           __attribute__((section(".ncx"), used, retain))
           int my_secret(int a) { return (a ^ 0x5A) * 3; }
           __attribute__((visibility("default")))
           int demo_call(int a) { return my_secret(a); }
           EOF
-
-          export ANDROID_NDK_HOME="${{ steps.ndk.outputs.ndk-path }}"
-          ./nox protect user.c --use-static-lib --abi arm64-v8a \
-                  --apk fixtures/sample.apk --package com.nox.ci \
+          ./nox protect user.c --apk fixtures/sample.apk --package com.nox.ci \
                   -o libuser.so
-
-          # 断言 1：产物是 aarch64
-          M=$(readelf -h libuser.so | grep -m1 Machine | sed 's/ *Machine: *//')
-          [ "$M" = "AArch64" ] || { echo "✗ 产物架构是 '$M'，应为 AArch64"; exit 1; }
-          echo "✔ 产物架构 AArch64"
-
-          # 断言 2：含 .ncx 加密段（说明静态库被正确链接、段标记生效）
           readelf -SW libuser.so | grep -q '\.ncx ' \
-            || { echo "✗ 产物缺 .ncx 段（--whole-archive 可能没生效）"; exit 1; }
-          echo "✔ 产物含 .ncx 加密段"
-
-          # 断言 3：符号已 strip
+            || { echo "✗ 产物缺 .ncx 段"; exit 1; }
           N=$(nm libuser.so 2>/dev/null | wc -l)
           [ "$N" -eq 0 ] || { echo "✗ 符号表未清空（$N 个）"; exit 1; }
-          echo "✔ 符号表已清空"
-
-      - name: 校验包在 aarch64 上可用（可选，仅当 runner 是 arm 时）
-        if: runner.arch == 'ARM64'
-        run: echo "runner 是 ARM64，可直接验证（当前 CI 是 x86，跳过）"
+          echo "✔ 用户代码加密成功、含 .ncx 段、符号已清空"
 
       - name: 生成校验和
         run: |

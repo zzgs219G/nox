@@ -82,62 +82,12 @@ EOF
 echo "=== nox 自测（$(basename "$APK")）==="
 echo ""
 
-# ── 设施链接方式（2026-10-30）──────────────────────────────────
-# 分发包默认只带 lib/libnox.a（不含设施 .c），而源码仓库有 .c。
-# 两种布局都要能测，否则"包内自测"在发布形态下必然失败
-# （实测踩过：CI 里 V1 报 no such file or directory: nc_guard_boot.c）。
-#
-# ⚠️ 用 .a 时必须加 --whole-archive：静态库只链接被引用的成员，
-#    而 nc_guard_boot.o 的入口是 constructor，无人显式调用 → 整个丢弃
-#    → 加密段从 5 个剩 1 个。
-GUARD_LINK=""
-GUARD_INC=""
-# ⚠️ 按【宿主架构】选 .a，不能无脑用 lib/libnox.a（实测踩过）：
-#    发布包里的 lib/libnox.a 是 CI runner 编的 x86-64，而用户在
-#    aarch64 上跑必然失败：
-#        is incompatible with aarch64linux
-#    nox 已按 ABI 分目录，这里保持一致：优先 lib/<宿主架构>/。
-_host_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo x86_64 ;;
-        aarch64|arm64) echo aarch64 ;;
-        armv7l|armv8l) echo arm ;;
-        *) uname -m ;;
-    esac
-}
-_static_lib() {
-    # ⚠️ 只接受【与宿主架构匹配】的 .a（实测踩过）：
-    #    在 x86-64 runner 上回落到 lib/arm64-v8a/libnox.a 会导致
-    #        V1 编译失败（库是 AArch64，编译目标是 x86-64）
-    #    正确行为是"没有匹配的就改用源码"，而不是硬凑一个架构不对的。
-    local h; h=$(_host_arch)
-    for c in "$ROOT/lib/$h/libnox.a" "$ROOT/lib/libnox.a"; do
-        [ -f "$c" ] || continue
-        local m
-        m=$(readelf -h "$c" 2>/dev/null | grep -m1 Machine | sed 's/ *Machine: *//')
-        case "$h:$m" in
-            x86_64:*X86-64*|aarch64:*AArch64*|arm:*ARM*) echo "$c"; return ;;
-        esac
-    done
-}
-_LIB=$(_static_lib)
-if [ -n "$_LIB" ] && [ ! -f "$ROOT/so-guard/nc_guard_boot.c" ]; then
-    GUARD_LINK="__WHOLE__$_LIB"
-    GUARD_INC="-I$ROOT/so-guard"
-    GUARD_MODE="静态库 ${_LIB#$ROOT/}"
-else
-    GUARD_INC="-I."
-    GUARD_MODE="源码 so-guard/*.c"
-fi
-# 展开成 clang 能吃的形式（--whole-archive 必须包住 .a 路径）
-clang_guard() {
-    if [ -n "$GUARD_LINK" ]; then
-        printf '%s\n%s\n%s' "-Wl,--whole-archive" "${GUARD_LINK#__WHOLE__}" "-Wl,--no-whole-archive"
-    else
-        printf '%s\n' nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c
-    fi
-}
-echo "设施链接方式: $GUARD_MODE"
+# ── 设施链接方式 ───────────────────────────────────────────────
+# 恒用源码编译。2026-10 曾支持"用预编译 .a"，已废弃：.a 与架构绑死，
+# 在错误架构上会报 is incompatible with aarch64linux，而这套分发的
+# 主要场景恰恰是跨架构（CI 编、用户用）。详见 nox 文件头的说明。
+GUARD_INC="-I."
+echo "设施链接方式: 源码 so-guard/*.c"
 
 # ── V1 编译（只拷本目录的源文件，不加任何外部代码）──
 echo "── V1 独立编译 ──"
@@ -145,9 +95,9 @@ cp "$ROOT"/so-guard/*.c "$ROOT"/so-guard/*.h "$W"/ 2>/dev/null
 cd "$W" || exit 2
 # ⚠️ 测试不做 -fvisibility=hidden：那会把 ncguard_unlock 藏进 hidden，
 #    dlsym 拿不到，无法验证解锁链路。生产构建才需要 hidden（见 README）。
-# shellcheck disable=SC2046
 if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
-        $(clang_guard) biz.c tshell.c -o raw.so 2>build.log; then
+        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
+        biz.c tshell.c -o raw.so 2>build.log; then
     ok "V1 编译通过（$(stat -c%s raw.so) B）"
 else
     bad "V1 编译失败"; head -15 build.log; echo; echo "结果: $PASS 通过, $FAIL 失败"; exit 1
@@ -371,9 +321,9 @@ __attribute__((visibility("default")))
 int demo_v7_sum(void) { return v7_sum(); }
 V7EOF
 cd "$W" || exit 2
-# shellcheck disable=SC2046
 if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
-        $(clang_guard) biz2.c -o v7raw.so 2>v7build.log; then
+        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
+        biz2.c -o v7raw.so 2>v7build.log; then
     # 关键：两段都要锁（--section .ncx,.ncxr）
     if python3 "$LOCK" v7raw.so v7l1.so --section .ncx,.ncxr \
             --from-apk "$APK" --package "$PKG_FIX" >v7l1.log 2>&1 \

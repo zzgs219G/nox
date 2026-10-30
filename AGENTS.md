@@ -39,7 +39,7 @@ int my_func(void) { ... }        /* 这个函数会被加密 */
 1. 同步 `so-guard/so-section-lock.py`（它从本头文件抽取常量的正则）
 2. 同步 `so-guard/nc_guard_boot.c`（消费这些常量的 C 侧）
 3. 跑 `./test.sh` 全绿（14 项）
-4. 若是**扩容** slot，还要重新生成 `lib/*/libnox.a`
+(分发形态是源码，无预编译产物需要重生成)
 
 ⚠️ 本文件零 include、零逻辑 —— 这是刻意的，任何工具链都能编。
 不要把逻辑塞进来。
@@ -102,17 +102,15 @@ causes a section type conflict
 
 ## 3. 允许的改动方式
 
-### 3.1 改 C 实现 → 必须重新生成静态库
+### 3.1 分发形态是源码，没有预编译产物
 
-发布包发的是 `lib/<abi>/libnox.a`（机器码），**不是源码**。
+发布包发的是 `so-guard/*.c` 源码，用户在自己机器上编译。
+**改 .c 直接生效，不需要重打任何二进制。**
 
-```bash
-./make-static-lib.sh host            # 本机架构
-./make-static-lib.sh arm64-v8a       # 需 ANDROID_NDK_HOME
-./make-static-lib.sh armeabi-v7a
-```
-
-**只改 .c 不重新生成 .a = 改动对分发用户完全无效。**
+（2026-10 曾短暂改为发 `lib/<abi>/libnox.a` 静态库，已废弃。原因：
+① `.a` 与 CPU 架构绑死，跨架构分发要维护架构矩阵，为此连续踩了 5 个坑；
+② 源码本来就公开在 GitHub 上，藏 `.a` 只挡得住"下载 zip 的人"。
+若将来确需藏源码，正确做法是服务化，不是发 `.a`。）
 
 ### 3.2 改测试 → 必须做反向验证
 
@@ -144,7 +142,7 @@ causes a section type conflict
 
 | 改了什么 | 还要做什么 |
 |---|---|
-| `.c` 实现 | `./make-static-lib.sh <abi>` 重新生成 `.a` |
+| `.c` 实现 | 无需额外动作（源码形态） |
 | `test.sh` 断言 | 反向验证：故意改坏 → 确认转红 → 恢复 |
 | `make-zip.sh` / `nox` | 打 zip → **解压到干净目录** → 跑 `./test.sh` |
 | CI workflow | 本地 `python3 -c "import yaml;yaml.safe_load(...)"` + 手动触发一次 |
@@ -163,36 +161,27 @@ causes a section type conflict
 
 ## 5. 分发形态契约
 
-### 5.1 发布包不含加密设施的 `.c`
+### 5.1 发布包只含源码，不含预编译二进制
 
-打包逻辑在 `make-zip.sh`：默认静态库形态，只放 `.h` + `.py` + `lib/*/libnox.a`。
-CI 有反向断言 —— 包内出现 `nc_guard_*.c` 即失败。
+打包逻辑在 `make-zip.sh`。CI 有反向断言 —— 包内出现 `.a` 即失败
+（防止有人误把已废弃的静态库形态加回来）。
 
-`SOURCE_MODE=1 ./make-zip.sh` 可发源码版（给要改代码的人），但要在
-提交信息里说明理由。
+### 5.2 源码形态的天然优势：不受架构限制
 
-### 5.2 必须按架构分发 `.a`
+源码在哪个架构上都能编，不需要架构矩阵、不需要交叉编译工具链、
+不会出现 `is incompatible with aarch64linux` 这类问题。
 
-`.a` 是机器码，与 CPU 绑死。当前提供：
-
-```
-lib/arm64-v8a/libnox.a      AArch64   ← Android 主力
-lib/armeabi-v7a/libnox.a    ARM       ← Android 旧设备
-lib/aarch64/libnox.a        AArch64   ← ARM Linux/macOS 宿主自测（与前者的别名）
-```
-
-**`arm64-v8a` 与 `aarch64` 是同一架构的两个名字**（Android ABI 名 vs
-`uname -m` 返回值），都要有，否则一边找不到。
-
-链接 `.a` 必须加 `-Wl,--whole-archive`：`nc_guard_boot.o` 的入口是
-`constructor`（无人显式调用），不加会被整个丢弃 → 加密段从 5 个剩 1 个。
+这是放弃 `.a` 的主要理由之一。
 
 ### 5.3 已知无法隐藏的部分（如实，不要试图"修好"）
 
 ```
-C 实现        ✅ 藏在 .a 里（机器码）
-头文件契约    ❌ 必须公开（编译需要：段名、slot 布局）
-Python 工具   ❌ 必须公开（无编译形态，.pyc 可反编译）
+C 实现        ❌ 公开（源码分发）
+头文件契约    ❌ 公开（编译需要：段名、slot 布局）
+Python 工具   ❌ 公开（无编译形态，.pyc 可反编译）
+
+也就是说：**这个包目前完全没有隐藏实现**。它就是一套开源工具，
+靠"抬高逆向成本"提供价值，不靠"藏住算法"。
 ```
 
 **读 `so-section-lock.py` 就能知道锁箱格式。** 这是 Python 的固有限制，
@@ -200,21 +189,27 @@ Python 工具   ❌ 必须公开（无编译形态，.pyc 可反编译）
 
 ---
 
-## 6. 架构债（下次重构应优先处理）
+## 6. 分发形态的历史教训（不要走回头路）
 
-**"选哪个架构的 .a"这个决策散落在 4 处**，每修一处就发现下一处：
+2026-10 曾花大量精力把分发改成预编译 `.a`，想藏住 C 实现。结果是：
 
-```
-nox          find_static_lib()
-test.sh      _host_arch() / _static_lib()
-make-zip.sh  打包时遍历 lib/*/
-CI           冒烟测试里指定 --abi
-```
+| 踩的坑 | 症状 |
+|---|---|
+| 只发 x86-64 的 .a | aarch64 链接报 `incompatible` |
+| nox 按 ABI 选了，test.sh 没同步 | 自测用错架构 |
+| test.sh 回落策略硬凑 | 用 AArch64 库编 x86 目标 |
+| 交叉编译用宿主 strip | `Unable to recognise the architecture` |
+| 包里留 x86 兜底库 | 用户命中它、报无关错误 |
 
-应抽成 `scripts/pick-lib.sh` 供四处 `source`。在那之前，**改选库逻辑
-必须四处一起看**。
+**根因**：`.a` 是机器码，与架构绑死；而"选哪份"的决策天然散落在
+nox / test.sh / make-zip.sh / CI 四处。
 
----
+**最终放弃的理由**：源码本来就公开在 GitHub 上，藏 `.a` 只挡得住
+"下载 zip 的人"，挡不住"看仓库的人"。收益不抵成本。
+
+**若将来又被要求"藏源码"**，先问：仓库私有吗？
+- 公开仓库 → 藏不住，别做 `.a`
+- 私有仓库 → 做服务化（上传 so，服务器加密后返回），不要发 `.a`
 
 ## 7. 一句话交接
 
