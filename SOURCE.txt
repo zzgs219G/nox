@@ -2,13 +2,17 @@
 来源提交: ed72a40 docs(so-guard): 独立化改造计划（供监督方审查）
 来源路径: scripts/so-guard/
 同步日期: 2026-10-30
+说明: 2026-10-30 独立化改造后（零外部依赖，可单独编译）
 
 文件校验（sha256）:
-fb2ef73a50562efb91730f33242abfe6660b2592f3a01c773da9c354589b0210  nc_guard_boot.c
+8aaff1ad7e921355ec470689b4ade8cfef7dd0d96ca8b9ece9a0c107a76e994d  nc_guard_boot.c
 b00108fcb458d2dc85a476123f41719bd6af371f4c12e1a6b1af75fba08c3797  nc_guard_jni.c
 83bb4a85686ba1dd304830860f8c8b2f2ba72a7498bfffeff3f7fc5233cc1ee0  nc_guard_key.c
+669a0295750df5fa9a97fb16d506511b267f48b9fb0ddd49400a2a2e3c7602a0  nc_guard_paths.c
 40d23267882df9494e2cd4ff21cc9c5d0dc6a422868110c7839c6119fce0966f  nc_guard_probe.c
 e2161482ad61665ca18165d5a325efe4c397e7ac039287b6da4c7779754ee139  nc_guard_key.h
 1d9914805d8bb8253d4fc8b3aa08d679479f89ac9b61fa679cae28544523a2bb  nc_guard_layout.h
+c9ac9e6afde0ccb2180095c0c591b435522869c324a4e4e2a317fdf65e5698a2  nc_guard_paths.h
+94c582ed2924167846115b382f0cdaf28ead8069cf90cfcbea71542c3452de9e  gen-paths.py
 8c3c6764575ff029a60c62d9bf54e28131e4b0253c27197901abb257a46f8cd0  so-section-lock.py
 2aaacd8a2fb79a981a9929774f17c7d603a04e96ca2f49195fd1402c36b424c0  so_section_mark.py

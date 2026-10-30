@@ -2,18 +2,29 @@
 
 把 C 代码中标记过的函数段加密，运行时由 so 自己解开。
 
-## 当前状态：**尚不可独立使用**
+## 当前状态：可单独编译
 
-⚠️ **本仓库目前只是一个快照，还不能单独编译。**
+✅ **本仓库已零外部源码依赖，可独立编译。**
 
-设施依赖主项目生成的 `sig_log_data.h`（用于隐藏两条 `/proc` 路径），
-导致脱离主项目时编译直接失败：
-
+```bash
+clang -fPIC -shared -Oz -fvisibility=hidden -DNC_GUARD_SECTIONED \
+      nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
+      your_code.c -o libyour.so
 ```
-nc_guard_boot.c:56:10: fatal error: 'sig_log_data.h' file not found
+
+（`nc_guard_jni.c` 可选，仅提供 JNI 自检入口。）
+
+### 编译后还需一步：锁箱
+
+编译出的 so 里 `.ncx` 段仍是明文，必须用 `so-section-lock.py` 加密：
+
+```bash
+python3 so-section-lock.py libyour.so libyour.locked.so \
+        --section .ncx --from-apk your-app.apk
+python3 so-section-lock.py libyour.locked.so libyour.final.so --lock-head
 ```
 
-改造计划见主项目 `docs/计划-so-guard独立化.md`。**在改造完成前，请勿把本仓库当作可用依赖。**
+**必须提供已签名的 APK** —— 密钥由它的证书派生（见下方"重要约束"）。
 
 ---
 
@@ -73,6 +84,8 @@ k_so = HKDF(master, SHA256(证书DER), "nc-so-v1" + 包名, 16)
 | `nc_guard_layout.h` | 契约唯一真相源：段名、尺寸、偏移、magic seed。零逻辑，带 `_Static_assert` |
 | `nc_guard_boot.c` | 自解谜引导：明文 stub（`.text`）+ unlock 本体（`.ncxh` 密文） |
 | `nc_guard_key.c` | SHA-256 / HMAC / HKDF / APK 证书 DER 定点读取 |
+| `nc_guard_paths.c/.h` | 两条 `/proc` 路径的密文表（自包含，不再依赖外部生成器） |
+| `gen-paths.py` | 生成上面那张密文表（一次性工具，可重跑） |
 | `nc_guard_probe.c` | `.ncx` / `.nck` 两段的唯一定义处 + 样例消费者 |
 | `nc_guard_jni.c` | JNI 自检入口（返回 59 = 全链路通过） |
 | `so-section-lock.py` | 构建期锁箱：加密段、写密钥槽、熵值安检 |
@@ -89,4 +102,19 @@ k_so = HKDF(master, SHA256(证书DER), "nc-so-v1" + 包名, 16)
 ## 来源
 
 本仓库是 `apk-protect-action` 项目中 `scripts/so-guard/` 的镜像，
-同步于该项目的提交（详见 `SOURCE.txt`）。后续改造将在此仓库进行。
+同步于该项目的提交（详见 `SOURCE.txt`）。
+
+### 独立化改造（2026-10-30）
+
+此前本设施 `#include "sig_log_data.h"`（主项目 sigcheck 模块生成的表），
+导致脱离主项目时编译失败：
+
+```
+nc_guard_boot.c:56:10: fatal error: 'sig_log_data.h' file not found
+```
+
+现已改为自包含：`nc_guard_paths.c` 自带两条 `/proc` 路径的密文
+（只这两条，成本极低），不再依赖任何外部生成器。
+
+**验证**：不拷贝任何 sigcheck 文件，仅凭本目录 + 一段业务代码即可编译通过，
+且 `.ncx/.ncxr/.ncxh/.nck/.ncks` 五段齐全。

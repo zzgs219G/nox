@@ -42,18 +42,22 @@
 
 #include "nc_guard_key.h"   /* khmac_sha256 */
 
-/* LSGS 密文表（路径字面量用）。
+/* 路径字面量走自带的密文表（2026-10-30 独立化）。
  *
- * ⚠️ 本文件的路径【复用 env_check.c 定义的宏】（LSGS_PATH_CMDLINE /
- *    LSGS_PATH_MAPS），不另立标记 —— make-sig-log.py 只扫描
- *    sig_check.c 与 env_check.c，扫不到本文件。同内容复用同一条密文，
- *    既省体积也避免两条标记内容漂移。
+ * 历史：此前复用 env_check.c 定义的 LSGS_PATH_CMDLINE / LSGS_PATH_MAPS
+ *   宏，由主项目的 make-sig-log.py 统一生成 sig_log_data.h。那个做法省体积，
+ *   但让本设施在编译期依赖 sigcheck 模块的产物 —— 单独拿设施编译会失败。
+ *   现在改为 nc_guard_paths.c 自带两条路径的密文（只这两条，成本极低）。
  *
  * ⚠️ 为什么必须加密：这两个字面量所在函数虽标进 .ncxh，
  *    但 **C 的字符串字面量永远进 .rodata，不会跟着函数进自定义段**。
  *    实测确认：锁箱后 /proc/self/cmdline 仍在 .rodata 明文可搜。 */
 #include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/slot尺寸/偏移/magic seed */
-#include "sig_log_data.h"
+/* ⚠️ 2026-10-30 独立化：原先 include "sig_log_data.h"（主项目 sigcheck 模块
+ *    生成的表），那让本设施脱离主项目就编译不过。现改为自带的路径密文表。
+ *    只有两条路径需要隐藏（cmdline / maps），自包含成本极低。
+ *    强度边界见 nc_guard_paths.h 的文件头（混淆，非加密）。 */
+#include "nc_guard_paths.h"
 
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
@@ -543,7 +547,7 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_self_pkg(char *out, size_t cap) {
     char _cb[24];
-    const char *_cp = lsg_s(LSGS_PATH_CMDLINE, _cb, sizeof(_cb));
+    const char *_cp = ncg_path_s(NCG_PATH_CMDLINE, _cb, sizeof(_cb));
     int fd = _cp ? open(_cp, O_RDONLY) : -1;
     if (fd < 0) return -1;
     char buf[256];
@@ -599,7 +603,7 @@ static void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
-    const char *_mp = lsg_s(LSGS_PATH_MAPS, _mb, sizeof(_mb));
+    const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
     int fd = _mp ? open(_mp, O_RDONLY) : -1;
     if (fd >= 0) {
         /* maps 可能上百 KB，按块读，逐行拼装 */
