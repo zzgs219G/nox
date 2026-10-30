@@ -488,6 +488,86 @@ static void ncg_rc4(const uint8_t *key, size_t keylen,
     }
 }
 
+/* 判断 [addr, addr+len) 覆盖的任何一个页范围内，是否存在
+ * 原始权限为可写（SHF_WRITE）的其它段。
+ *
+ * 为什么需要它：mprotect 的粒度是【页】。给某个段设只读时，若该页上
+ * 还住着 .data / .bss 这类本来可写的段，它们会一起变只读 →
+ * 后续写入即 SIGSEGV。
+ *
+ * 实测踩过两次：
+ *   ① .ncxhr（master，32B）与 .data/.bss 同页 —— 已在 ncg_stub_recover
+ *      里用"恢复 RW"修掉
+ *   ② .ncxr（常量表，17B）与 .bss 同页 —— 2026-10-30 实测 dlopen 即
+ *      SIGSEGV。主项目没暴露是因为它的 .ncxr 有 96 字节、恰好与 .data
+ *      同页而不是 .bss。
+ *
+ * 返回 1 = 有可写邻居（调用方应保持 RW），0 = 无（可安全设只读）。
+ * 出错时返回 1（保守：宁可权限宽一点，也不要误伤正常段）。 */
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
+                                          size_t len, uintptr_t page) {
+    /* 思路：镜像基址必定页对齐，所以「运行期地址所在页」减去基址后，
+     * 与「链接期地址所在页」是同一页。因此只要把所有段的 sh_addr 按页
+     * 分组，找出 addr 落在哪一组，再看该组里有没有 SHF_WRITE 的段即可。
+     *
+     * 但 addr 是运行期地址、sh_addr 是链接期地址，两者的页号可能差一个
+     * 常数（基址页号）。为回避这个未知量，改用【相对位置】判断：
+     *   对每个候选段 X（非当前段），若 X 与本段的链接期距离
+     *   |X.sh_addr - 本段.sh_addr| 使得两者覆盖的页区间相交，则同页。
+     * 这只需要段表，不需要基址。 */
+    int fd = open(so_path, O_RDONLY);
+    if (fd < 0) return 1;                    /* 保守：放宽权限，不误伤 */
+    Elf64_Ehdr eh;
+    if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)
+        || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0
+        || eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shnum > 4096) {
+        close(fd); return 1;
+    }
+    Elf64_Shdr *shs = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
+    if (!shs) { close(fd); return 1; }
+    if (pread(fd, shs, eh.e_shnum * sizeof(Elf64_Shdr), eh.e_shoff)
+        != (ssize_t)(eh.e_shnum * sizeof(Elf64_Shdr))) {
+        free(shs); close(fd); return 1;
+    }
+    close(fd);
+
+    /* 找出当前段：运行期地址与 sh_addr 的差就是基址，同一镜像里所有段
+     * 共用同一个基址。故 base = addr - 当前段.sh_addr，但我们不知道
+     * 当前段是哪个。改为：对每个段假设它是当前段，算出 base，再验证
+     * 该 base 是否让 addr 落在它的范围内。只有一个段会验证通过。 */
+    const Elf64_Shdr *cur = NULL;
+    for (int i = 0; i < eh.e_shnum; i++) {
+        if ((shs[i].sh_flags & SHF_ALLOC) == 0) continue;
+        if ((shs[i].sh_flags & SHF_WRITE) != 0) continue;   /* 当前段是只读的 */
+        if (shs[i].sh_addr == 0 || shs[i].sh_size == 0) continue;
+        uintptr_t base = addr - (uintptr_t)shs[i].sh_addr;
+        if (addr >= base + shs[i].sh_addr
+            && addr + len <= base + shs[i].sh_addr + shs[i].sh_size
+            && base % page == 0) {
+            cur = &shs[i];
+            break;
+        }
+    }
+    if (!cur) { free(shs); return 1; }
+
+    /* 与当前段页区间相交的其它段里，有可写的吗 */
+    uintptr_t clo = (uintptr_t)cur->sh_addr & ~(page - 1);
+    uintptr_t chi = (((uintptr_t)cur->sh_addr + cur->sh_size - 1) & ~(page - 1)) + page;
+    int found = 0;
+    for (int i = 0; i < eh.e_shnum; i++) {
+        if (&shs[i] == cur) continue;
+        if ((shs[i].sh_flags & SHF_ALLOC) == 0) continue;
+        if ((shs[i].sh_flags & SHF_WRITE) == 0) continue;
+        if (shs[i].sh_size == 0) continue;
+        uintptr_t wlo = (uintptr_t)shs[i].sh_addr & ~(page - 1);
+        uintptr_t whi = (((uintptr_t)shs[i].sh_addr + shs[i].sh_size - 1) & ~(page - 1)) + page;
+        if (wlo < chi && clo < whi) { found = 1; break; }
+    }
+    free(shs);
+    return found;
+}
+
 /* 在 ELF 文件里按名字找段（ELF64；armeabi-v7a 的 ELF32 支持是既有缺口，
  * 见 unlock.c 同款函数的历史说明，本轮不扩范围） */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
@@ -998,10 +1078,40 @@ int ncg_head_unlock(void) {
         memcpy(tgt, buf, len);
         free(buf);
         if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
-        if (mprotect((void *) s, e - s,
-                     PROT_READ | (is_code ? PROT_EXEC : 0)) != 0) {
-            ncg_wipe(key, sizeof(key));
-            return -10;
+        /* ⚠️⚠️ 2026-10-30 修 SIGSEGV（实测复现）：
+         *   原实现对数据段设 PROT_READ（只读）——前提是"该页只属于它"。
+         *   但实测布局里 .ncxr 与 .bss 同页：
+         *       .ncxr  addr=0xc54e size=17   ┐ 同属页 0xc000
+         *       .bss   addr=0xc560 size=9968 ┘
+         *   mprotect 粒度是页 → 把整页设成只读 → .bss 也变只读 →
+         *   之后任何 .bss 写入即 SIGSEGV（dlopen 阶段直接崩）。
+         *
+         *   这与 .ncxhr/master 段踩的是同一个坑（见 ncg_stub_recover 里
+         *   "恢复成 RW 而不是 R" 的注释）。当时的修法只覆盖了 master，
+         *   没覆盖这里 —— 因为主项目的 .ncxr（96 字节签名表）恰好与
+         *   .data 同页而非 .bss，没暴露出来。
+         *
+         *   修法：数据段若与"本来可写"的段同页，保持 RW。
+         *   密文段的安全性从来靠"内容是密文"，不靠页权限 ——
+         *   所以放宽成 RW 不降低防护（攻击者能读，本来就该能读；
+         *   能写也没用，MAC 会拒）。 */
+        {
+            int prot = PROT_READ;
+            if (is_code) {
+                prot |= PROT_EXEC;
+            } else {
+                /* 数据段：同页若含 .data/.bss（原始权限可写），保持 RW，
+                 * 否则会误伤。判据：检查覆盖该段的整页范围内，
+                 * 是否有其它段要求 SHF_WRITE。 */
+                if (ncg_page_has_writable_neighbor(so_path, (uintptr_t)tgt,
+                                                   len, ps)) {
+                    prot |= PROT_WRITE;
+                }
+            }
+            if (mprotect((void *) s, e - s, prot) != 0) {
+                ncg_wipe(key, sizeof(key));
+                return -10;
+            }
         }
     }
 

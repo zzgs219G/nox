@@ -79,6 +79,10 @@ int plain_add(int a, int b) {
  * 所以这里默认【注释掉】，让最小示例先跑通。
  * 要用常量表保护，取消注释并确认上面两条都做到。
  *
+ * ℹ️ 2026-10-30 补充：第三条连带影响已修（.ncxr 与 .bss 同页时 mprotect
+ *    会把 .bss 变只读 → dlopen SIGSEGV）。现在启用它是安全的，
+ *    test.sh 的 V7 项专门覆盖这个场景。
+ *
 __attribute__((section(".ncxr"), used, retain))
 const uint8_t sample_table[16] = {
     0x3C, 0x5A, 0x91, 0xE7, 0x12, 0x8B, 0xD4, 0x6F,

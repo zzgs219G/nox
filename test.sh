@@ -260,6 +260,70 @@ else
     skip "V5 无一级锁箱产物"
 fi
 
+# ── V7 带 .ncxr 常量表的场景（2026-10-30 新增，修完真 bug 后补的断言）──
+# 为什么必须单独测：.ncxr 与 .bss 同页时，给数据段设只读会把 .bss 也变
+# 只读 → dlopen 阶段 SIGSEGV。主项目的 .ncxr 有 96 字节、恰好与 .data
+# 同页而非 .bss，所以这条路径长期没被覆盖。实测发现后修了
+# ncg_page_has_writable_neighbor()，本项防止回归。
+echo "── V7 常量表（.ncxr 与 .bss 同页）──"
+cat > "$W/biz2.c" <<'V7EOF'
+#include <stdint.h>
+/* 数据放 .ncxr（clang 不允许 const 进 AXR 段） */
+__attribute__((section(".ncxr"), used, retain))
+static uint8_t V7DATA[17] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17};
+/* 代码放 .ncx，读上面的数据 */
+__attribute__((section(".ncx"), used, retain))
+int v7_sum(void) {
+    int s = 0;
+    for (int i = 0; i < 17; i++) s += V7DATA[i];
+    return s;
+}
+__attribute__((visibility("default")))
+int demo_v7_sum(void) { return v7_sum(); }
+V7EOF
+cd "$W" || exit 2
+if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I. \
+        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
+        biz2.c -o v7raw.so 2>v7build.log; then
+    # 关键：两段都要锁（--section .ncx,.ncxr）
+    if python3 "$LOCK" v7raw.so v7l1.so --section .ncx,.ncxr \
+            --from-apk "$APK" --package "$PKG_FIX" >v7l1.log 2>&1 \
+       && python3 "$LOCK" v7l1.so v7l2.so --lock-head >v7l2.log 2>&1; then
+        mkdir -p "v7fake/$PKG_FIX/lib/arm64-v8a"
+        cp "$APK" "v7fake/$PKG_FIX/base.apk"
+        cp v7l2.so "v7fake/$PKG_FIX/lib/arm64-v8a/libv7.so"
+        cat > v7drv.c <<'V7DRV'
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int c, char **v) {
+    void *h = dlopen(v[1], RTLD_NOW);
+    if (!h) { printf("OPENFAIL\n"); return 2; }
+    int (*f)(void) = dlsym(h, "demo_v7_sum");
+    if (!f) { printf("NOSYM\n"); return 3; }
+    printf("%d\n", f());
+    return 0;
+}
+V7DRV
+        if clang v7drv.c -o v7drv -ldl 2>/dev/null; then
+            V7OUT=$( cd "v7fake/$PKG_FIX" && bash -c "exec -a $PKG_FIX '$W/v7drv' ./lib/arm64-v8a/libv7.so" 2>/dev/null )
+            # 1+2+...+17 = 153
+            if [ "$V7OUT" = "153" ]; then
+                ok "V7 带 .ncxr 的产物可解锁并正确执行（v7_sum()=153）"
+            elif [ "$V7OUT" = "OPENFAIL" ]; then
+                bad "V7 dlopen 失败 —— .ncxr 与 .bss 同页的 mprotect 问题回归了"
+            else
+                bad "V7 执行结果异常: '$V7OUT'（期望 153）"
+            fi
+        else
+            skip "V7 无法编译驱动"
+        fi
+    else
+        bad "V7 锁箱失败"; tail -5 v7l1.log v7l2.log 2>/dev/null
+    fi
+else
+    bad "V7 编译失败"; head -10 v7build.log
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
