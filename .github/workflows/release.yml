@@ -113,10 +113,33 @@ jobs:
           chmod +x make-zip.sh
           ./make-zip.sh "${{ steps.ver.outputs.version }}"
 
-      - name: 生成静态库
+      - name: 安装 NDK（交叉编译 arm 静态库用）
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: 生成静态库（按架构）
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
+          # ⚠️ .a 是机器码，必须按目标架构分别生成。
+          #    只出 host（x86-64）的话，用户在 aarch64 / Android 上链接会报
+          #        is incompatible with aarch64linux
+          #    整个包等于不可用 —— 这是 v0.2.0 实际踩到的坑。
           chmod +x make-static-lib.sh
+          echo "── host ──"
           ./make-static-lib.sh host
+          echo "── arm64-v8a ──"
+          ./make-static-lib.sh arm64-v8a
+          echo "── armeabi-v7a ──"
+          ./make-static-lib.sh armeabi-v7a
+          echo ""
+          echo "生成结果："
+          for f in lib/libnox.a lib/*/libnox.a; do
+            [ -f "$f" ] && printf "  %-30s %s\n" "$f" \
+                "$(readelf -h "$f" | grep -m1 Machine | sed 's/ *Machine: *//')"
+          done
 
       - name: 打包
         run: |
@@ -131,7 +154,7 @@ jobs:
           echo "包大小: $(stat -c%s "$Z") 字节"
           # 默认形态：静态库分发。关键文件里应有 .a、不该有 .c
           for f in nox test.sh README.md QUICKSTART.md \
-                   lib/libnox.a \
+                   lib/arm64-v8a/libnox.a \
                    so-guard/nc_guard_layout.h \
                    so-guard/so-section-lock.py \
                    fixtures/sample.c fixtures/sample.apk example/run.sh; do
@@ -153,6 +176,20 @@ jobs:
             exit 1
           fi
           echo "✔ 未含加密设施 C 源码（静态库形态正确）"
+
+          # ── 断言：arm64-v8a 的 .a 必须是 aarch64 架构 ──
+          # 防"误把 host 的 .a 塞进 arm64 目录"——那样对方链接时才炸，
+          # 而且报错信息不指向真因（is incompatible with aarch64linux）。
+          T=$(mktemp -d)
+          unzip -q -o "$Z" -d "$T"
+          A="$T/nox-${{ steps.ver.outputs.version }}/lib/arm64-v8a/libnox.a"
+          M=$(readelf -h "$A" 2>/dev/null | grep -m1 Machine | sed 's/ *Machine: *//')
+          if [ "$M" != "AArch64" ]; then
+            echo "✗ lib/arm64-v8a/libnox.a 架构是 '$M'，应为 AArch64"
+            exit 1
+          fi
+          echo "✔ arm64-v8a 静态库架构正确（AArch64）"
+          rm -rf "$T"
 
       - name: 冒烟测试（解压后能否零参数自测 + 静态库可用）
         run: |

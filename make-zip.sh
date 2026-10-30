@@ -51,12 +51,29 @@ else
     cp so-guard/*.h "$STAGE/so-guard/"
     cp so-guard/*.py "$STAGE/so-guard/"
     rm -rf "$STAGE/so-guard/__pycache__"
-    if [ ! -f lib/libnox.a ]; then
-        echo "  lib/libnox.a 不存在，先跑 ./make-static-lib.sh"
-        ./make-static-lib.sh host >/dev/null 2>&1 || true
-    fi
+    # ⚠️ .a 是机器码，必须按架构分别提供（实测踩过：
+    #    只发 host 架构的 .a，用户在 aarch64 上链接报
+    #    "is incompatible with aarch64linux"，整个包不可用）。
+    #    这里把所有已生成的架构都打进去；缺的由 CI/用户自行补。
     mkdir -p "$STAGE/lib"
-    cp lib/libnox.a "$STAGE/lib/"
+    _n=0
+    for d in lib/*/; do
+        [ -d "$d" ] || continue
+        abi=$(basename "$d")
+        [ -f "$d/libnox.a" ] || continue
+        mkdir -p "$STAGE/lib/$abi"
+        cp "$d/libnox.a" "$STAGE/lib/$abi/"
+        _n=$((_n+1))
+    done
+    # 单架构兜底布局（老路径，某些用户可能只有这一个）
+    if [ -f lib/libnox.a ]; then
+        cp lib/libnox.a "$STAGE/lib/libnox.a"
+        _n=$((_n+1))
+    fi
+    echo "  已打包 $_n 个静态库（按架构分目录）"
+    if [ "$_n" = "0" ]; then
+        echo "  ⚠ 没有任何 libnox.a —— 对方只能自己跑 make-static-lib.sh"
+    fi
 fi
 
 # ── 样本与示例 ──
