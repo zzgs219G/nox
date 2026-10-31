@@ -117,6 +117,10 @@ chmod +x "$STAGE/test.sh"
 cp README.md "$STAGE/"
 cp AGENTS.md "$STAGE/"   # AI 接手维护时的必读契约
 
+# 版本标记：解压后 `cat nox/VERSION` 即知版本，不用回仓库查 tag。
+# 消费者（artifact-pipeline 的 ensure_nox）也靠它做版本校验与日志。
+printf '%s\n' "$VER" > "$STAGE/VERSION"
+
 # 包内快速上手说明
 cat > "$STAGE/QUICKSTART.md" <<'EOF'
 # 三分钟上手（静态库形态）
