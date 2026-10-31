@@ -113,12 +113,22 @@ jobs:
           # make-zip-lib.sh 要把 so-guard/*.c 交叉编译成双 ABI 静态库。
           # 版本固定 r27d（与消费方 artifact-pipeline 的 setup-ndk 一致），
           # 换版 = 换 .a 的 ABI/目标三元组，必须同步验证。
+          #
+          # ⚠️ 不用 sdkmanager：它只认完整版本号（如 "ndk;27.0.12077973"），
+          #    写 "ndk;r27d" 会报 "Failed to find package"（v0.4.0 实测踩过）。
+          #    直接下官方压缩包更稳，且体积/时间可控。
           NDK_VER=r27d
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER" >> "$GITHUB_ENV"
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            --install "ndk;$NDK_VER" >/dev/null
-          echo "NDK: $ANDROID_HOME/ndk/$NDK_VER"
-          ls "$ANDROID_HOME/ndk/$NDK_VER/ndk-build"
+          NDK_ZIP="android-ndk-${NDK_VER}-linux.zip"
+          curl -fsSL -o /tmp/ndk.zip \
+            "https://dl.google.com/android/repository/${NDK_ZIP}"
+          mkdir -p "$RUNNER_TEMP/ndk"
+          unzip -q /tmp/ndk.zip -d "$RUNNER_TEMP/ndk"
+          NDK_DIR="$RUNNER_TEMP/ndk/android-ndk-${NDK_VER}"
+          test -d "$NDK_DIR" || { echo "✗ NDK 解压目录不存在: $NDK_DIR"; ls "$RUNNER_TEMP/ndk"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "NDK: $NDK_DIR"
+          ls "$NDK_DIR/toolchains/llvm/prebuilt/"
+          ls "$NDK_DIR"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang
 
       - name: 打包（静态库形态）
         run: |
