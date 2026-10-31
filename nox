@@ -204,6 +204,14 @@ def do_build(args, workdir):
                     print('  自动选择 ABI: %s（包内唯一静态库）' % _auto_abi)
 
     clang, extra = find_clang(args.abi or _auto_abi)
+    # 把推导出的 ABI 回写进 args：do_protect 的 strip 段靠它决定用不用
+    # NDK 的 llvm-strip。不回写的后果（v0.4.0 CI 实测）：
+    #   宿主 /usr/bin/strip 处理 ARM 产物 →
+    #   "Unable to recognise the architecture of the input file"
+    # 这正是 AGENTS.md §4 记的坑 #4 复发，只是触发路径从"显式 --abi"
+    # 变成了"自动推导 ABI"。
+    if _auto_abi and not args.abi:
+        args.abi = _auto_abi
     out_so = os.path.abspath(args.output)
     # 输出目录可能不存在（首次使用、或 zip 解压后没有空目录）
     out_dir = os.path.dirname(out_so)
@@ -330,6 +338,15 @@ def do_protect(args, workdir):
                     stripper = cand
                     break
     if not stripper:
+        # 交叉编译时【禁止】退回宿主 strip：它只认本机架构，处理 ARM 产物会报
+        # "Unable to recognise the architecture"（v0.4.0 CI 实测踩过）。
+        # 这种情况必须 fail-fast，让人话提示去装 NDK，而不是产出一个
+        # 符号表未清的包（那会让攻击者 nm 到 ncg_frag_* 等内部符号名）。
+        if getattr(args, 'abi', None):
+            die('交叉编译（--abi %s）找不到 llvm-strip。\n'
+                '  NDK 里应有 toolchains/llvm/prebuilt/*/bin/llvm-strip；\n'
+                '  宿主 /usr/bin/strip 不认识 ARM 产物，不能替代。\n'
+                '  请设 ANDROID_NDK_HOME 指向完整 NDK。' % args.abi)
         stripper = shutil.which('llvm-strip') or shutil.which('strip')
     if not stripper:
         shutil.copy2(step2, out_so)
