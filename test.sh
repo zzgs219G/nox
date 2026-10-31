@@ -21,9 +21,21 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
 
+# 加密设施目录：两种布局都要支持，否则测试在其中一个环境里跑不了。
+#   · 源码树（本仓库）：<root>/scripts/so-guard/
+#   · 发布包（zip 解压）：<root>/so-guard/  （打包时摊回平级）
+# 判据不能只看 .c —— 静态库形态的包里没有 .c，只有 .h + lib/<abi>/libnox.a。
+GUARD_DIR=""
+for _c in "$ROOT/scripts/so-guard" "$ROOT/so-guard"; do
+    if [ -f "$_c/nc_guard_layout.h" ]; then GUARD_DIR="$_c"; break; fi
+done
+if [ -z "$GUARD_DIR" ]; then
+    echo "✗ 找不到加密设施目录（试过 scripts/so-guard 与 so-guard）"; exit 1
+fi
+
 APK="${1:-}"
 SAMPLE_C="$ROOT/fixtures/sample.c"
-LOCK="$ROOT/so-guard/so-section-lock.py"
+LOCK="$GUARD_DIR/so-section-lock.py"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $*"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ✗ $*"; }
@@ -83,21 +95,59 @@ echo "=== nox 自测（$(basename "$APK")）==="
 echo ""
 
 # ── 设施链接方式 ───────────────────────────────────────────────
-# 恒用源码编译。2026-10 曾支持"用预编译 .a"，已废弃：.a 与架构绑死，
-# 在错误架构上会报 is incompatible with aarch64linux，而这套分发的
-# 主要场景恰恰是跨架构（CI 编、用户用）。详见 nox 文件头的说明。
-GUARD_INC="-I."
-echo "设施链接方式: 源码 so-guard/*.c"
+# 两种分发形态都要能自测：
+#   · 源码形态：把 so-guard/*.c 拷进临时目录一起编
+#   · 静态库形态：只有 so-guard/lib/<abi>/libnox.a，用 --whole-archive 链接
+# 为什么 .a 必须 --whole-archive：ncguard_unlock 是 constructor，无人显式
+# 引用 → 默认被丢弃 → 加密段 5 个塌成 1 个（实测）。
+GUARD_INC="-I$GUARD_DIR"
+HAS_SRC=0
+[ -f "$GUARD_DIR/nc_guard_boot.c" ] && HAS_SRC=1
+
+# 选一个可链接的静态库（宿主自测用：优先原生架构，否则任一可用 ABI）
+STATIC_LIB=""
+HOST_ABI=""
+case "$(uname -m)" in
+    aarch64|arm64) HOST_ABI=arm64-v8a ;;
+    armv7l|armv8l) HOST_ABI=armeabi-v7a ;;
+    x86_64)        HOST_ABI=x86_64 ;;
+    i686|i386)     HOST_ABI=x86 ;;
+esac
+if [ -f "$GUARD_DIR/lib/$HOST_ABI/libnox.a" ]; then
+    STATIC_LIB="$GUARD_DIR/lib/$HOST_ABI/libnox.a"
+fi
+
+# guard_compile <输出> <源码...>：按可用形态编译
+# 源码形态 → 直接编 .c；静态库形态 → 链接 .a（带 --whole-archive）
+guard_compile() {
+    local out="$1"; shift
+    if [ "$HAS_SRC" = "1" ]; then
+        cp "$GUARD_DIR"/*.h "$W"/ 2>/dev/null
+        ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$W" \
+            "$GUARD_DIR"/nc_guard_boot.c "$GUARD_DIR"/nc_guard_probe.c \
+            "$GUARD_DIR"/nc_guard_key.c "$GUARD_DIR"/nc_guard_paths.c \
+            "$@" -o "$out" )
+    else
+        local lib="${STATIC_LIB:-$(ls "$GUARD_DIR"/lib/*/libnox.a 2>/dev/null | head -1)}"
+        [ -n "$lib" ] || { echo "✗ 既无源码也无静态库: $GUARD_DIR" >&2; return 1; }
+        clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$GUARD_DIR" \
+            "$@" -Wl,--whole-archive "$lib" -Wl,--no-whole-archive \
+            -o "$out"
+    fi
+}
+
+if [ "$HAS_SRC" = "1" ]; then
+    echo "设施链接方式: 源码 $GUARD_DIR/*.c"
+else
+    echo "设施链接方式: 静态库 ${STATIC_LIB:-$(ls "$GUARD_DIR"/lib/*/libnox.a 2>/dev/null | head -1)}"
+fi
 
 # ── V1 编译（只拷本目录的源文件，不加任何外部代码）──
 echo "── V1 独立编译 ──"
-cp "$ROOT"/so-guard/*.c "$ROOT"/so-guard/*.h "$W"/ 2>/dev/null
 cd "$W" || exit 2
 # ⚠️ 测试不做 -fvisibility=hidden：那会把 ncguard_unlock 藏进 hidden，
 #    dlsym 拿不到，无法验证解锁链路。生产构建才需要 hidden（见 README）。
-if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
-        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
-        biz.c tshell.c -o raw.so 2>build.log; then
+if guard_compile "$W/raw.so" biz.c tshell.c 2>"$W/build.log"; then
     ok "V1 编译通过（$(stat -c%s raw.so) B）"
 else
     bad "V1 编译失败"; head -15 build.log; echo; echo "结果: $PASS 通过, $FAIL 失败"; exit 1
@@ -321,9 +371,7 @@ __attribute__((visibility("default")))
 int demo_v7_sum(void) { return v7_sum(); }
 V7EOF
 cd "$W" || exit 2
-if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED $GUARD_INC \
-        nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
-        biz2.c -o v7raw.so 2>v7build.log; then
+if guard_compile "$W/v7raw.so" biz2.c 2>"$W/v7build.log"; then
     # 关键：两段都要锁（--section .ncx,.ncxr）
     if python3 "$LOCK" v7raw.so v7l1.so --section .ncx,.ncxr \
             --from-apk "$APK" --package "$PKG_FIX" >v7l1.log 2>&1 \

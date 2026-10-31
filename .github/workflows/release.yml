@@ -49,7 +49,7 @@ jobs:
           fi
           ls -la fixtures/sample.apk
 
-      - name: 自测（13 项）
+      - name: 自测（14 项）
         run: |
           chmod +x test.sh
           ./test.sh
@@ -108,10 +108,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq zip unzip python3
 
-      - name: 打包
+      - name: 安装 Android NDK（打包静态库形态需要交叉编译）
         run: |
-          chmod +x make-zip.sh
-          ./make-zip.sh "${{ steps.ver.outputs.version }}"
+          # make-zip-lib.sh 要把 so-guard/*.c 交叉编译成双 ABI 静态库。
+          # 版本固定 r27d（与消费方 artifact-pipeline 的 setup-ndk 一致），
+          # 换版 = 换 .a 的 ABI/目标三元组，必须同步验证。
+          NDK_VER=r27d
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;$NDK_VER" >/dev/null
+          echo "NDK: $ANDROID_HOME/ndk/$NDK_VER"
+          ls "$ANDROID_HOME/ndk/$NDK_VER/ndk-build"
+
+      - name: 打包（静态库形态）
+        run: |
+          # 发的是 .a 形态：只给头文件 + Python 工具 + 双 ABI libnox.a，
+          # 不给 C 源码。脚本内部会先交叉编译再打包，一条命令走完。
+          chmod +x scripts/make-zip-lib.sh
+          ./scripts/make-zip-lib.sh "${{ steps.ver.outputs.version }}"
 
       - name: 校验包内容
         run: |
@@ -119,38 +133,52 @@ jobs:
           test -f "$Z" || { echo "✗ 包不存在"; exit 1; }
           echo "包大小: $(stat -c%s "$Z") 字节"
 
-          # 源码形态：必需文件
+          # 静态库形态：必需文件（.h + .py + 双 ABI .a，无 .c）
           for f in nox test.sh README.md AGENTS.md QUICKSTART.md \
-                   so-guard/nc_guard_boot.c so-guard/nc_guard_key.c \
-                   so-guard/nc_guard_paths.c so-guard/nc_guard_probe.c \
-                   so-guard/nc_guard_layout.h so-guard/so-section-lock.py \
+                   so-guard/nc_guard_layout.h so-guard/nc_guard_key.h \
+                   so-guard/nc_guard_paths.h so-guard/so-section-lock.py \
+                   so-guard/so_section_mark.py \
+                   so-guard/lib/arm64-v8a/libnox.a \
+                   so-guard/lib/armeabi-v7a/libnox.a \
                    fixtures/sample.c fixtures/sample.apk example/run.sh; do
             unzip -l "$Z" | grep -q "nox/$f" \
               || { echo "✗ 包内缺: $f"; exit 1; }
           done
-          echo "✔ 必需文件齐全"
+          echo "✔ 必需文件齐全（头文件 + Python + 双 ABI 静态库）"
 
-          # 断言：不得含预编译静态库（.a 方案已废弃）
-          # 原因：.a 与 CPU 架构绑死，跨架构分发要维护架构矩阵，
-          # 而源码本来就公开 —— 收益不抵成本。详见 nox 文件头。
-          BAD=$(unzip -l "$Z" | grep -E '\.a$' || true)
+          # 反向断言：不得含 C 源码（静态库形态的核心契约）
+          BAD=$(unzip -l "$Z" | grep -E 'so-guard/[^/]*\.c$' || true)
           if [ -n "$BAD" ]; then
-            echo "✗ 包内含 .a（已废弃的静态库形态）:"
+            echo "✗ 包内含 C 源码（静态库形态不该有）:"
             echo "$BAD"
             exit 1
           fi
-          echo "✔ 未含 .a（源码形态正确）"
+          echo "✔ 未含 C 源码（静态库形态正确）"
 
-      - name: 冒烟测试（解压后零参数自测）
+          # 断言：.a 必须是真 ARM 机器码，不是空文件/错架构
+          T=$(mktemp -d); unzip -q "$Z" -d "$T"
+          for abi in arm64-v8a armeabi-v7a; do
+            A="$T/nox/so-guard/lib/$abi/libnox.a"
+            [ -s "$A" ] || { echo "✗ $abi/libnox.a 为空"; exit 1; }
+            echo "  $abi/libnox.a: $(stat -c%s "$A") 字节"
+          done
+          BIN=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)
+          "$BIN" -h "$T/nox/so-guard/lib/arm64-v8a/libnox.a" | grep -q AArch64 \
+            || { echo "✗ arm64-v8a 的 .a 不是 AArch64"; exit 1; }
+          "$BIN" -h "$T/nox/so-guard/lib/armeabi-v7a/libnox.a" | grep -q "ARM" \
+            || { echo "✗ armeabi-v7a 的 .a 不是 ARM"; exit 1; }
+          echo "✔ 双 ABI 静态库架构正确"
+
+      - name: 冒烟测试（解压后零参数自测 + 真实加密链路）
         run: |
-          # 源码形态下，任意架构都能直接编 —— 这正是它比 .a 强的地方。
           T=$(mktemp -d)
           cd "$T"
           unzip -q "$GITHUB_WORKSPACE/dist/nox-${{ steps.ver.outputs.version }}.zip"
           cd nox
           ./test.sh
 
-          # 再用临时用户代码验一次完整链路
+          # 再用临时用户代码验一次完整链路。
+          # 静态库形态下 nox 会自动选 ABI（包内多 ABI 时默认 arm64-v8a）。
           cat > user.c <<'EOF'
           __attribute__((section(".ncx"), used, retain))
           int my_secret(int a) { return (a ^ 0x5A) * 3; }
@@ -163,7 +191,10 @@ jobs:
             || { echo "✗ 产物缺 .ncx 段"; exit 1; }
           N=$(nm libuser.so 2>/dev/null | wc -l)
           [ "$N" -eq 0 ] || { echo "✗ 符号表未清空（$N 个）"; exit 1; }
-          echo "✔ 用户代码加密成功、含 .ncx 段、符号已清空"
+          # 静态库形态必须产出目标架构的机器码（.a 是 ARM，产物也应如此）
+          readelf -h libuser.so | grep -q AArch64 \
+            || { echo "✗ 产物不是 AArch64（.a 架构与目标不符？）"; exit 1; }
+          echo "✔ 用户代码加密成功、含 .ncx 段、符号已清空、架构 AArch64"
 
       - name: 生成校验和
         run: |
@@ -215,8 +246,8 @@ jobs:
           ## 快速开始
 
           \`\`\`bash
-          unzip nox-*.zip && cd nox-*
-          ./test.sh                 # 13 项自测，验证工具链
+          unzip nox-*.zip && cd nox
+          ./test.sh                 # 14 项自测，验证工具链
           cd example && ./run.sh    # 完整演示：加密前后对比
           \`\`\`
 

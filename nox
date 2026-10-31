@@ -29,7 +29,46 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GUARD = os.path.join(HERE, 'so-guard')
+
+
+def _locate_guard():
+    """定位加密设施目录。
+
+    两种布局都要支持（源码树 vs 发布包），否则 nox 在其中一个环境里跑不了：
+      · 发布包（zip 解压）：nox/nox + nox/so-guard/          → 同级
+      · 源码树（本仓库）  ：nox + scripts/so-guard/          → scripts/ 下
+    为什么源码树要收进 scripts/：根目录只留"产品 + 文档"，开发脚本与
+    其依赖集中到 scripts/，一眼能分清哪个是发布物、哪个是脚手架。
+    打包时（scripts/make-zip-src.sh）仍按包内布局摊回 nox/so-guard/，
+    所以对外消费契约（artifact-pipeline 的 ensure_nox）不受影响。
+    """
+    for cand in (os.path.join(HERE, 'so-guard'),
+                 os.path.join(HERE, 'scripts', 'so-guard')):
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(HERE, 'so-guard')   # 不存在：交给调用方报错
+
+
+GUARD = _locate_guard()
+
+
+def _static_lib_for(abi):
+    """返回该 ABI 的预编译静态库路径；不存在返回 None。
+
+    分发形态有两种（见 scripts/make-zip-src.sh / make-zip-lib.sh）：
+      · 源码形态：so-guard/*.c 存在 → 直接编译源码
+      · 静态库形态：只有 so-guard/lib/<abi>/libnox.a，不给 .c
+    两种形态产物等价（实测：段表与解锁结果完全一致），只是编译时机不同。
+    优先源码（若有），否则用 .a。
+    """
+    if not abi:
+        return None
+    p = os.path.join(GUARD, 'lib', abi, 'libnox.a')
+    return p if os.path.isfile(p) else None
+
+
+def _guard_has_sources():
+    return all(os.path.isfile(os.path.join(GUARD, s)) for s in GUARD_SRCS)
 
 # 加密设施必须一起编译的源文件（顺序无关，但一个都不能少）
 GUARD_SRCS = [
@@ -144,7 +183,27 @@ def find_clang(abi):
 
 def do_build(args, workdir):
     """只编译，不加密。用于调试和 V1 类验证。"""
-    clang, extra = find_clang(args.abi)
+    # 静态库形态必须知道目标 ABI（.a 与 CPU 架构绑死）。
+    # 用户没给 --abi 时自动选：
+    #   · 包内只有一个 ABI → 用它
+    #   · 包内有多个 ABI   → 默认 arm64-v8a（Android 主流目标），并打印提示
+    # 这样"包里有 .a 却因为没写 --abi 就报错"的挫败感被消除，同时不猜错
+    # ——arm64-v8a 是当前 Android 应用的事实标准，其它架构显式指定即可。
+    _auto_abi = None
+    if not getattr(args, 'abi', None) and not _guard_has_sources():
+        _libdir = os.path.join(GUARD, 'lib')
+        if os.path.isdir(_libdir):
+            _abis = sorted(d for d in os.listdir(_libdir)
+                           if os.path.isfile(os.path.join(_libdir, d, 'libnox.a')))
+            if _abis:
+                _auto_abi = 'arm64-v8a' if 'arm64-v8a' in _abis else _abis[0]
+                if len(_abis) > 1:
+                    print('  自动选择 ABI: %s（包内有 %s；要换用 --abi）'
+                          % (_auto_abi, ', '.join(_abis)))
+                else:
+                    print('  自动选择 ABI: %s（包内唯一静态库）' % _auto_abi)
+
+    clang, extra = find_clang(args.abi or _auto_abi)
     out_so = os.path.abspath(args.output)
     # 输出目录可能不存在（首次使用、或 zip 解压后没有空目录）
     out_dir = os.path.dirname(out_so)
@@ -157,13 +216,39 @@ def do_build(args, workdir):
 
     cmd = [clang] + extra + CFLAGS_BASE
 
-    # 恒用源码编译设施。不再有静态库分支（见文件头"分发形态"的说明）。
-    cmd += ['-I', GUARD]
-    cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
-    where = '源码 %d 个 .c' % len(GUARD_SRCS)
-    where = '源码 %d 个 .c' % len(GUARD_SRCS)
+    # 设施来源：优先源码，没有源码时用预编译静态库（静态库形态分发）。
+    # 两种形态产物等价，只是编译时机不同：
+    #   源码形态   → so-guard/*.c 直接参与编译
+    #   静态库形态 → so-guard/lib/<abi>/libnox.a 静态链接
+    #
+    # ⚠️ 静态库必须包 -Wl,--whole-archive：
+    #    ncguard_unlock 是 constructor，无人显式引用 → 链接器按需拉取时
+    #    会整个丢掉它，连带 .ncxh/.ncxhr/.nck/.ncks 四段被 --gc-sections
+    #    回收。实测：不加该参数时 5 个加密段塌成 1 个，连 unlock 都不见了。
+    #    --whole-archive 是状态开关，必须用 --no-whole-archive 收尾，
+    #    否则 libc 等也会被全量拉入，so 体积爆炸。
+    if _guard_has_sources():
+        cmd += ['-I', GUARD]
+        cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+        where = '源码 %d 个 .c' % len(GUARD_SRCS)
+        _static = None
+    else:
+        _static = _static_lib_for(args.abi or _auto_abi)
+        if not _static:
+            _abi_hint = args.abi or _auto_abi or 'arm64-v8a'
+            die('加密设施既无源码也无静态库。\n'
+                '  期望其一：%s/%s\n'
+                '             %s/lib/%s/libnox.a\n'
+                '  静态库形态必须用 --abi 指定目标架构（%s）。'
+                % (GUARD, GUARD_SRCS[0], GUARD, _abi_hint, _abi_hint))
+        cmd += ['-I', GUARD]
+        where = '静态库 %s' % os.path.basename(_static)
 
     cmd += [os.path.abspath(s) for s in args.sources]
+    # 静态库要在 --whole-archive 状态区间内，且必须在用户源码之后
+    # （链接器按命令行顺序解析，库放前面会漏符号）。
+    if _static:
+        cmd += ['-Wl,--whole-archive', _static, '-Wl,--no-whole-archive']
     cmd += LDFLAGS_BASE
     if not args.no_version_script:
         cmd += ['-Wl,--version-script=%s' % vs]

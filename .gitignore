@@ -1,14 +1,22 @@
 __pycache__/
 *.pyc
+
+# 编译产物（可再生产）
 *.so
 *.o
+*.a
 build/
 
-# 分发形态实验产物，不入库
-*.a
-*.o
+# 打包产物
 dist/
 build-zip/
+
+# 静态库形态打包的中间产物（scripts/make-zip-lib.sh 生成，可再生产）
+build-lib/
+
+# example/run.sh 的运行目录（模拟已安装环境）
 example/run/
 example/build/
+
+# 旧静态库方案的产物目录（已废弃，保留忽略以免历史残留进库）
 lib/

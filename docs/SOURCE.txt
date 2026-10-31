@@ -1,11 +1,11 @@
 来源仓库: apk-protect-action
 来源提交: ed72a40 docs(so-guard): 独立化改造计划（供监督方审查）
-来源路径: scripts/so-guard/
+来源路径: scripts/so-guard/（上游仓库内位置；本仓库现置于 ../scripts/so-guard/）
 同步日期: 2026-10-30
 说明: 2026-10-30 独立化改造后（零外部依赖，可单独编译）
 
-文件校验（sha256）:
-8aaff1ad7e921355ec470689b4ade8cfef7dd0d96ca8b9ece9a0c107a76e994d  nc_guard_boot.c
+文件校验（sha256，相对 ../scripts/so-guard/）:
+6f97f3aad7e6fde5dd656cf7c985bd4c6a474707e58d03c0f3fadaa953a9b71f  nc_guard_boot.c
 b00108fcb458d2dc85a476123f41719bd6af371f4c12e1a6b1af75fba08c3797  nc_guard_jni.c
 83bb4a85686ba1dd304830860f8c8b2f2ba72a7498bfffeff3f7fc5233cc1ee0  nc_guard_key.c
 669a0295750df5fa9a97fb16d506511b267f48b9fb0ddd49400a2a2e3c7602a0  nc_guard_paths.c
@@ -16,3 +16,14 @@ c9ac9e6afde0ccb2180095c0c591b435522869c324a4e4e2a317fdf65e5698a2  nc_guard_paths
 94c582ed2924167846115b382f0cdaf28ead8069cf90cfcbea71542c3452de9e  gen-paths.py
 8c3c6764575ff029a60c62d9bf54e28131e4b0253c27197901abb257a46f8cd0  so-section-lock.py
 2aaacd8a2fb79a981a9929774f17c7d603a04e96ca2f49195fd1402c36b424c0  so_section_mark.py
+
+---
+维护说明（2026-10-31）：
+1. 本文件从根目录移入 docs/，原写"来源路径 scripts/so-guard/"指上游仓库内的
+   位置；本仓库内部现在放在 ../scripts/so-guard/（根目录只留产品与文档）。
+2. nc_guard_boot.c 的 hash 已更新：旧记录 8aaff1ad...（2026-10-30 快照）已过期，
+   该文件在独立化之后又加了 nc_guard_paths 依赖与 SHA-256-CTR 加密，
+   现为 6f97f3aa...（与上游 artifact-pipeline 的 scripts/so-guard 一致）。
+3. 核对方式：
+       cd ../scripts/so-guard && sha256sum -c ../../docs/SOURCE.txt
+   任何一行 FAILED = 文件已漂移，需确认是"本仓独立演进"还是"漏同步上游"。

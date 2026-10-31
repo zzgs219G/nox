@@ -6,22 +6,43 @@
 
 ✅ **本仓库已零外部源码依赖，可独立编译。**
 
+源码树布局（开发时）：
+
 ```bash
 clang -fPIC -shared -Oz -fvisibility=hidden -DNC_GUARD_SECTIONED \
-      nc_guard_boot.c nc_guard_probe.c nc_guard_key.c nc_guard_paths.c \
+      -I scripts/so-guard \
+      scripts/so-guard/nc_guard_boot.c scripts/so-guard/nc_guard_probe.c \
+      scripts/so-guard/nc_guard_key.c  scripts/so-guard/nc_guard_paths.c \
       your_code.c -o libyour.so
 ```
 
+或用 CLI 一条命令（推荐，自动带齐参数 + 锁箱 + strip）：
+
+```bash
+./nox protect your_code.c --apk your-app.apk -o libyour.so
+```
+
 （`nc_guard_jni.c` 可选，仅提供 JNI 自检入口。）
+
+### 分发形态：源码 / 静态库两套
+
+| 打包脚本 | 包内容 |
+|---|---|
+| `scripts/make-zip-src.sh` | 含 `so-guard/*.c` 源码 |
+| `scripts/make-zip-lib.sh` | 只含 `*.h` + `*.py` + `lib/<abi>/libnox.a`（C 实现不外泄） |
+
+**静态库形态链接时必须加 `-Wl,--whole-archive`**：`ncguard_unlock` 是
+constructor，无人显式引用 → 默认被丢弃 → 加密段 5 个塌成 1 个。
+`nox` CLI 已自动处理。
 
 ### 编译后还需一步：锁箱
 
 编译出的 so 里 `.ncx` 段仍是明文，必须用 `so-section-lock.py` 加密：
 
 ```bash
-python3 so-section-lock.py libyour.so libyour.locked.so \
+python3 scripts/so-guard/so-section-lock.py libyour.so libyour.locked.so \
         --section .ncx --from-apk your-app.apk
-python3 so-section-lock.py libyour.locked.so libyour.final.so --lock-head
+python3 scripts/so-guard/so-section-lock.py libyour.locked.so libyour.final.so --lock-head
 ```
 
 **必须提供已签名的 APK** —— 密钥由它的证书派生（见下方"重要约束"）。

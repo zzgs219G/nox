@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# make-zip.sh — 打发行包
+# make-zip-src.sh — 打【源码形态】发行包
 #
-# 用法：./make-zip.sh [版本号]
+# 用法：./scripts/make-zip-src.sh [版本号]
 #
 # 产出：dist/nox-<版本>.zip
 #
@@ -14,12 +14,12 @@
 #   test.sh             自测
 #   README.md           使用说明
 #
-# 分发形态：源码。
-#   SOURCE_MODE 已不再需要判断 —— 只有源码一种形态（.a 方案已废弃，
-#   原因见 nox 文件头：架构矩阵代价高，且源码本来就公开）。
+# 与本目录 make-zip-lib.sh 的区别（两套并存，按需选用）：
+#   本脚本           → 发 C 源码（消费方 artifact-pipeline 用这套）
+#   make-zip-lib.sh  → 只发头文件 + .a（C 实现不外泄）
 #
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
 VER="${1:-$(git describe --tags --always 2>/dev/null || echo dev)}"
@@ -45,7 +45,7 @@ chmod +x "$STAGE/nox"
 
 # ── 设施源码 ──
 mkdir -p "$STAGE/so-guard"
-cp so-guard/*.c so-guard/*.h so-guard/*.py "$STAGE/so-guard/"
+cp scripts/so-guard/*.c scripts/so-guard/*.h scripts/so-guard/*.py "$STAGE/so-guard/"
 rm -rf "$STAGE/so-guard/__pycache__"
 
 # ── 样本与示例 ──
