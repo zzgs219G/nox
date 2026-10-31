@@ -96,29 +96,50 @@ echo ""
 
 # ── 设施链接方式 ───────────────────────────────────────────────
 # 两种分发形态都要能自测：
-#   · 源码形态：把 so-guard/*.c 拷进临时目录一起编
-#   · 静态库形态：只有 so-guard/lib/<abi>/libnox.a，用 --whole-archive 链接
-# 为什么 .a 必须 --whole-archive：ncguard_unlock 是 constructor，无人显式
-# 引用 → 默认被丢弃 → 加密段 5 个塌成 1 个（实测）。
+#   · 源码形态：把 so-guard/*.c 一起编（宿主 clang，产物可在本机执行）
+#   · 静态库形态：只有 so-guard/lib/<abi>/libnox.a（ARM 机器码）
+#
+# ⚠️ 静态库形态的两个硬约束（v0.4.0 CI 实测踩过）：
+#   ① 必须用【NDK 交叉编译器】编：宿主 x86_64 的 ld 链接 ARM 的 .a 会报
+#      "Relocations in generic ELF (EM: 183)"，产不出东西。
+#   ② 产出的 so 是 ARM，宿主【跑不起来】：所以 V5/V6/V7 这些依赖 dlopen
+#      执行的断言必须跳过（无法在本机验证），只验静态属性（段表/熵值/
+#      strings）。执行类验证由消费方在真机或 arm64 runner 上做。
 GUARD_INC="-I$GUARD_DIR"
 HAS_SRC=0
 [ -f "$GUARD_DIR/nc_guard_boot.c" ] && HAS_SRC=1
 
-# 选一个可链接的静态库（宿主自测用：优先原生架构，否则任一可用 ABI）
+# 静态库形态：选 ABI + 找 NDK 交叉编译器
 STATIC_LIB=""
-HOST_ABI=""
-case "$(uname -m)" in
-    aarch64|arm64) HOST_ABI=arm64-v8a ;;
-    armv7l|armv8l) HOST_ABI=armeabi-v7a ;;
-    x86_64)        HOST_ABI=x86_64 ;;
-    i686|i386)     HOST_ABI=x86 ;;
-esac
-if [ -f "$GUARD_DIR/lib/$HOST_ABI/libnox.a" ]; then
-    STATIC_LIB="$GUARD_DIR/lib/$HOST_ABI/libnox.a"
+STATIC_CC=""
+STATIC_ABI=""
+CAN_EXEC=1                      # 产物能否在本机执行（源码形态=1，.a 形态=0）
+if [ "$HAS_SRC" = "0" ]; then
+    CAN_EXEC=0
+    case "$(uname -m)" in
+        aarch64|arm64) _host_abi=arm64-v8a ; _tgt=aarch64-linux-android21-clang ;;
+        armv7l|armv8l) _host_abi=armeabi-v7a; _tgt=armv7a-linux-androideabi21-clang ;;
+        *)             _host_abi="" ;        _tgt="" ;;
+    esac
+    # 优先宿主原生 ABI（能在本机执行）；否则取第一个可用的（只验静态属性）
+    if [ -n "$_host_abi" ] && [ -f "$GUARD_DIR/lib/$_host_abi/libnox.a" ]; then
+        STATIC_ABI="$_host_abi"; STATIC_LIB="$GUARD_DIR/lib/$_host_abi/libnox.a"
+    else
+        STATIC_LIB=$(ls "$GUARD_DIR"/lib/*/libnox.a 2>/dev/null | head -1)
+        [ -n "$STATIC_LIB" ] && STATIC_ABI=$(basename "$(dirname "$STATIC_LIB")")
+    fi
+    case "$STATIC_ABI" in
+        arm64-v8a)   _tgt=aarch64-linux-android21-clang ;;
+        armeabi-v7a) _tgt=armv7a-linux-androideabi21-clang ;;
+    esac
+    if [ -n "$_tgt" ] && [ -n "${ANDROID_NDK_HOME:-}" ]; then
+        STATIC_CC=$(ls -d "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/"$_tgt" 2>/dev/null | head -1)
+    fi
 fi
 
 # guard_compile <输出> <源码...>：按可用形态编译
-# 源码形态 → 直接编 .c；静态库形态 → 链接 .a（带 --whole-archive）
+# 源码形态 → 宿主 clang 直接编 .c
+# 静态库形态 → NDK 交叉编译器 + --whole-archive 链接 .a
 guard_compile() {
     local out="$1"; shift
     if [ "$HAS_SRC" = "1" ]; then
@@ -128,18 +149,25 @@ guard_compile() {
             "$GUARD_DIR"/nc_guard_key.c "$GUARD_DIR"/nc_guard_paths.c \
             "$@" -o "$out" )
     else
-        local lib="${STATIC_LIB:-$(ls "$GUARD_DIR"/lib/*/libnox.a 2>/dev/null | head -1)}"
-        [ -n "$lib" ] || { echo "✗ 既无源码也无静态库: $GUARD_DIR" >&2; return 1; }
-        clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$GUARD_DIR" \
-            "$@" -Wl,--whole-archive "$lib" -Wl,--no-whole-archive \
+        [ -n "$STATIC_LIB" ] || { echo "✗ 找不到静态库: $GUARD_DIR/lib" >&2; return 1; }
+        [ -n "$STATIC_CC" ] || {
+            echo "✗ 静态库形态需要 NDK 交叉编译器（$STATIC_ABI）" >&2
+            echo "  设 ANDROID_NDK_HOME 后重试；或改用源码形态的分发包" >&2
+            return 1; }
+        # --whole-archive 不能省：ncguard_unlock 是 constructor，无人引用
+        # 会被链接器丢弃 → 加密段 5 个塌成 1 个。
+        "$STATIC_CC" -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$GUARD_DIR" \
+            "$@" -Wl,--whole-archive "$STATIC_LIB" -Wl,--no-whole-archive \
             -o "$out"
     fi
 }
 
 if [ "$HAS_SRC" = "1" ]; then
-    echo "设施链接方式: 源码 $GUARD_DIR/*.c"
+    echo "设施链接方式: 源码 $GUARD_DIR/*.c（产物可在本机执行）"
 else
-    echo "设施链接方式: 静态库 ${STATIC_LIB:-$(ls "$GUARD_DIR"/lib/*/libnox.a 2>/dev/null | head -1)}"
+    echo "设施链接方式: 静态库 $STATIC_ABI/libnox.a（交叉编译，产物不可在本机执行）"
+    [ "$CAN_EXEC" = "0" ] && \
+        echo "  ℹ V5/V6/V7（依赖 dlopen 执行）将跳过 —— 静态库形态在 x86 宿主上跑不了 ARM 产物"
 fi
 
 # ── V1 编译（只拷本目录的源文件，不加任何外部代码）──
@@ -283,7 +311,9 @@ int main(int c, char **v) {
     return 0;
 }
 EOF
-        if clang drv.c -o drv -ldl 2>/dev/null; then
+        if [ "$CAN_EXEC" = "0" ]; then
+            skip "V5 篡改已生效（静态验证）；执行验证跳过 —— .a 产物是 ARM，宿主跑不了"
+        elif clang drv.c -o drv -ldl 2>/dev/null; then
             # 包名：运行期从 /proc/self/cmdline 取并截到首个 ":"，
             # 假目录名必须与真实包名一致，否则 fail-closed(-12)
             PKG="$PKG_FIX"
@@ -322,7 +352,9 @@ int main(int c, char **v) {
     return 0;
 }
 EOF
-                    if clang t2.c -o t2 -ldl 2>/dev/null; then
+                    if [ "$CAN_EXEC" = "0" ]; then
+                        skip "V6 解锁链路静态验证通过；执行验证跳过 —— .a 产物是 ARM，宿主跑不了"
+                    elif clang t2.c -o t2 -ldl 2>/dev/null; then
                         OUT=$( cd "fake/$PKG" && bash -c "exec -a $PKG '$W/t2' ./lib/arm64-v8a/libtest.so" 2>/dev/null )
                         # secret_calc(0) = (0^0x5A)*3 = 270 ; plain_calc(0) = 1
                         if [ "$OUT" = "270 1" ]; then
@@ -391,7 +423,9 @@ int main(int c, char **v) {
     return 0;
 }
 V7DRV
-        if clang v7drv.c -o v7drv -ldl 2>/dev/null; then
+        if [ "$CAN_EXEC" = "0" ]; then
+            skip "V7 .ncxr 锁箱成功、产物含两段；执行验证跳过 —— .a 产物是 ARM，宿主跑不了"
+        elif clang v7drv.c -o v7drv -ldl 2>/dev/null; then
             V7OUT=$( cd "v7fake/$PKG_FIX" && bash -c "exec -a $PKG_FIX '$W/v7drv' ./lib/arm64-v8a/libv7.so" 2>/dev/null )
             # 1+2+...+17 = 153
             if [ "$V7OUT" = "153" ]; then
