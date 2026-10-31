@@ -40,7 +40,13 @@ OUT="dist/nox-${VER}.zip"
 CFLAGS="-fPIC -fvisibility=hidden -fno-ident -Oz \
         -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED \
         -I$GUARD"
-LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths"
+# ⚠️ 必须包含 nc_guard_jni：它提供 Java_com_nc_link_NcLink_selftest()。
+#    jian_box 的 inject-javacheck.py 会注入对 NcLink.selftest() 的调用，
+#    缺这个符号 → UnsatisfiedLinkError → Guard 的 .catch 判定"so 缺失"
+#    → fail-closed 杀进程（真机实测：装完启动即闪退，logcat 报
+#      No implementation found for NcLink.selftest）。
+#    这不是可选项 —— 漏了它整包起不来。
+LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni"
 
 : "${ANDROID_NDK_HOME:?双 ABI 交叉编译需要 ANDROID_NDK_HOME（指向 NDK 根目录）}"
 _prebuilt="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
