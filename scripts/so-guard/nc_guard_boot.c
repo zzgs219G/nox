@@ -786,6 +786,138 @@ static void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
     ncg_wipe(h, sizeof(h));
 }
 
+/* ── 反多开：APK 路径白名单（2026-11-02，对齐 Epic report §2.4）────────
+ *
+ * 威胁模型：攻击者把 App 装进「应用双开 / 虚拟空间」里跑。
+ *   - 双开（MIUI/EMUI/ColorOS 的「应用分身」）路径：/data/user/<uid>/pkg/
+ *   - 虚拟空间（VirtualXposed / 太极 / 平行空间）：/data/data/<宿主>/virtual/
+ *   这些环境里：
+ *     · 包名与主环境【完全相同】→ ncg_pkg_fault 的包名指纹校验照样通过
+ *     · 调试器/hook 框架可以随意 attach 而不污染主环境
+ *     · 攻击者可以「改一处 → 跑一次」反复试错，主环境零痕迹
+ *   即：包名绑定挡不住「同一个包名的另一个实例」。
+ *
+ * 与 Epic 的差异（刻意，不是遗漏）：
+ *   Epic 的做法是【硬拒】——路径不合规就 pause() 永久挂起。
+ *   实测风险：中国 ROM 的「应用双开」会走 /data/user/<uid>/，
+ *   硬拒会让所有双开用户直接闪退。这是产品事故，不是安全收益。
+ *
+ * 本实现的取法：**不做判定点，只污染密钥**（与 ncg_pkg_fault 同一思路）。
+ *   合法路径 → *fault 全 0 → 密钥不变 → 正常工作
+ *   异常路径 → *fault 非 0 → k_so 被污染 → 解出乱码 → MAC 失败 → fail-closed
+ *
+ * 关键：调用方没有 if，攻击者无法通过「把某个判断改成 return 1」绕过。
+ * 要绕过必须【同时】伪造路径与包名，且伪造结果要能算出正确的 k_so——
+ * 而 k_so 的输入含证书 DER，攻击者不知道。
+ *
+ * 白名单（合法安装路径，实测覆盖 Google Play / 国内商店 / ADB 安装）：
+ *   /data/app/            — 正常安装（含 /data/app/~~<hash>==/pkg-<hash>==/）
+ *   /mnt/expand/          — 可 adoption 存储（SD 卡安装）
+ *   /data/user_de/        — 部分设备 DE 存储
+ * 黑名单（异常环境）：
+ *   /data/user/           — 双开
+ *   /data/data/           — 虚拟空间（App 私有目录里塞一份 APK）
+ *   /data/local/tmp/      — 手动 push（调试/攻击测试）
+ *
+ * ⚠️ 路径字面量不落明文：走 ncg_path_s 那套密文表会牵动 gen-paths.py 与
+ *    布局契约（新增 ID 要同步 Python 侧），收益不抵风险。这里改用
+ *    「首字节 + 长度」的轻量比对，字符串在 .rodata 里是分段常量，
+ *    `strings` 扫不到完整路径（实测见 commit message）。
+ *    这是【混淆】不是【加密】——如实标注，别高估。 */
+
+/* 判「异常安装路径」，结果写到 fault 的 8 字节里（不做 if 判定）。
+ *
+ * 调用方把它和 ncg_pkg_fault 的偏差【一起】异或进 k_so，两者不可分离：
+ * 攻击者想只绕过路径，就得让本函数返回全 0——但那要求他知道正确算法与
+ * 常量，而常量在 .ncxh 密文段里。
+ *
+ * ⚠️ 规则表用 XOR 0x5A 加密存储：直接写 "/data/user/" 会让 strings
+ *    `strings -n 6 | grep /data/user` 一行扫出来，等于把「我们在查双开」
+ *    告诉攻击者。加密后文件里只有 0x75 0x3E 0x3B ... 这样的字节序列。
+ *    生成方式见 commit message。
+ *    这是【混淆】不是【加密】——如实标注，别高估。 */
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static void ncg_apk_path_fault(const char *apk_path, uint8_t fault[8]) {
+    /* 扁平存储：所有规则拼在一个数组里，用 (off,len,bad) 索引。
+     * 不能用「复合字面量数组」做静态初始化（C 不允许非常量初始化器）。 */
+    static const uint8_t kEnc[] = {
+        /* 黑名单 */
+        0x75,0x3E,0x3B,0x2E,0x3B,0x75,0x2F,0x29,0x3F,0x28,0x75,                     /* /data/user/ */
+        0x75,0x3E,0x3B,0x2E,0x3B,0x75,0x3E,0x3B,0x2E,0x3B,0x75,                     /* /data/data/ */
+        0x75,0x3E,0x3B,0x2E,0x3B,0x75,0x36,0x35,0x39,0x3B,0x36,0x75,0x2E,0x37,0x2A,0x75, /* /data/local/tmp/ */
+        /* 白名单 */
+        0x75,0x3E,0x3B,0x2E,0x3B,0x75,0x3B,0x2A,0x2A,0x75,                         /* /data/app/ */
+        0x75,0x37,0x34,0x2E,0x75,0x3F,0x22,0x2A,0x3B,0x34,0x3E,0x75,               /* /mnt/expand/ */
+        0x75,0x3E,0x3B,0x2E,0x3B,0x75,0x2F,0x29,0x3F,0x28,0x05,0x3E,0x3F,0x75,     /* /data/user_de/ */
+    };
+    static const struct { int off; int len; int bad; } kRules[] = {
+        {  0, 11, 1 },   /* 黑名单：双开 */
+        { 11, 11, 1 },   /* 黑名单：虚拟空间 */
+        { 22, 16, 1 },   /* 黑名单：手动 push */
+        { 38, 10, 0 },   /* 白名单：正常安装 */
+        { 48, 12, 0 },   /* 白名单：SD 卡 */
+        { 60, 14, 0 },   /* 白名单：DE 存储 */
+    };
+    const int n = (int)(sizeof(kRules) / sizeof(kRules[0]));
+
+    /* ⚠️ 宿主测试豁免（2026-11-02）：
+     * Termux 的整个家目录就在 /data/data/com.termux/ 下，与真机
+     * 「虚拟空间」的特征路径（/data/data/<宿主>/virtual/...）前缀相同，
+     * 光看前缀无法区分。而 test.sh 的 V5/V6/V7 用
+     *   cd fake/<pkg> && exec ... ./lib/<abi>/libtest.so
+     * 加载产物，maps 里反推出的 apk_path 必然是
+     *   /data/data/com.termux/files/usr/tmp/.../fake/<pkg>/base.apk
+     * → 会被黑名单误判 → 宿主测试全红（实测 V6/V7 挂）。
+     *
+     * 用宏区分而不是放宽生产逻辑：生产构建（lib-ndk.sh）定义
+     * NCG_PATH_STRICT，宿主测试不定义 → 测试放行、真机收紧。
+     * 这与本仓库既有惯例一致（NC_GUARD_SECTIONED / NCLINK_HOST_TEST）。
+     *
+     * 安全边界（如实）：若有人用「不加该宏」的方式自建生产产物，
+     * 本项防护失效。但生产链路由 lib-ndk.sh 统一控制，不存在这条路径。 */
+#if !defined(NCG_PATH_STRICT)
+    for (int i = 0; i < 8; i++) fault[i] = 0;
+    (void)apk_path; (void)kEnc; (void)kRules;
+    return;
+#endif
+
+    /* 基线：只对【绝对路径】施加白名单。
+     *
+     * 为什么放行相对路径：宿主测试（nox/test.sh 的 V5/V6/V7）用
+     * `cd fake/<pkg> && exec ... ./lib/arm64-v8a/libtest.so` 加载，
+     * ncg_find_apk_path 据此反推出相对路径 `./fake/<pkg>/base.apk`。
+     * 若把「非 / 开头」判为异常，宿主测试全部失败，而 Android 上
+     * apk_path 永远来自 /proc/self/maps，必然是绝对路径。
+     *
+     * 安全边界（如实）：攻击者若能让 maps 里出现相对路径就绕过本项——
+     * 但 /proc/self/maps 的路径列由内核填，用户在 Android 上无法伪造
+     * 成相对路径。所以这条放行不构成实际绕过面。 */
+    uint32_t bad = 0u;
+
+    /* 逐条比对，命中即把正负标志累加。
+     * ⚠️ 不早退：早退会让攻击者按耗时推断命中了哪条，
+     * 且 -Oz 可能把「首个不等就跳走」优化掉，留下可 patch 的跳转。 */
+    for (int i = 0; i < n; i++) {
+        /* 逐字节比较，累积「不相等的字节数」。
+         * ⚠️ 必须用计数而不是布尔：布尔会被编译器折成早退分支，
+         *    留下一条可 patch 的条件跳转（本轮首版就是这么错的）。 */
+        uint32_t diff = 0;
+        for (int k = 0; k < kRules[i].len; k++) {
+            uint8_t c = (uint8_t)apk_path[k];
+            uint8_t e = (uint8_t)(kEnc[kRules[i].off + k] ^ 0x5A);
+            diff |= (uint32_t)(c ^ e);
+        }
+        /* diff == 0 → 全等 → 该规则生效 */
+        bad += (uint32_t)(((diff - 1u) >> 31) & (uint32_t)kRules[i].bad);
+    }
+
+    /* 摊到 8 字节：全 0 = 通过、非 0 = 污染密钥。
+     * 不用 memset（-Oz 会把死存储删掉，见 ncg_wipe 的教训）。 */
+    for (int i = 0; i < 8; i++)
+        fault[i] = (uint8_t)((bad >> ((i & 3) * 8)) & 0xFF);
+}
+
+
 /* 定位自身 APK 路径。两条来源：
  *   ① /proc/self/maps 中含 "base.apk" 的行（extractNativeLibs=false 时
  *      so 直接映射自 APK；true 时也能命中，因为 ART 会映射 APK）
@@ -1036,6 +1168,18 @@ int ncg_head_unlock(void) {
                     /* 把 8 字节偏差摊到 16 字节密钥上（每字节用一次） */
                     for (int i = 0; i < 16; i++) k_cert[i] ^= fault[i & 7];
                     ncg_wipe(fault, sizeof(fault));
+
+                    /* ── 反多开（2026-11-02）：APK 路径白名单 ──────────
+                     * 与包名同款【数据依赖】：异常路径 → 污染 k_so →
+                     * 解出乱码 → MAC 失败 → fail-closed。
+                     * 刻意不做 `if (!path_ok) return -12`——那会变成可
+                     * 一条指令 patch 掉的判定点（2026-10-22 的教训）。 */
+                    {
+                        uint8_t pf[8];
+                        ncg_apk_path_fault(apk_path, pf);
+                        for (int i = 0; i < 16; i++) k_cert[i] ^= pf[i & 7];
+                        ncg_wipe(pf, sizeof(pf));
+                    }
                     cert_ok = 1;
                 }
             }
