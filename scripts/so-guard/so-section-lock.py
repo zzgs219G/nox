@@ -1351,19 +1351,36 @@ def strip_meta(so_path: str, out_path: str) -> int:
     present = [s for s in sections if elf.find(s) is not None]
     if not present:
         print('   元数据清理: 无可删段（已干净）')
-        shutil.copyfile(so_path, out_path)
+        # ⚠️ 不能无条件 copyfile：protect.sh 是 in-place 调用（in==out），
+        #    同文件拷贝会抛 SameFileError（v7a 那轮就是这么失败的）。
+        if os.path.abspath(so_path) != os.path.abspath(out_path):
+            shutil.copyfile(so_path, out_path)
         return 0
+
+    # in-place 时必须先写临时文件再替换：objcopy 不允许 in==out，
+    # 且直接覆盖会破坏正在读的输入。
+    inplace = os.path.abspath(so_path) == os.path.abspath(out_path)
+    if inplace:
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.so', dir=os.path.dirname(out_path) or '.')
+        os.close(fd)
+    else:
+        tmp = out_path
 
     cmd = [tool]
     for s in present:
         cmd += ['--remove-section', s]
-    cmd += [so_path, out_path]
+    cmd += [so_path, tmp]
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
         print('❌ 元数据清理失败（%s 退出码 %d）：%s'
               % (os.path.basename(tool), r.returncode,
                  r.stderr.decode('utf-8', 'replace').strip()[:200]), file=sys.stderr)
+        if inplace and os.path.exists(tmp):
+            os.unlink(tmp)
         return 1
+    if inplace:
+        os.replace(tmp, out_path)
 
     # 校验：删掉的段必须真的不在输出里，且关键段地址未变（锁箱契约）
     after = Elf(open(out_path, 'rb').read())
