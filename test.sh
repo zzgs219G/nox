@@ -445,6 +445,51 @@ else
     bad "V7 编译失败"; head -10 v7build.log
 fi
 
+# ── V8 元数据清理：.eh_frame / .comment / 函数边界（2026-11-02）──
+# 为什么必须单独断言：.comment 的清除在 CI 上【从未生效过】（GNU objcopy
+# 不存在 → 走 else 分支打印警告后继续）。只靠「日志没报错」看不出来，
+# 必须在【产物】上断言。同理 .eh_frame 的 709 个 FDE 会把段加密架空
+# （它列出每个函数的精确起止地址），也必须验产物。
+echo "── V8 元数据清理 ──"
+if [ -f l2.so ]; then
+    ZA=$(mktemp -d)
+    python3 "$LOCK" l2.so "$ZA/clean.so" --strip-meta >"$ZA/m.log" 2>&1
+    RC_META=$?
+    if [ $RC_META -eq 0 ]; then
+        ok "V8 --strip-meta 执行成功"
+        # 三个断言都必须为 0 命中
+        n_eh=$(readelf -SW "$ZA/clean.so" 2>/dev/null | grep -c "eh_frame" || true)
+        n_cm=$(readelf -SW "$ZA/clean.so" 2>/dev/null | grep -c "\.comment" || true)
+        n_fp=$(strings -n 5 "$ZA/clean.so" 2>/dev/null | grep -ciE "Android \(|clang version" || true)
+        if [ "$n_eh" = "0" ] && [ "$n_cm" = "0" ] && [ "$n_fp" = "0" ]; then
+            ok "V8 .eh_frame/.comment/clang指纹 全部零命中"
+        else
+            bad "V8 元数据残留（eh_frame=$n_eh comment=$n_cm clang=$n_fp）"
+        fi
+        # 锁箱契约不可被破坏：六个段地址必须与清理前一致
+        _bad_addr=""
+        for _s in .ncx .ncxh .ncxr .ncxhr .nck .ncks .text; do
+            _a=$(readelf -SW l2.so 2>/dev/null | awk -v n="$_s" '$2==n{print $4}')
+            _b=$(readelf -SW "$ZA/clean.so" 2>/dev/null | awk -v n="$_s" '$2==n{print $4}')
+            [ -n "$_a" ] && [ "$_a" != "$_b" ] && _bad_addr="$_bad_addr $_s"
+        done
+        if [ -z "$_bad_addr" ]; then
+            ok "V8 清理后段地址全部不变（锁箱契约完好）"
+        else
+            bad "V8 objcopy 挪动了段地址:$_bad_addr"
+        fi
+        # 幂等：再跑一次必须报「无可删段」且退出 0
+        python3 "$LOCK" "$ZA/clean.so" "$ZA/clean2.so" --strip-meta >/dev/null 2>&1 \
+            && ok "V8 --strip-meta 幂等（二次运行成功）" \
+            || bad "V8 --strip-meta 二次运行失败"
+    else
+        bad "V8 --strip-meta 失败"; tail -5 "$ZA/m.log"
+    fi
+    rm -rf "$ZA"
+else
+    skip "V8 无二级锁箱产物"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
