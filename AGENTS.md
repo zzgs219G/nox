@@ -57,6 +57,13 @@ int my_func(void) { ... }        /* 这个函数会被加密 */
 
 **改段名 = 所有历史产物的锁箱/开箱契约失效。** 不要为了"更好看"改。
 
+⚠️ **已知泄露（2026-11-02 审计，决定不修）**：这 6 个名字是自解释的，
+`readelf -S` 一眼看出「6 层加密结构 + 96/112 两个密钥槽」。
+但改名要动 `nc_guard_layout.h` 的 6 个宏 + `artifact-pipeline/scripts/pipelines/protect.sh`
+的 26 处字面量 + 全部测试断言，收益只是「降低可发现性」。
+`so加固第二阶段计划-2026-10-28.md` §4.4 已给过结论：**`★☆☆☆☆`，
+风险收益不成比例**。真正的解法是改按段索引定位（A 任务），不是改名字。
+
 ### 1.3 `so-guard/so-section-lock.py` 的密钥派生
 
 ```
@@ -127,24 +134,45 @@ causes a section type conflict
 任何"取不到数据就当通过"的写法都是红线。历史教训：
 - `lock_head` 段缺失时 `return 0`（成功）→ 自解谜没发生但流水线全绿
 - 证书读不到时降级用固定密钥 → 证书绑定完全失效
+- **`.comment` 移除失败时打印 `⚠️ ... 继续但不阻塞`** → 该防护
+  **连续三个月零生效**（2026-10-21 → 2026-11-02），因为 CI 上没有
+  GNU `objcopy`，每次都走 else 分支。**日志里有输出 ≠ 防护生效。**
 
 正确做法一律 **fail-closed**：拿不到就拒绝，并给出人话报错。
+
+**推论（2026-11-02 补充）**：如果某步确实不能阻塞出包（如可选优化），
+那它**必须在产物侧有断言**（`test.sh` 里验产物），不能只靠日志。
+
+### 3.4 加密了内容 ≠ 隐藏了结构
+
+六段加密把**字节**变成了密文，但以下段会让结构原样可读：
+
+| 段 | 泄露 |
+|---|---|
+| `.eh_frame` / `.eh_frame_hdr` | 每个函数的精确起止地址（709 个 FDE） |
+| `.gcc_except_table` | 异常处理块边界 |
+| `.symtab`（若未 strip） | 函数名 |
+| 段名 / 段尺寸 | 有多少个加密段、密钥槽多大 |
+
+**评估加密效果时必须问一句「还有什么没加密但能推出结构」**，而不是
+只看「加密了几段」。见 §5.4 的 `--strip-meta`。
 
 ---
 
 ## 4. 改动后的必做动作（不论大小）
 
 ```bash
-./test.sh          # 必须 14 通过 0 失败
+./test.sh          # 必须 18 通过 0 失败（2026-11-02 起；此前是 14 项）
 ```
 
 外加按改动类型：
 
 | 改了什么 | 还要做什么 |
 |---|---|
-| `.c` 实现 | 无需额外动作 |
+| `.c` 实现 | **双 ABI 编译**（arm64 + v7a）；改动涉及 ELF 解析时两 ABI 都要验段表 |
 | `test.sh` 断言 | 反向验证：故意改坏 → 确认转红 → 恢复 |
 | `scripts/make-zip-*.sh` / `nox` | 打 zip → **解压到干净目录** → 跑 `./test.sh` |
+| `so-section-lock.py` | 用**真机产物**跑一遍 `--strip-meta`，确认 `.eh_frame`/`.comment` 归零且段地址未变 |
 | CI workflow | 本地 `python3 -c "import yaml;yaml.safe_load(...)"` + 手动触发一次 |
 
 ⚠️ **"本地跑通"不等于"发出去的包能用"。** 本项目因此连续踩了 5 个坑：
@@ -207,6 +235,117 @@ Python 工具   ❌ 公开（无编译形态，.pyc 可反编译）
 
 **读 `so-section-lock.py` 就能知道锁箱格式。** 这是 Python 的固有限制，
 不是实现缺陷。要真正保密只能服务化（对方上传 so，服务器加密后返回）。
+
+---
+
+### 5.4 产物元数据清理（`--strip-meta`，2026-11-02）
+
+**三道锁箱之后必须再跑一次元数据清理**，否则前面的加密收益被大幅抵消。
+
+```bash
+# 顺序不可颠倒：先 lock → 再 lock-head → 最后 strip-meta
+python3 so-section-lock.py in.so out.so --section .ncx,.ncxr --from-apk app.apk
+python3 so-section-lock.py out.so out.so --lock-head
+python3 so-section-lock.py out.so out.so --strip-meta      # ← 新增
+```
+
+### 为什么必须放在【最后】
+
+`objcopy` 会重写 ELF 文件。`lock`/`lock-head` 已经把**链接期 `sh_addr`**
+写进了 `.nck`/`.ncks` 槽，任何挪动都会让运行期基址计算全错，
+且崩溃点是 `.ncxh` 里的 SIGILL —— 症状完全不指向 objcopy。
+
+实测 `--remove-section` 对本产物不改任何 `sh_addr`/`sh_offset`，
+**但不要把顺序建立在这个实测结论上**，把顺序本身做对。
+
+### 删什么 / 为什么
+
+| 段 | 泄露什么 | 实测数据 |
+|---|---|---|
+| `.eh_frame` + `.eh_frame_hdr` | **每个函数的精确起止地址** | 709 个 FDE；`.ncx` 内 15 个函数（4/200/1500/820/…B），`.ncxh` 内 8 个（208/480/372/…B） |
+| `.comment` | 完整工具链指纹 | `Android (13691557, +pgo, +bolt, +lto, +mlgo) clang version 18.0.4` + LLVM commit hash |
+| `.debug_*` | libc++ 源码路径 | `out/llvm-project/libcxxabi/src/...`（`--strip-all` 删不掉，属 `.debug_line`） |
+
+**`.eh_frame` 是最反直觉的一项**：六段都加密了，但异常表把
+「有几个函数、每个多大」原样公布。加密了内容 ≠ 隐藏了结构。
+
+### 代价（如实）
+
+失去 C++ 异常栈回溯，崩溃时 tombstone 的 backtrace 会残缺。
+`nc_guard`/`sig_check` 全是 C；dex2c 产物用 `EX_LandingPad` + 显式
+`goto` 分发，不依赖 `.eh_frame`。**排障时用未清理的中间产物。**
+
+### 删不掉的部分（如实，别试图"修好"）
+
+libc++ 的 5 条源码路径（`out/llvm-project/libcxxabi/src/demangle/*.h` 等）
+落在 **`.rodata`**，是 `__cxa_demangle` 的断言消息与文件路径常量。
+删了 demangle 会崩。它们只泄露 NDK 版本，**不泄露 `nc_*` 实现**。
+
+> ⚠️ 曾有外部报告写「那是 `__cxa_demangle` 的调试信息，`--strip-all`
+> 会一并去掉」—— **不准确**。`.rodata` 里的静态字符串 `--strip-all` 不碰。
+
+### 断言在哪
+
+`test.sh` 的 **V8**（4 项）：执行成功 / 三类元数据产物侧零命中 /
+清理后段地址不变 / 幂等。必须验**产物**而不是看日志——
+`.comment` 曾因「失败但继续」的日志措辞失效三个月无人发现。
+
+---
+
+### 5.5 反多开路径白名单（`ncg_apk_path_fault`，2026-11-02）
+
+**不是判定点，是数据依赖**。异常安装路径 → 污染 `k_so` → 解出乱码 →
+MAC 失败 → fail-closed。调用方**没有 `if`**，攻击者无法「把某个判断
+改成 `return 1`」绕过。
+
+| | 路径 |
+|---|---|
+| 白名单 | `/data/app/`、`/mnt/expand/`、`/data/user_de/` |
+| 黑名单 | `/data/user/`（双开）、`/data/data/`（虚拟空间）、`/data/local/tmp/` |
+
+**与 Epic 的刻意差异**：Epic 用 `pause()` 硬拒。中国 ROM 的应用双开走
+`/data/user/<uid>/`，硬拒会让**所有双开用户直接闪退** —— 那是产品事故
+不是安全收益。
+
+### 生产宏 `NCG_PATH_STRICT`
+
+- 生产（`artifact-pipeline/scripts/lib/lib-ndk.sh` 的 `APP_CFLAGS`）**定义**
+- 宿主测试（`test.sh`）**不定义** → 放行
+
+理由：Termux 家目录就在 `/data/data/com.termux/` 下，与「虚拟空间」
+前缀相同，光看前缀无法区分；测试用相对路径加载产物必然命中黑名单。
+
+**边界（如实）**：若有人用「不加该宏」的方式自建生产产物，本项失效。
+但生产链路由 `lib-ndk.sh` 统一控制。
+
+### 规则表用 XOR 0x5A 加密存储
+
+直接写 `"/data/user/"` 会让 `strings -n 6 | grep /data/user` 一行扫出来，
+等于告诉攻击者「我们在查双开」。加密后文件里只有 `0x75 0x3E 0x3B ...`。
+**这是混淆不是加密**，别高估。
+
+---
+
+### 5.6 ELF32 支持（2026-11-02）
+
+`APP_ABI := armeabi-v7a arm64-v8a`，**v7a 产物是 ELF32**
+（`Class: ELF32 / Machine: ARM / shentsize 40`）。
+
+此前 `nc_guard_boot.c` 三处 ELF 解析全硬编码 `Elf64_Ehdr`/`Elf64_Shdr`，
+用 ELF64 结构读 ELF32 文件会得到 `e_shoff = 0x28000900200034`
+（真实 `0x335a8`，把 `e_phoff` + `e_shoff` 两个 32 位字段拼成一个 64 位读）
+→ `pread` 读回 0 字节 → `boot_key` 失败 → `.ncx` 不解密 → **32 位设备启动即 SIGILL**。
+
+现统一走 `ncg_elf_hdr` / `ncg_elf_shdr` 两个 `.text` 内的轻量抽象，
+按 `e_ident[EI_CLASS]` 分派，产出统一的 `ncg_shdr_t`。
+
+**三条纪律**：
+1. 抽象必须放 `.text`（明文）—— `ncg_boot_key` 要在 `.ncxh` 尚未解密时
+   就算出来，而 `.ncxh` 里的 `ncg_find_section` 也消费同一套函数。
+   两边都调它，它自己不能在任何加密段，否则「用密文解密文」。
+2. 不要放进 `nc_guard_layout.h` —— 那是常量契约文件，**零 include 零逻辑**
+   是刻意约束（会被拷进各种 NDK 工程）。
+3. **任何 ELF 解析改动必须双 ABI 验证**，不能只测 arm64。
 
 ---
 
