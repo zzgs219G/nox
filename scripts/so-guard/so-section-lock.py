@@ -1288,6 +1288,101 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     return 0
 
 
+# ── 元数据清理：删 .eh_frame / 源码路径（2026-11-02）──────────────────
+# 对齐 Epic report §4.3/§4.6 与本次实测审计的 6 个泄露项里最难修的两项。
+#
+# 为什么需要独立一阶段（不在 lock/lock_head 里做）：
+#   ① 必须在【所有锁箱之后】：objcopy 会重写 ELF，若在锁箱前跑，
+#      slot 里已写好的链接期 sh_addr 会失配 → 运行期基址计算崩。
+#   ② 实测确认 objcopy --remove-section 对本产物【不改变任何 sh_addr /
+#      sh_offset】（双 ABI 各 7/7 段逐一比对），所以放在最后是安全的。
+#
+# 删什么、为什么：
+#   .eh_frame / .eh_frame_hdr
+#       709 个 FDE，每条给出一个函数的精确起止地址。加密了 6 个段，
+#       但异常表把这些函数的位置、大小、个数全列出来了 —— 等于把
+#       「.ncx 里有 15 个函数、.ncxh 里有 8 个函数、每个多大」直接公布。
+#       代价：失去 C++ 异常栈回溯（崩溃时 backtrace 会残缺）。
+#       nc_guard/sig_check 全是 C，不用 C++ 异常；dex2c 产物用
+#       EX_LandingPad 但那是显式 goto 分发，不依赖 .eh_frame。
+#   .comment
+#       工具链指纹（clang 18.0.4 + LLVM commit + PGO/BOLT/LTO 配置）。
+#       artifact-pipeline 的 protect.sh 也在删，但那里 CI 环境可能没有
+#       objcopy（实测 GH Actions 上从未成功过）；在锁箱器里删是最后一道。
+#   .debug_*
+#       libc++ 的源码路径（out/llvm-project/libcxxabi/src/...）。
+#       --strip-all 删不掉它们（那属于 .debug_line），必须显式 remove。
+def strip_meta(so_path: str, out_path: str) -> int:
+    """删 .eh_frame / .eh_frame_hdr / .comment / .debug_*。
+
+    用 llvm-objcopy（NDK 自带优先，其次系统）。找不到工具即 fail-fast——
+    静默跳过会让「以为清理了其实没清」重演（这正是 .comment 那一项
+    在 CI 上失效三个月的原因）。
+    """
+    import shutil
+    import subprocess
+
+    cands = []
+    ndk = os.environ.get('ANDROID_NDK_HOME', '')
+    if ndk:
+        for host in ('linux-x86_64', 'linux-aarch64', 'darwin-x86_64'):
+            cands.append(os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt',
+                                      host, 'bin', 'llvm-objcopy'))
+    for nm in ('llvm-objcopy', 'objcopy'):
+        p = shutil.which(nm)
+        if p:
+            cands.append(p)
+
+    tool = next((c for c in cands if os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    if tool is None:
+        print('❌ 找不到 llvm-objcopy / objcopy —— 无法清理元数据。', file=sys.stderr)
+        print('   （静默跳过会让产物继续泄露工具链指纹与函数边界，故 fail-fast）',
+              file=sys.stderr)
+        return 1
+
+    # 逐个删，某一段不存在时 objcopy 会报错但其它段仍会删；用 --remove-section
+    # 多次传入，缺失的段由 objcopy 忽略（llvm-objcopy 对不存在的段静默跳过）。
+    sections = ['.eh_frame', '.eh_frame_hdr', '.comment',
+                '.debug_line', '.debug_info', '.debug_abbrev',
+                '.debug_str', '.debug_aranges', '.debug_ranges']
+
+    # 先查实际存在哪些，只删存在的（避免某些 objcopy 版本对缺失段报错）
+    elf = Elf(open(so_path, 'rb').read())
+    present = [s for s in sections if elf.find(s) is not None]
+    if not present:
+        print('   元数据清理: 无可删段（已干净）')
+        shutil.copyfile(so_path, out_path)
+        return 0
+
+    cmd = [tool]
+    for s in present:
+        cmd += ['--remove-section', s]
+    cmd += [so_path, out_path]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        print('❌ 元数据清理失败（%s 退出码 %d）：%s'
+              % (os.path.basename(tool), r.returncode,
+                 r.stderr.decode('utf-8', 'replace').strip()[:200]), file=sys.stderr)
+        return 1
+
+    # 校验：删掉的段必须真的不在输出里，且关键段地址未变（锁箱契约）
+    after = Elf(open(out_path, 'rb').read())
+    still = [s for s in present if after.find(s) is not None]
+    if still:
+        print('❌ 清理后仍存在: %s（objcopy 行为异常）' % ', '.join(still), file=sys.stderr)
+        return 1
+    for name in (SECTION_NAME, HEAD_NAME, SLOT_NAME, STUB_SLOT, HEAD_RO_NAME):
+        b, a = elf.find(name), after.find(name)
+        if b and a and (b['addr'] != a['addr'] or b['offset'] != a['offset']):
+            print('❌ 段 %s 地址被 objcopy 改动（锁箱契约破坏）: '
+                  'addr 0x%x→0x%x' % (name, b['addr'], a['addr']), file=sys.stderr)
+            return 1
+
+    print('   元数据清理: 已删 %s（%s）'
+          % (', '.join(present), os.path.basename(tool)))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='把 so 的代码段加密锁死（构建期锁箱）')
     ap.add_argument('input', help='输入 .so')
@@ -1307,6 +1402,10 @@ def main(argv=None):
     ap.add_argument('--lock-head', action='store_true',
                     help='二级锁箱：把 unlock 本体也锁进 %s（自解谜，需先跑过一级锁箱）'
                          % HEAD_NAME)
+    ap.add_argument('--strip-meta', action='store_true',
+                    help='元数据清理：删 .eh_frame（709 个函数边界）/ .comment'
+                         '（工具链指纹）/ .debug_*（源码路径）。'
+                         '⚠️ 必须在 --lock-head 之后跑（objcopy 会重写 ELF）')
     args = ap.parse_args(argv)
 
     # 证书与包名来源：
@@ -1330,6 +1429,8 @@ def main(argv=None):
         cert = b'\x00' * 32
 
     try:
+        if args.strip_meta:
+            return strip_meta(args.input, args.output)
         if args.lock_head:
             return lock_head(args.input, args.output, args.force)
         return lock(args.input, args.output, args.section, cert,
