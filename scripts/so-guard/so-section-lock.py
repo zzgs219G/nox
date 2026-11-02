@@ -465,7 +465,17 @@ def _encrypt_slots(elf: 'Elf') -> None:
         raise ElfError('.ncks / .nck 缺失，无法执行 T4 槽加密')
 
     boot_key = _derive_boot_key(elf)
-    print('   T4 boot_key: %s（.ncks/.nck 将整体加密）' % boot_key.hex())
+    # ⚠️ 绝不打印 boot_key 本身（2026-11-02 修）。
+    # boot_key 是 .ncks/.nck 两个槽段的 RC4 密钥，而槽里装着
+    # wrapped k_stub + XOR 碎片 + k_mac_head —— 拿到它就能不逆向
+    # 直接剥掉整个解锁链：
+    #   boot_key → 解 .ncks → XOR 碎片拼回 XOR_KEY → k_stub
+    #   → SHA-256-CTR 解 .ncxh（unlock 本体）→ 解 .ncx/.ncxr
+    # 而构建日志会进 CI artifact（protect-modules.yml 的
+    # upload-artifact "构建日志-build.log"）与 R2，属于可下载物。
+    # 仓库即便私有，日志也可能被外传/截图；泄露一把主密钥不划算。
+    # 只留"已派生"的事实，长度都不打（长度也是常量信息）。
+    print('   T4 boot_key: 已派生（.text CRC 自绑定，不落日志）')
 
     enc_off = _LAYOUT['NC_OFF_FRAGS_ENC']          # 8
     # .ncks：[enc_off : size) 加密
