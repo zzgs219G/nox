@@ -344,7 +344,37 @@ static void ncg_xor_key(const uint8_t *slot, uint8_t out[8]) {
  *     ncg_find_section 在 .ncxh 段里，stub 调它会执行密文 → SIGILL。
  *     所以下面另写一个最小实现，只读 ELF 头 + 段表，与它逻辑相同但
  *     编译进 .text。这是"stub 只能调 .text 函数"纪律的直接后果。 */
-static int ncg_stub_find_text(const char *so_path, Elf64_Shdr *out);
+/* ── ELF32/ELF64 统一抽象（2026-11-02）────────────────────────────────
+ *
+ * 为什么必须有它：`APP_ABI := armeabi-v7a arm64-v8a`，v7a 产物是
+ * **ELF32**（实测 `Class: ELF32 / Machine: ARM / shentsize 40`），
+ * 而本文件原先所有解析都硬编码 `Elf64_Ehdr` / `Elf64_Shdr`。用 ELF64
+ * 结构读 ELF32 文件会得到：
+ *     e_shoff  = 0x28000900200034   （真实 0x335a8，把 e_phoff+e_shoff
+ *                                    两个 32 位字段拼成一个 64 位读）
+ *     e_shstrndx = 0
+ *     → pread(shstrtab) 读回 0 字节 → find_text 返回 -1
+ *     → ncg_boot_key 返回 -1 → ncg_slot_read 失败
+ *     → .ncks/.nck 保持密文 → ncg_head_unlock() 执行密文 → SIGILL
+ * 即 **32 位设备上加固包启动即崩**，且症状（SIGILL 在 .ncxh）完全不
+ * 指向"ELF 解析读错字段"。已用最小复现钉死。
+ *
+ * 设计选择：本文件【不放逻辑进 nc_guard_layout.h】——那是常量契约文件，
+ * 零 include 零逻辑是刻意约束（它会被拷进各种 NDK 工程）。所以这层
+ * 抽象留在 boot.c 的 .text 段。
+ *
+ * ⚠️ 必须放在 .text（明文）：T4 的 ncg_boot_key 要在 .ncxh 尚未解密时
+ *    就算出来，而 .ncxh 里的 ncg_find_section 也消费同一套读段函数。
+ *    两边都调它，它自己不能在任何加密段里，否则"用密文解密文"。 */
+typedef struct {
+    uint64_t addr;      /* 运行期/链接期虚拟地址 */
+    uint64_t offset;    /* 文件偏移 */
+    uint64_t size;
+    uint32_t name_off;
+    uint32_t flags;     /* sh_flags 在两种 ELF 里都是 32 位 */
+} ncg_shdr_t;
+
+static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out);
 
 /* CRC32（IEEE 802.3）—— 与第二部分 ncg_crc32 同算法，此处前置实现，
  * 因为 stub 阶段的调用顺序早于第二部分定义。 */
@@ -358,6 +388,65 @@ static uint32_t ncg_boot_crc32(const uint8_t *p, size_t n) {
     return ~c;
 }
 
+/* 读 ELF 头，把差异抹平。返回 0 成功。 */
+static int ncg_elf_hdr(int fd, uint8_t *cls_out, uint64_t *shoff,
+                       uint16_t *shnum, uint16_t *shstrndx,
+                       uint16_t *shentsize) {
+    unsigned char id[EI_NIDENT];
+    if (pread(fd, id, sizeof(id), 0) != (ssize_t)sizeof(id)) return -1;
+    if (memcmp(id, ELFMAG, SELFMAG) != 0) return -1;
+    /* EI_DATA=2 是大端，本设施只支持小端（Android 全 ABI 都是小端） */
+    if (id[EI_DATA] != ELFDATA2LSB) return -1;
+
+    if (id[EI_CLASS] == ELFCLASS64) {
+        Elf64_Ehdr eh;
+        if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh)) return -1;
+        *cls_out = 64;
+        *shoff = eh.e_shoff;
+        *shnum = eh.e_shnum;
+        *shstrndx = eh.e_shstrndx;
+        *shentsize = eh.e_shentsize;
+        if (*shentsize != sizeof(Elf64_Shdr)) return -1;
+    } else if (id[EI_CLASS] == ELFCLASS32) {
+        Elf32_Ehdr eh;
+        if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh)) return -1;
+        *cls_out = 32;
+        *shoff = eh.e_shoff;
+        *shnum = eh.e_shnum;
+        *shstrndx = eh.e_shstrndx;
+        *shentsize = eh.e_shentsize;
+        if (*shentsize != sizeof(Elf32_Shdr)) return -1;
+    } else {
+        return -1;
+    }
+    if (*shoff == 0 || *shnum == 0 || *shstrndx >= *shnum) return -1;
+    return 0;
+}
+
+/* 读第 i 个段头（统一成 ncg_shdr_t）。返回 0 成功。 */
+static int ncg_elf_shdr(int fd, uint8_t cls, uint64_t shoff,
+                        uint16_t shentsize, int i, ncg_shdr_t *out) {
+    off_t at = (off_t)shoff + (off_t)i * (off_t)shentsize;
+    if (cls == 64) {
+        Elf64_Shdr sh;
+        if (pread(fd, &sh, sizeof(sh), at) != (ssize_t)sizeof(sh)) return -1;
+        out->addr = sh.sh_addr;
+        out->offset = sh.sh_offset;
+        out->size = sh.sh_size;
+        out->name_off = sh.sh_name;
+        out->flags = (uint32_t)sh.sh_flags;
+    } else {
+        Elf32_Shdr sh;
+        if (pread(fd, &sh, sizeof(sh), at) != (ssize_t)sizeof(sh)) return -1;
+        out->addr = sh.sh_addr;
+        out->offset = sh.sh_offset;
+        out->size = sh.sh_size;
+        out->name_off = sh.sh_name;
+        out->flags = sh.sh_flags;
+    }
+    return 0;
+}
+
 /* ── T4 专用：在 stub 阶段查 .text 段 ────────────────────────────────
  *
  * 为什么不复用 ncg_find_section：那函数编译进 .ncxh 段（密文），
@@ -365,32 +454,31 @@ static uint32_t ncg_boot_crc32(const uint8_t *p, size_t n) {
  * 按本文件开头的调用纪律"stub 只能调 .text 里的函数"，这里另写一份
  * 最小实现，编进 .text。
  *
- * 只取 .text 一项，不做通用遍历（省体积，也减少 stub 的攻击面）。 */
+ * 只取 .text 一项，不做通用遍历（省体积，也减少 stub 的攻击面）。
+ * ELF32/64 双支持见上方的 ncg_elf_hdr / ncg_elf_shdr。 */
 __attribute__((noinline))
-static int ncg_stub_find_text(const char *so_path, Elf64_Shdr *out) {
+static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -1;
-    Elf64_Ehdr eh;
-    if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)
-        || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0
-        || eh.e_shoff == 0 || eh.e_shnum == 0
-        || eh.e_shstrndx >= eh.e_shnum) {
+    uint8_t cls;
+    uint64_t shoff;
+    uint16_t shnum, shstrndx, shentsize;
+    if (ncg_elf_hdr(fd, &cls, &shoff, &shnum, &shstrndx, &shentsize) != 0) {
         close(fd); return -1;
     }
-    Elf64_Shdr shstr;
-    if (pread(fd, &shstr, sizeof(shstr),
-              eh.e_shoff + (off_t)eh.e_shstrndx * sizeof(Elf64_Shdr))
-        != (ssize_t)sizeof(shstr)) { close(fd); return -1; }
+    ncg_shdr_t shstr;
+    if (ncg_elf_shdr(fd, cls, shoff, shentsize, shstrndx, &shstr) != 0) {
+        close(fd); return -1;
+    }
 
     char name[16];
     /* 段名只可能是 ".text"，逐项比对前 16 字节即可 */
-    for (int i = 0; i < eh.e_shnum; i++) {
-        Elf64_Shdr sh;
-        if (pread(fd, &sh, sizeof(sh),
-                  eh.e_shoff + (off_t)i * sizeof(Elf64_Shdr))
-            != (ssize_t)sizeof(sh)) break;
-        if (sh.sh_name >= shstr.sh_size) continue;
-        ssize_t n = pread(fd, name, sizeof(name) - 1, shstr.sh_offset + sh.sh_name);
+    for (int i = 0; i < shnum; i++) {
+        ncg_shdr_t sh;
+        if (ncg_elf_shdr(fd, cls, shoff, shentsize, i, &sh) != 0) break;
+        if (sh.name_off >= shstr.size) continue;
+        ssize_t n = pread(fd, name, sizeof(name) - 1,
+                          (off_t)shstr.offset + sh.name_off);
         if (n <= 0) continue;
         name[n] = 0;
         if (strcmp(name, ".text") == 0) { *out = sh; close(fd); return 0; }
@@ -403,7 +491,7 @@ static int ncg_stub_find_text(const char *so_path, Elf64_Shdr *out) {
  * 参数：so_path（由调用方用 dladdr 取得）、base（镜像基址）。
  * 返回 0 成功；-1 表示 .text 定位失败或区间配置错误（fail-closed）。 */
 static int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
-    Elf64_Shdr text;
+    ncg_shdr_t text;
     if (ncg_stub_find_text(so_path, &text) != 0) return -1;
 
     /* 区间长度自适应：取 min(上限, .text 实际长度)。
@@ -411,10 +499,10 @@ static int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
      *    armeabi-v7a 的 .text 只有 12000 字节 < 16384 → 锁箱 fail-fast。
      *    改成自适应后两个 ABI 都能工作，且与 Python 侧 take min 同规则。 */
     size_t span = (size_t)NC_BOOT_SPAN;
-    if (span > (size_t)text.sh_size) span = (size_t)text.sh_size;
+    if (span > (size_t)text.size) span = (size_t)text.size;
     if (span < (size_t)NC_BOOT_SPAN_MIN) return -1;   /* 区间过小，强度不足 */
 
-    const uint8_t *lo = (const uint8_t *)base + text.sh_addr;
+    const uint8_t *lo = (const uint8_t *)base + text.addr;
     uint32_t crc = ncg_boot_crc32(lo, span);
 
     /* ikm = CRC(4B 大端) || 区间首 16B || 区间末 16B
@@ -518,17 +606,19 @@ static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
      * 这只需要段表，不需要基址。 */
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return 1;                    /* 保守：放宽权限，不误伤 */
-    Elf64_Ehdr eh;
-    if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)
-        || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0
-        || eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shnum > 4096) {
+    uint8_t cls;
+    uint64_t shoff;
+    uint16_t shnum, shstrndx, shentsize;
+    if (ncg_elf_hdr(fd, &cls, &shoff, &shnum, &shstrndx, &shentsize) != 0
+        || shnum > 4096) {
         close(fd); return 1;
     }
-    Elf64_Shdr *shs = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
+    ncg_shdr_t *shs = (ncg_shdr_t *)calloc(shnum, sizeof(ncg_shdr_t));
     if (!shs) { close(fd); return 1; }
-    if (pread(fd, shs, eh.e_shnum * sizeof(Elf64_Shdr), eh.e_shoff)
-        != (ssize_t)(eh.e_shnum * sizeof(Elf64_Shdr))) {
-        free(shs); close(fd); return 1;
+    for (int i = 0; i < shnum; i++) {
+        if (ncg_elf_shdr(fd, cls, shoff, shentsize, i, &shs[i]) != 0) {
+            free(shs); close(fd); return 1;
+        }
     }
     close(fd);
 
@@ -536,14 +626,14 @@ static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
      * 共用同一个基址。故 base = addr - 当前段.sh_addr，但我们不知道
      * 当前段是哪个。改为：对每个段假设它是当前段，算出 base，再验证
      * 该 base 是否让 addr 落在它的范围内。只有一个段会验证通过。 */
-    const Elf64_Shdr *cur = NULL;
-    for (int i = 0; i < eh.e_shnum; i++) {
-        if ((shs[i].sh_flags & SHF_ALLOC) == 0) continue;
-        if ((shs[i].sh_flags & SHF_WRITE) != 0) continue;   /* 当前段是只读的 */
-        if (shs[i].sh_addr == 0 || shs[i].sh_size == 0) continue;
-        uintptr_t base = addr - (uintptr_t)shs[i].sh_addr;
-        if (addr >= base + shs[i].sh_addr
-            && addr + len <= base + shs[i].sh_addr + shs[i].sh_size
+    const ncg_shdr_t *cur = NULL;
+    for (int i = 0; i < shnum; i++) {
+        if ((shs[i].flags & SHF_ALLOC) == 0) continue;
+        if ((shs[i].flags & SHF_WRITE) != 0) continue;   /* 当前段是只读的 */
+        if (shs[i].addr == 0 || shs[i].size == 0) continue;
+        uintptr_t base = addr - (uintptr_t)shs[i].addr;
+        if (addr >= base + shs[i].addr
+            && addr + len <= base + shs[i].addr + shs[i].size
             && base % page == 0) {
             cur = &shs[i];
             break;
@@ -552,48 +642,59 @@ static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
     if (!cur) { free(shs); return 1; }
 
     /* 与当前段页区间相交的其它段里，有可写的吗 */
-    uintptr_t clo = (uintptr_t)cur->sh_addr & ~(page - 1);
-    uintptr_t chi = (((uintptr_t)cur->sh_addr + cur->sh_size - 1) & ~(page - 1)) + page;
+    uintptr_t clo = (uintptr_t)cur->addr & ~(page - 1);
+    uintptr_t chi = (((uintptr_t)cur->addr + cur->size - 1) & ~(page - 1)) + page;
     int found = 0;
-    for (int i = 0; i < eh.e_shnum; i++) {
+    for (int i = 0; i < shnum; i++) {
         if (&shs[i] == cur) continue;
-        if ((shs[i].sh_flags & SHF_ALLOC) == 0) continue;
-        if ((shs[i].sh_flags & SHF_WRITE) == 0) continue;
-        if (shs[i].sh_size == 0) continue;
-        uintptr_t wlo = (uintptr_t)shs[i].sh_addr & ~(page - 1);
-        uintptr_t whi = (((uintptr_t)shs[i].sh_addr + shs[i].sh_size - 1) & ~(page - 1)) + page;
+        if ((shs[i].flags & SHF_ALLOC) == 0) continue;
+        if ((shs[i].flags & SHF_WRITE) == 0) continue;
+        if (shs[i].size == 0) continue;
+        uintptr_t wlo = (uintptr_t)shs[i].addr & ~(page - 1);
+        uintptr_t whi = (((uintptr_t)shs[i].addr + shs[i].size - 1) & ~(page - 1)) + page;
         if (wlo < chi && clo < whi) { found = 1; break; }
     }
     free(shs);
     return found;
 }
 
-/* 在 ELF 文件里按名字找段（ELF64；armeabi-v7a 的 ELF32 支持是既有缺口，
- * 见 unlock.c 同款函数的历史说明，本轮不扩范围） */
+/* 在 ELF 文件里按名字找段（ELF32 + ELF64 双支持，2026-11-02）。
+ *
+ * 原先只支持 ELF64 且注释写"ELF32 是既有缺口，本轮不扩范围"——但
+ * `APP_ABI := armeabi-v7a arm64-v8a`，v7a 产物就是 ELF32，缺口等于
+ * 32 位设备上加固包必然 SIGILL。复用 ncg_elf_hdr / ncg_elf_shdr。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_find_section(const char *so_path, const char *name,
-                            Elf64_Shdr *out) {
+                            ncg_shdr_t *out) {
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -1;
-    Elf64_Ehdr eh;
-    if (read(fd, &eh, sizeof(eh)) != sizeof(eh)
-        || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0
-        || eh.e_shoff == 0 || eh.e_shnum == 0) { close(fd); return -1; }
-    if (eh.e_shstrndx >= eh.e_shnum) { close(fd); return -1; }
+    uint8_t cls;
+    uint64_t shoff;
+    uint16_t shnum, shstrndx, shentsize;
+    if (ncg_elf_hdr(fd, &cls, &shoff, &shnum, &shstrndx, &shentsize) != 0) {
+        close(fd); return -1;
+    }
 
-    Elf64_Shdr *shs = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
+    ncg_shdr_t *shs = (ncg_shdr_t *)calloc(shnum, sizeof(ncg_shdr_t));
     if (!shs) { close(fd); return -1; }
-    if (pread(fd, shs, eh.e_shnum * sizeof(Elf64_Shdr), eh.e_shoff)
-        != (ssize_t)(eh.e_shnum * sizeof(Elf64_Shdr))) { free(shs); close(fd); return -1; }
+    for (int i = 0; i < shnum; i++) {
+        if (ncg_elf_shdr(fd, cls, shoff, shentsize, i, &shs[i]) != 0) {
+            free(shs); close(fd); return -1;
+        }
+    }
 
-    Elf64_Shdr *strh = &shs[eh.e_shstrndx];
-    char *strtab = (char *)calloc(strh->sh_size + 1, 1);
+    const ncg_shdr_t *strh = &shs[shstrndx];
+    char *strtab = (char *)calloc(strh->size + 1, 1);
     if (!strtab) { free(shs); close(fd); return -1; }
-    pread(fd, strtab, strh->sh_size, strh->sh_offset);
+    if (pread(fd, strtab, strh->size, (off_t)strh->offset)
+        != (ssize_t)strh->size) {
+        free(strtab); free(shs); close(fd); return -1;
+    }
 
     int found = -1;
-    for (int i = 0; i < eh.e_shnum; i++) {
-        const char *n = strtab + shs[i].sh_name;
+    for (int i = 0; i < shnum; i++) {
+        if (shs[i].name_off >= strh->size) continue;
+        const char *n = strtab + shs[i].name_off;
         if (strcmp(n, name) == 0) { *out = shs[i]; found = 0; break; }
     }
     free(strtab);
@@ -760,17 +861,17 @@ int ncg_head_unlock(void) {
     char so_path[512];
     if (ncg_resolve_self(&base, so_path, sizeof(so_path)) != 0) return -1;
 
-    Elf64_Shdr sec, slot;
+    ncg_shdr_t sec, slot;
     if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) return -2;
     if (ncg_find_section(so_path, NC_SEC_SLOT, &slot) != 0) return -3;
-    if (sec.sh_size == 0) return -4;
-    if ((sec.sh_flags & SHF_ALLOC) == 0) return -5;
+    if (sec.size == 0) return -4;
+    if ((sec.flags & SHF_ALLOC) == 0) return -5;
 
     uint8_t slotdata[NC_SLOT_SIZE];
     memset(slotdata, 0, sizeof(slotdata));
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -6;
-    ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.sh_offset);
+    ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.offset);
     close(fd);
     if (got < 32) return -7;
 
@@ -786,20 +887,20 @@ int ncg_head_unlock(void) {
     int so_locked = 0;
     {
         /* 用 .ncks 的 magic 判"是否已锁"（.ncks[0:8) 永远明文） */
-        Elf64_Shdr nks;
+        ncg_shdr_t nks;
         if (ncg_find_section(so_path, NC_SEC_STUBSLOT, &nks) == 0
-            && nks.sh_size >= NC_OFF_FRAGS_ENC) {
+            && nks.size >= NC_OFF_FRAGS_ENC) {
             uint8_t probe[8];
             int pfd = open(so_path, O_RDONLY);
             if (pfd >= 0) {
-                if (pread(pfd, probe, 8, nks.sh_offset) == 8
+                if (pread(pfd, probe, 8, nks.offset) == 8
                     && ncg_magic_ok(probe, NCG_MAGIC_SEED_STUB))
                     so_locked = 1;
                 close(pfd);
             }
         }
     }
-    if (so_locked && slot.sh_size >= NC_SLOT_SIZE) {
+    if (so_locked && slot.size >= NC_SLOT_SIZE) {
         uint8_t bk2[16];
         char p2[512];
         Dl_info di;
@@ -849,7 +950,7 @@ int ncg_head_unlock(void) {
      *   magic 之后【不允许】再有"长度不够就放行"的分支。
      *   ——这与报错五十二（lock_head 段缺失 return 0）、报错五十四
      *   （env_mem_readable 取不到就当通过）是同一类病，本仓库第三次复发。 */
-    if (got < NC_SLOT_SIZE || slot.sh_size < NC_SLOT_SIZE) {
+    if (got < NC_SLOT_SIZE || slot.size < NC_SLOT_SIZE) {
         /* 此刻尚未派生任何密钥（key[] 在下方才声明），故只需清槽缓冲。
          * 清 slotdata 是既有纪律：它含 wrapped 值，不留残渣。 */
         memset(slotdata, 0, sizeof(slotdata));
@@ -969,18 +1070,18 @@ int ncg_head_unlock(void) {
      *
      * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
-    Elf64_Shdr segs[2];
+    ncg_shdr_t segs[2];
     int nseg = 0;
     segs[nseg++] = sec;
     {
-        Elf64_Shdr ro;
+        ncg_shdr_t ro;
         if (ncg_find_section(so_path, NC_SEC_CONST, &ro) == 0
-            && ro.sh_size > 0 && (ro.sh_flags & SHF_ALLOC)) {
+            && ro.size > 0 && (ro.flags & SHF_ALLOC)) {
             segs[nseg++] = ro;
         }
     }
 
-    uint8_t *target = (uint8_t *)base + sec.sh_addr;
+    uint8_t *target = (uint8_t *)base + sec.addr;
 
     /* 完整性校验：先验后解（位置在 mprotect/解密之前）
      *
@@ -1011,8 +1112,8 @@ int ncg_head_unlock(void) {
             khmac_ctx *hc = (khmac_ctx *)hcbuf;
             khmac_init(hc, k_mac, 16);
             for (int i = 0; i < nseg; i++) {
-                const uint8_t *p = (const uint8_t *)base + segs[i].sh_addr;
-                khmac_update(hc, p, segs[i].sh_size);
+                const uint8_t *p = (const uint8_t *)base + segs[i].addr;
+                khmac_update(hc, p, segs[i].size);
             }
             khmac_final(hc, got_mac);
             memset(hcbuf, 0, sizeof(hcbuf));
@@ -1037,10 +1138,10 @@ int ncg_head_unlock(void) {
      * 按页对齐，否则会失败。 */
     uintptr_t ps = getpagesize();
     for (int i = 0; i < nseg; i++) {
-        uint8_t *tgt = (uint8_t *)base + segs[i].sh_addr;
-        size_t len = (size_t)segs[i].sh_size;
+        uint8_t *tgt = (uint8_t *)base + segs[i].addr;
+        size_t len = (size_t)segs[i].size;
         /* 数据段不需要 EXEC；代码段需要 */
-        int is_code = (segs[i].sh_flags & SHF_EXECINSTR) != 0;
+        int is_code = (segs[i].flags & SHF_EXECINSTR) != 0;
         uintptr_t s = (uintptr_t) tgt & ~(ps - 1);
         uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
         if (mprotect((void *) s, e - s,
@@ -1145,8 +1246,8 @@ int ncg_head_unlock(void) {
         uint8_t *addrs[NC_CODE_SEG_MAX];
         uint32_t sizes[NC_CODE_SEG_MAX];
         for (int i = 0; i < nseg && i < NC_CODE_SEG_MAX; i++) {
-            addrs[i] = (uint8_t *)base + segs[i].sh_addr;
-            sizes[i] = (uint32_t)segs[i].sh_size;
+            addrs[i] = (uint8_t *)base + segs[i].addr;
+            sizes[i] = (uint32_t)segs[i].size;
         }
         ncg_baseline_init(addrs, sizes, nseg);
     }
