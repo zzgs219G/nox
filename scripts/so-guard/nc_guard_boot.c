@@ -70,6 +70,42 @@
  *    强度边界见 nc_guard_paths.h 的文件头（混淆，非加密）。 */
 #include "nc_guard_paths.h"
 
+/* ncg_xor_key 已拆到 nc_guard_xor.c（2026-11-06）：VMP 与 annotate 互斥
+ * —— annotate 会把函数地址写进 @llvm.global.annotations，VMP 因此判定
+ * "has non-call address uses" 并跳过（实测 CI 42075245237 的 debug 日志）。
+ * 拆到独立文件后可用文件级 AMICE_VM_VIRTUALIZE，不经 annotate。 */
+void ncg_xor_key(const uint8_t *slot, uint8_t out[8]);
+
+/* ── Amice 混淆标注（2026-11-05，可选）──────────────────────────────
+ *
+ * 组合 5 项，全部逐函数生效（不设全局 AMICE_* 环境变量 —— 那会波及
+ * 同编译单元的所有函数，实测让 .text 涨 92%）。
+ *
+ *   +flatten            控制流平坦化 —— 唯一改变控制流结构的
+ *   +mba                混合布尔算术 —— 算术等价替换，风险最低
+ *   +shuffle_blocks     基本块乱序
+ *   +split_basic_block  基本块拆分（默认 num=1，体积随 num 线性涨）
+ *   +indirect_call      间接调用 —— 打断调用链
+ *
+ * 不选 VMP/BCF 的理由：VMP 体积 +300~500% 且崩溃后 pc 落在解释器里
+ * 无法排查；BCF 让体积翻几倍且关键路径上有实打实的执行开销。
+ * （ncg_xor_key 的 VMP 试验见 nc_guard_xor.c）
+ *
+ * ⚠️ flatten 会重排控制流，而这两个函数都在 constructor(50) 里。
+ *    一旦有边界错误就是随机崩溃，且混淆后的反汇编我们自己也不好查。
+ *    唯一有效验证是真机 selftest==59（CI x86_64 跑不了 ARM64）。 */
+#if defined(NC_AMICE_ANNOTATE)
+#  define NC_OBF \
+     __attribute__((noinline, \
+       annotate("+flatten"), \
+       annotate("+mba"), \
+       annotate("+shuffle_blocks"), \
+       annotate("+split_basic_block"), \
+       annotate("+indirect_call")))
+#else
+#  define NC_OBF
+#endif
+
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
  * 为什么不能放 .ncx：那是 AXR（可执行）段，clang 拒绝让 const 数据
@@ -189,7 +225,6 @@ static void ncg_baseline_init(uint8_t *const *addrs, const uint32_t *sizes,
  *
  * 存放约定：逻辑字节 i<4 取第 NCG_XOR_FRAG[i] 个 uint16 的低 8 位；
  *   i>=4 取高 8 位。 */
-static const uint8_t NCG_XOR_FRAG[8] = NC_XOR_FRAG_INIT;
 
 static volatile uint16_t ncg_frag_a = 0x51a3u;
 static volatile uint16_t ncg_frag_b = 0xe27bu;
@@ -304,88 +339,6 @@ static int ncg_slot_read(const char *so_path, uintptr_t base,
 
 
 
-/* 从【调用方提供的已解密槽】里拼回 8 字节 XOR_KEY。
- *
- * ⚠️ 2026-10-29 改动：原实现直接读全局 ncg_slot_live（.bss 常驻明文）。
- *    现在改为由调用方传槽指针，调用方用完立刻擦 —— 不在任何地方留副本。
- * ⚠️ 不缓存结果（缓存=又一处常驻明文），每次重算，调用方用完必须 ncg_wipe。 */
-/* ── Amice 混淆标注（2026-11-05，可选择性启用）─────────────────────
- *
- * 目的：让攻击者"读懂解密逻辑"的成本上升。
- *   当前拿到的 so 里，这个函数是明文（它必须先于解锁运行，不能进 .ncx），
- *   符号虽被 strip，但 -mbranch-protection=standard 的 bti c 标出了
- *   函数边界（实测 182 个入口），反汇编即可读懂 XOR_KEY 重组规则。
- *
- * 为什么可以安全加：
- *   · Amice 是编译期 pass，不改变 ELF 段结构 → .ncx/.ncxh 六段不受影响
- *   · 混淆改变 .text 内容 → crc32(.text) 变 → 但 code_len 由锁箱期
- *     Python 按段表重算并写入 slot（nc_guard_boot.c:1974），幂等自洽
- *   · 未装 Amice 时 NC_AMICE_ANNOTATE 展开为空 → 编译行为与之前逐字节一致
- *
- * ⚠️ 只标 MBA，不标 flatten：
- *   flatten 会重排控制流，在 constructor(50) 关键路径上风险高（一旦有边界
- *   错误就是随机崩溃，且混淆后的反汇编我们自己也不好查）。MBA 是
- *   算术/逻辑等价的局部替换，风险低一个量级。
- *   验证充分后再考虑加 +flatten。
- *
- * ⚠️ 用宏条件化而不是直接写 __attribute__：
- *   宿主测试（test-so-lock.sh 的 T22 二进制等价）与未装 Amice 的构建
- *   都必须走"无标注"路径，否则会把不可用的属性带进 clang 18。
- */
-#if defined(NC_AMICE_ANNOTATE)
-/* 混淆组合（2026-11-06）：按"强度/代价"权衡后选定 5 项。
- *
- * 为什么是这几项（都是【逐函数】生效，不设全局 AMICE_* 环境变量）：
- *   +flatten        控制流平坦化 —— 唯一能改变控制流结构的，是质变。
- *                   不选它，MBA 只是"跳过去还能看到原指令"。
- *   +mba            混合布尔算术 —— 算术等价替换，风险最低，做基础噪声。
- *   +shuffle_blocks 基本块乱序 —— 打乱布局，配合 flatten 增强。
- *   +split_basic_block 基本块拆分 —— 把一个块拆成多个，增大 CFG 重建成本。
- *                   用默认 num=1，不调大：体积随 num 线性增长。
- *   +indirect_call  间接调用 —— 打断调用链，静态看不到"谁调了谁"。
- *
- * 刻意【不选】的：
- *   +vm_flatten / +vm_virtualize  VMP 虚拟化 —— 体积 +300~500%，
- *       启动路径上（constructor(50)）会明显拖慢；且崩溃时 pc 落在
- *       解释器里，看不出是哪个函数，连我们自己都排不了障。
- *   +bogus_control_flow  BCF —— 虚假分支会让体积翻几倍，且分支多了
- *       在关键路径上是实打实的执行开销。
- *   +alias_access / +clone_function —— 收益限于表达式局部，对
- *       "读懂解密链"帮助很小。
- *
- * ⚠️ flatten 会重排控制流，而这三个函数都在 constructor(50) 里。
- *    一旦有边界错误就是随机崩溃，且混淆后的反汇编我们自己也不好查。
- *    唯一有效的验证是真机 selftest==59（CI x86_64 跑不了 ARM64）。
- *    所以：先在【只勾 sigcheck】的最小组合上验证通过，再扩大使用。 */
-#  define NC_OBF \
-     __attribute__((noinline, \
-       annotate("+flatten"), \
-       annotate("+mba"), \
-       annotate("+shuffle_blocks"), \
-       annotate("+split_basic_block"), \
-       annotate("+indirect_call")))
-/* VMP 试验（2026-11-06）：只给最小的那个函数（ncg_xor_key，源码 8 行）
- * 上指令级虚拟化，验证三件事后再决定是否推广：
- *   ① 体积涨多少   ② 启动慢多少   ③ 崩了能不能排查
- * vm_runtime_scope=func：解释器内联进本函数，不引入模块级 runtime
- * （module 模式会把解释器作为独立符号，更容易被定位）。 */
-#  define NC_OBF_VMP \
-     __attribute__((noinline, \
-       annotate("+vm_virtualize,vm_runtime_scope=func")))
-#else
-#  define NC_OBF
-#  define NC_OBF_VMP
-#endif
-
-NC_OBF_VMP
-static void ncg_xor_key(const uint8_t *slot, uint8_t out[8]) {
-    const uint8_t *fr = slot + NC_OFF_FRAGS;
-    for (int i = 0; i < 8; i++) {
-        uint16_t v = (uint16_t)(fr[NCG_XOR_FRAG[i] * 2]
-                               | (fr[NCG_XOR_FRAG[i] * 2 + 1] << 8));
-        out[i] = (i < 4) ? (uint8_t)(v & 0xFF) : (uint8_t)((v >> 8) & 0xFF);
-    }
-}
 
 /* ── T4：boot_key 派生（2026-10-28）─────────────────────────────────
  *

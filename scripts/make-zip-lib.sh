@@ -80,7 +80,8 @@ fi
 #    → fail-closed 杀进程（真机实测：装完启动即闪退，logcat 报
 #      No implementation found for NcLink.selftest）。
 #    这不是可选项 —— 漏了它整包起不来。
-LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni"
+# nc_guard_xor（2026-11-06）：XOR_KEY 重组，从 boot.c 拆出以便单独 VMP
+LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni nc_guard_xor"
 
 : "${ANDROID_NDK_HOME:?双 ABI 交叉编译需要 ANDROID_NDK_HOME（指向 NDK 根目录）}"
 _prebuilt="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
@@ -117,7 +118,19 @@ for abi in arm64-v8a armeabi-v7a; do
     echo "[$abi] 编译器: $CC"
     for f in $LIB_SRCS; do
         # shellcheck disable=SC2086
-        "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+        #
+        # ⚠️ nc_guard_xor.c 单独走 VMP（2026-11-06）：
+        #   VMP 与 annotate 互斥 —— annotate 会把函数地址写进
+        #   @llvm.global.annotations，vm_virtualize 判定 "has non-call
+        #   address uses" 并跳过（实测 CI 42075245237 的 debug 日志）。
+        #   所以该文件不含 annotate，改用文件级 AMICE_VM_VIRTUALIZE。
+        #   只对它一个文件开 —— 全局开会让整个编译单元的所有函数都被
+        #   虚拟化（体积 +300~500%，且崩溃不可排查）。
+        if [[ "$f" == "nc_guard_xor" && -n "${AMICE_BUNDLE:-}" ]]; then
+            AMICE_VM_VIRTUALIZE=true "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+        else
+            "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+        fi
         printf "  %-20s %s 字节\n" "$f.o" "$(stat -c%s "$_out/$f.o")"
     done
     "$AR" rcs "$_out/libnox.a" "$_out"/*.o
