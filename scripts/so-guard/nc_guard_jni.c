@@ -42,14 +42,21 @@ extern int ncguard_probe(int token);
 static atomic_int ncg_selftest_done = 0;
 
 /* 解锁 + 执行密文段代码，返回可判读的回执。
- * 显式 visibility("default")：库是 -fvisibility=hidden 编的，
- * 不加这个 JNI 符号不会被导出，Java 侧找不到。
- * ⚠️ 用短名绑定而非动态注册：后者在 so 加载时机（Application 初始化中）
- *   调 FindClass 会崩，真机实证（见 nc_link.c 同处注释）。 */
-#define NC_SELFTEST_DECL \
-    __attribute__((visibility("default"))) JNIEXPORT jint JNICALL \
-    Java_com_nc_link_NcLink_selftest(JNIEnv *env, jobject thiz)
-NC_SELFTEST_DECL {
+ *
+ * ⚠️ 2026-11-04：改为【动态注册】（见 artifact-pipeline 的 nc_link_jni.c）。
+ *   原先是短名绑定 `Java_com_nc_link_NcLink_selftest` + JNIEXPORT，
+ *   符号必然进 .dynsym —— JNIEXPORT 自带 visibility("default")，
+ *   对 -fvisibility=hidden 免疫，version script 也收敛不掉。
+ *   现在去掉 JNIEXPORT 与 Java_ 前缀 → 受 -fvisibility=hidden 支配
+ *   → hidden → 不进符号表，由 RegisterNatives 按字符串名在 JNI_OnLoad 注册。
+ *
+ * ⚠️ 若注册侧（nc_link_jni.c）以 weak 引用本符号且本文件未参与编译
+ *   （静态库形态 / --exclude nc_guard_jni.c），则 selftest 不会被注册，
+ *   Java 侧调用抛 UnsatisfiedLinkError。这是【允许】的：注入的 smali 已把
+ *   selftest 包在独立 try/catch 里（报错四十九的教训），不影响心跳与判决。
+ *   代价只是失去自检可观测性，不构成安全降级（selftest 本就不参与判定）。 */
+jint nc_link_jni_selftest(JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
     int expected = 0;
     if (!atomic_compare_exchange_strong(&ncg_selftest_done, &expected, 1)) {
         return (jint) -100;      /* 已自检过，拒绝重入 */
