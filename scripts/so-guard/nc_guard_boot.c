@@ -64,11 +64,13 @@
  *    但 **C 的字符串字面量永远进 .rodata，不会跟着函数进自定义段**。
  *    实测确认：锁箱后 /proc/self/cmdline 仍在 .rodata 明文可搜。 */
 #include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/slot尺寸/偏移/magic seed */
+#include "nc_guard_internal.h" /* 跨 .c 的内部声明（ncg_shdr_t 等，2026-11-06）*/
 /* ⚠️ 2026-10-30 独立化：原先 include "sig_log_data.h"（主项目 sigcheck 模块
  *    生成的表），那让本设施脱离主项目就编译不过。现改为自带的路径密文表。
  *    只有两条路径需要隐藏（cmdline / maps），自包含成本极低。
  *    强度边界见 nc_guard_paths.h 的文件头（混淆，非加密）。 */
 #include "nc_guard_paths.h"
+#include "nc_guard_internal.h" /* 跨 .c 内部声明（ncg_shdr_t / ncg_boot_key 等，2026-11-06）*/
 
 /* ncg_xor_key 已拆到 nc_guard_xor.c（2026-11-06）：VMP 与 annotate 互斥
  * —— annotate 会把函数地址写进 @llvm.global.annotations，VMP 因此判定
@@ -138,7 +140,7 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
 /* 不可优化的清零（实现在第二部分 .text）。前向声明：密钥清零调用点
  * 在 .ncxh 段的 ncg_head_unlock 里，而本函数在 .text —— 两侧都必须能
  * 相互引用，靠 PC 相对寻址天然正确。详见定义处的说明。 */
-static void ncg_wipe(void *p, size_t n);
+void ncg_wipe(void *p, size_t n);
 
 /* 提交二（2026-10-30）：完整性基线采集。定义在第二部分 .text，
  * 调用点在 .ncxh 段的 ncg_head_unlock —— 同 ncg_wipe 的理由需前置声明。
@@ -282,8 +284,8 @@ static const volatile unsigned char ncg_stub_slot[NC_STUB_SIZE];
  * 要么堆），都违背"用完即毁"。强制调用方给栈缓冲，用完必须 ncg_wipe。
  *
  * ⚠️ 未锁箱（开发期）：直接把原段明文拷过来，行为与改动前一致。 */
-/* 前向声明：ncg_boot_key 定义在本文件靠后位置，ncg_slot_read 需要它。 */
-static int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]);
+/* ncg_boot_key 的前向声明已移到 nc_guard_internal.h（2026-11-06 拆文件）。
+ * 定义现在 nc_guard_crypto.c —— ncg_slot_read 仍在本文件调用它。 */
 
 __attribute__((noinline))
 static int ncg_slot_read(const char *so_path, uintptr_t base,
@@ -387,20 +389,19 @@ static int ncg_slot_read(const char *so_path, uintptr_t base,
  *
  * ⚠️ 必须放在 .text（明文）：T4 的 ncg_boot_key 要在 .ncxh 尚未解密时
  *    就算出来，而 .ncxh 里的 ncg_find_section 也消费同一套读段函数。
- *    两边都调它，它自己不能在任何加密段里，否则"用密文解密文"。 */
-typedef struct {
-    uint64_t addr;      /* 运行期/链接期虚拟地址 */
-    uint64_t offset;    /* 文件偏移 */
-    uint64_t size;
-    uint32_t name_off;
-    uint32_t flags;     /* sh_flags 在两种 ELF 里都是 32 位 */
-} ncg_shdr_t;
+ *    两边都调它，它自己不能在任何加密段里，否则"用密文解密文"。
+ *
+ * ⚠️ 2026-11-06：`ncg_shdr_t` 的定义已上移到 nc_guard_internal.h ——
+ *    ncg_boot_key 拆到 nc_guard_crypto.c 后两侧都要用这个类型。
+ *    此处只保留说明，不再重复定义（重复定义会编译报错，好事）。 */
 
-static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out);
+int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out);
 
 /* CRC32（IEEE 802.3）—— 与第二部分 ncg_crc32 同算法，此处前置实现，
- * 因为 stub 阶段的调用顺序早于第二部分定义。 */
-static uint32_t ncg_boot_crc32(const uint8_t *p, size_t n) {
+ * 因为 stub 阶段的调用顺序早于第二部分定义。
+ * ⚠️ 2026-11-06 去掉 static：ncg_boot_key 已拆到 nc_guard_crypto.c，
+ *    跨编译单元调用。符号面由 -fvisibility=hidden 收敛，不进 .dynsym。 */
+uint32_t ncg_boot_crc32(const uint8_t *p, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < n; i++) {
         c ^= p[i];
@@ -479,7 +480,7 @@ static int ncg_elf_shdr(int fd, uint8_t cls, uint64_t shoff,
  * 只取 .text 一项，不做通用遍历（省体积，也减少 stub 的攻击面）。
  * ELF32/64 双支持见上方的 ncg_elf_hdr / ncg_elf_shdr。 */
 __attribute__((noinline))
-static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
+int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -1;
     uint8_t cls;
@@ -509,43 +510,29 @@ static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
     return -1;
 }
 
-/* 计算 boot_key（16 字节）。调用方用完必须 ncg_wipe。
- * 参数：so_path（由调用方用 dladdr 取得）、base（镜像基址）。
- * 返回 0 成功；-1 表示 .text 定位失败或区间配置错误（fail-closed）。
- * ⚠️ NC_OBF（见 ncg_xor_key 上方的说明）：攻击者读懂本函数就能复现
- *    boot_key → 解 .ncks → 拿 k_stub → 解 .ncxh。所以它是最值得混淆的一个。 */
-NC_OBF
-static int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
-    ncg_shdr_t text;
-    if (ncg_stub_find_text(so_path, &text) != 0) return -1;
-
-    /* 区间长度自适应：取 min(上限, .text 实际长度)。
-     * ⚠️ 2026-10-28 CI 踩坑：原先把 BACK+FWD 写成常量相加，
-     *    armeabi-v7a 的 .text 只有 12000 字节 < 16384 → 锁箱 fail-fast。
-     *    改成自适应后两个 ABI 都能工作，且与 Python 侧 take min 同规则。 */
-    size_t span = (size_t)NC_BOOT_SPAN;
-    if (span > (size_t)text.size) span = (size_t)text.size;
-    if (span < (size_t)NC_BOOT_SPAN_MIN) return -1;   /* 区间过小，强度不足 */
-
-    const uint8_t *lo = (const uint8_t *)base + text.addr;
-    uint32_t crc = ncg_boot_crc32(lo, span);
-
-    /* ikm = CRC(4B 大端) || 区间首 16B || 区间末 16B
-     * 补首尾原始字节：4 字节 CRC 碰撞空间只有 2^32，补入原始字节
-     * 可让敏感度接近全区间。 */
-    uint8_t ikm[36];
-    ikm[0] = (uint8_t)(crc >> 24); ikm[1] = (uint8_t)(crc >> 16);
-    ikm[2] = (uint8_t)(crc >> 8);  ikm[3] = (uint8_t)crc;
-    memcpy(ikm + 4, lo, 16);
-    memcpy(ikm + 20, lo + span - 16, 16);
-
-    static const uint8_t salt[16] = NC_BOOT_SALT_INIT;
-    khkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt),
-                 (const uint8_t *)NC_BOOT_INFO, strlen(NC_BOOT_INFO),
-                 out, 16);
-    ncg_wipe(ikm, sizeof(ikm));
-    return 0;
-}
+/* ── ncg_boot_key 已拆到 nc_guard_crypto.c（2026-11-06）────────────
+ *
+ * 为什么拆：要给本函数上【指令级 VMP】，而 VMP 与 annotate 互斥 ——
+ * annotate 会把函数地址写进 @llvm.global.annotations，Amice 的
+ * vm_virtualize 因此判定 "has non-call address uses" 并静默跳过。
+ * Amice 只提供文件级开关 AMICE_VM_VIRTUALIZE，没有"按函数名指定"的途径，
+ * 所以必须把目标函数单独放一个 .c（与 nc_guard_xor.c 同样的手法）。
+ *
+ * 为什么只搬这一个、不连带搬它的依赖：
+ *   ncg_boot_crc32 / ncg_stub_find_text 若一起搬并开文件级 VMP，
+ *   它们也会被虚拟化 —— 但它们是通用工具函数（内嵌 open/pread/close），
+ *   VMP 之后体积暴涨且强度无收益。所以它们留在本文件，只去掉 static，
+ *   由 nc_guard_internal.h 提供声明。
+ *
+ * 为什么搬走是安全的（实测，非推断）：ncg_boot_key 不碰 ncg_stub_slot，
+ *   不依赖 PC 相对寻址反推基址。基址由调用方以 base 参数传入。
+ *   （对照：ncg_slot_read 靠 &ncg_stub_slot 反推基址，改外部符号会让它
+ *    从 PC 相对变成 GOT 间接寻址 —— 那条风险留给 P2，且已单独验证过
+ *    反推结果仍正确，见 docs/混淆计划.md §3.2。）
+ *
+ * ⚠️ 拆走后本文件对 NC_OBF 的使用只剩 ncg_stub_recover（见下方）。
+ *    混淆开关由 scripts/make-zip-lib.sh 按文件粒度控制。
+ */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 第一部分：密文 unlock 本体（进 .ncxh，构建期被锁）
@@ -1571,7 +1558,7 @@ static uint32_t ncg_rd32(const volatile unsigned char *p) {
  *   随 API level 变化，且会引入 PLT 表项（本项目明令禁止）。
  * ⚠️ 不用 memset_s：那是 C11 附录 K 的可选接口，NDK 未提供。
  * 本实现零依赖、零 PLT、任何工具链都能编。 */
-static void ncg_wipe(void *p, size_t n) {
+void ncg_wipe(void *p, size_t n) {
     volatile unsigned char *v = (volatile unsigned char *)p;
     while (n--) *v++ = 0;
 }

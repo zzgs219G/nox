@@ -77,6 +77,7 @@ GUARD_SRCS = [
     'nc_guard_key.c',      # SHA256/HMAC/HKDF
     'nc_guard_paths.c',    # 路径密文表
     'nc_guard_xor.c',      # XOR_KEY 重组（2026-11-06 从 boot.c 拆出）
+    'nc_guard_crypto.c',   # boot_key 派生（2026-11-06 从 boot.c 拆出，为 VMP）
 ]
 
 # 预编译静态库。按目标 ABI 分目录存放 —— .a 是机器码，与 CPU 架构绑死，

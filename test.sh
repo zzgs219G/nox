@@ -147,7 +147,7 @@ guard_compile() {
         ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$W" \
             "$GUARD_DIR"/nc_guard_boot.c "$GUARD_DIR"/nc_guard_probe.c \
             "$GUARD_DIR"/nc_guard_key.c "$GUARD_DIR"/nc_guard_paths.c \
-            "$GUARD_DIR"/nc_guard_xor.c \
+            "$GUARD_DIR"/nc_guard_xor.c "$GUARD_DIR"/nc_guard_crypto.c \
             "$@" -o "$out" )
     else
         [ -n "$STATIC_LIB" ] || { echo "✗ 找不到静态库: $GUARD_DIR/lib" >&2; return 1; }
