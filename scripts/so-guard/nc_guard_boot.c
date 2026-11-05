@@ -76,7 +76,7 @@
  * —— annotate 会把函数地址写进 @llvm.global.annotations，VMP 因此判定
  * "has non-call address uses" 并跳过（实测 CI 42075245237 的 debug 日志）。
  * 拆到独立文件后可用文件级 AMICE_VM_VIRTUALIZE，不经 annotate。 */
-void ncg_xor_key(const uint8_t *slot, uint8_t out[8]);
+/* 声明已移至 nc_guard_internal.h（2026-11-06），此处不再重复 */
 
 /* ── Amice 混淆标注（2026-11-05，可选）──────────────────────────────
  *

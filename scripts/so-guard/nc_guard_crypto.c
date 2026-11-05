@@ -111,6 +111,95 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
  * 第二部分：二级锁箱的开箱本体（2026-11-06 从 boot.c 拆出）
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* 校验 .ncxh 密文的 HMAC（P0-b）。
+ * 2026-11-06 从 ncguard_stub_recover 拆出 —— 与 ncguard_headro_unlock 同因：
+ * 降低单函数寄存器压力，好让 VMP 能接受（原因见 ncguard_headro_unlock 注释）。
+ *
+ * ⚠️ 对【密文】算，不对明文算：密文在解密前就可读，所以可以"先验后解"；
+ *    若对明文算就必须先解密再验，篡改的明文已经落盘生效，晚一步。
+ *
+ * ⚠️ k_mac_head 的恢复与 k_stub 同源（都是 wrapped ^ XOR_KEY）。
+ *    调 khmac_sha256 不破坏"stub 无智力"约束 —— 它只是复用 .text 里
+ *    现成的密码学原语，本函数仍没有 ELF 解析、RC4 S 盒、密钥派生。
+ *
+ * 返回 1 = 通过；0 = 不通过（或参数异常）。
+ * 内部用完即擦 k_mac / got_mac，不给调用方留密钥材料。
+ *
+ * ⚠️ noinline 不可省：实测 -Oz 会内联回去，拆分即失效。
+ */
+__attribute__((noinline))
+static int ncguard_head_mac_ok(const volatile unsigned char *slot,
+                               const uint8_t *cipher, uint32_t cipher_len) {
+    if (!slot || !cipher || cipher_len == 0) return 0;
+
+    uint8_t k_mac[16], got_mac[32];
+    {
+        uint8_t xk[8];
+        ncg_xor_key(slot, xk);
+        for (int i = 0; i < 16; i++)
+            k_mac[i] = (uint8_t)(slot[NC_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
+        ncg_wipe(xk, sizeof(xk));
+    }
+    khmac_sha256(k_mac, 16, cipher, cipher_len, got_mac);
+
+    const volatile unsigned char *want = slot + NC_OFF_EXPMAC_HEAD;
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++)
+        diff |= (uint8_t)(got_mac[i] ^ want[i]);
+
+    ncg_wipe(k_mac, sizeof(k_mac));
+    ncg_wipe(got_mac, sizeof(got_mac));
+    return diff == 0;
+}
+
+/* 解开 master 数据段（.ncxhr，32 字节）。
+ * 2026-11-06 从 ncguard_stub_recover 拆出 —— 目的是降低单函数寄存器压力，
+ * 好让 VMP 能接受它（原因见调用处的注释）。
+ *
+ * ⚠️ 必须与 ncguard_stub_recover 同在 .text（明文）：
+ *    调用点仍在 .ncxh 尚未解密的时刻之前/之后紧邻，不能进加密段。
+ * ⚠️ 调用纪律：只能用 .text 里的函数（ncg_ctr_xor 满足）。
+ *    绝不能调 ncg_rc4 —— 它在 .ncxh 段里，此刻还是密文。
+ *
+ * 参数：
+ *   k         已恢复的 k_stub（16 字节，调用方在用完后负责 wipe）
+ *   slot      已解密的 .ncks 槽副本（只读，不解密它自己）
+ *   img_base  镜像基址（调用方已算出）
+ *
+ * 失败处理（与拆分前一致）：段缺失 / 大小异常 / mprotect 失败 → 什么都不做，
+ * master 保持全零 → ncg_head_unlock 检测到全零即判定"未锁"返回 0。
+ * 这是 fail-safe 而非 fail-open：未锁状态下 .ncx 本就是明文。
+ *
+ * ⚠️⚠️ noinline 不可省：实测 -Oz 会把它整个内联回 ncguard_stub_recover，
+ *    那样寄存器压力一点没降、拆分等于没做（拆完第一版就是这样，IR 里
+ *    根本找不到这个函数的 define）。加 noinline 后才是两个独立的函数，
+ *    各自过 VM 寄存器预算。
+ */
+__attribute__((noinline))
+static void ncguard_headro_unlock(const uint8_t k[16],
+                                  const volatile unsigned char *slot,
+                                  uintptr_t img_base) {
+    uint32_t ro_addr = ncg_rd32(slot + NC_OFF_HEADRO_ADDR);
+    uint32_t ro_size = ncg_rd32(slot + NC_OFF_HEADRO_SIZE);
+    if (ro_addr == 0 || ro_size == 0 || ro_size > (1u << 16)) return;
+
+    uint8_t *ro = (uint8_t *)(img_base + ro_addr);
+    uintptr_t ps = getpagesize();
+    uintptr_t rs = (uintptr_t) ro & ~(ps - 1);
+    uintptr_t re = ((uintptr_t) ro + ro_size - 1 & ~(ps - 1)) + ps;
+    if (mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE) != 0) return;
+
+    /* dom=0x02 与 head 段（0x01）分域，避免 two-time pad。 */
+    ncg_ctr_xor(k, NC_CTR_DOM_HEADRO, ro, ro_size);
+
+    /* ⚠️ 恢复成 RW 而不是 R —— 实测踩过：.ncxhr 与 .data/.bss 同页
+     * （arm64：.data 0x13ca8、head_ro 0x13cd0、.bss 0x13cf0，同在页 0x13000）。
+     * mprotect 粒度是页，设成 READ 会把 .bss 也变只读 → 之后任何 .bss
+     * 写入即 SIGSEGV。这页本就是 RW，恢复 RW 才是还原原状；
+     * 密文段的保护靠"内容是密文"，不靠页权限。 */
+    (void) mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE);
+}
+
 /* 明文 stub：把 .ncxh 还原成明文。
  * 全程无循环展开以外的分支、无 libc 调用、无磁盘 I/O。
  * 未锁（slot magic 不匹配）时直接返回——段本就是明文。
@@ -194,38 +283,18 @@ void ncguard_stub_recover(const char *so_path, uintptr_t base) {
     uint8_t *start = (uint8_t *)(img_base + head_sh_addr);
 
     /* ── P0-b：先验 MAC 再解密（2026-10-18）──────────────────────
-     * 对【密文】算 HMAC-SHA256，与 slot 里的期望值恒定时间比较。
-     * 位置刻意在 mprotect/解密【之前】：一旦不符，head 一个字都不改 → 段保持
-     * 密文 → 后续调用踩密文 = SIGILL（fail-closed，与 .ncx 的 -11 语义
-     * 完全对等）。此前 head 只有 XOR，攻击者可改"unlock 本体里的 MAC 校验
-     * 函数"那几位，把 .ncx 的 HMAC 保护改成恒真从而绕过。
-     *
-     * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ XOR_KEY。
-     * 调用 khmac_sha256 不破坏"stub 无智力"约束——它只是复用 .text 里
-     * 现成的密码学原语（nc_guard_key.c 的函数全在明文段），stub 本身仍没有
-     * ELF 解析、没有 RC4 S 盒、没有密钥派生、没有 slot 布局解释。 */
-    uint8_t k_mac[16], got_mac[32];
-    {
-        uint8_t xk[8];
-        ncg_xor_key(slot, xk);
-        for (int i = 0; i < 16; i++)
-            k_mac[i] = (uint8_t)(slot[NC_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
-        ncg_wipe(xk, sizeof(xk));
+     * 2026-11-06 抽成独立函数 ncguard_head_mac_ok（降寄存器压力）。
+     * ⚠️ 位置不变，仍在 mprotect / 解密【之前】：
+     *    一旦 MAC 不符，head 一个字都不改 → 段保持密文 →
+     *    后续调用踩密文 = SIGILL（fail-closed，与 .ncx 的 -11 语义对等）。
+     * ⚠️ 返回值语义：1 = 通过；0 = 不通过或参数异常。
+     *    不通过时必须【立即返回】且不解密，保持与拆分前完全一致的时序。 */
+    if (!ncguard_head_mac_ok(slot, start, head_size)) {
+        ncg_wipe(k, sizeof(k));
+        ncg_wipe(slot, sizeof(slot));
+        return;
     }
-    khmac_sha256(k_mac, 16, start, head_size, got_mac);
-    {
-        const volatile unsigned char *want = slot + NC_OFF_EXPMAC_HEAD;
-        uint8_t diff = 0;
-        for (int i = 0; i < 32; i++)
-            diff |= (uint8_t)(got_mac[i] ^ want[i]);
-        ncg_wipe(k_mac, sizeof(k_mac));
-        ncg_wipe(got_mac, sizeof(got_mac));
-        if (diff != 0) {
-            /* 密文段被改过（或密钥与密文不匹配）→ 不解密、不动 mprotect */
-            ncg_wipe(k, sizeof(k));
-            return;
-        }
-    }
+
 
     uintptr_t ps = getpagesize();
     uintptr_t s = (uintptr_t) start & ~(ps - 1);
@@ -258,50 +327,18 @@ void ncguard_stub_recover(const char *so_path, uintptr_t base) {
      *   dom=0x01 与 master 段（dom=0x02）分开，避免 two-time pad。 */
     ncg_ctr_xor(k, NC_CTR_DOM_HEAD, start, head_size);
 
-    /* ── 顺带解开 master 数据段（2026-10-19）──────────────────────
-     * 与 head 用同一把 k_stub、同一次遍历：master 只有解开这段才能读到，
-     * 而这段的定位信息在 slot 的 NC_OFF_HEADRO_ADDR(96) 与
-     * NC_OFF_HEADRO_SIZE(100) 两个 u32 里（.ncks 扩容到 104 时装它们）。
+    /* ── 解 master 数据段（2026-11-06 抽成独立函数）──────────────
+     * 为什么抽出去：本函数原先在这里还有一整段 mprotect + 解密，
+     * 与前面"验 MAC + 解 head"叠在一起，导致单个 call 点上同时存活
+     * 18 个 SSA 值 —— 超过 Amice VM 的 x0..x31 虚拟寄存器预算，
+     * 整个函数被 VMP 静默跳过（CI 日志：VM x-register budget exceeded）。
      *
-     * 为什么必须在这里解、而不是在 ncg_head_unlock 里：
-     *   ncg_master 是 head 段【外面】的另一个段，head 本体解完之后才能
-     *   拿到 k_so；而取得 master 是派生 k_so 的前置。所以必须由 stub
-     *   （唯一持有 k_stub 的地方）在解完 head 后立刻解它。
-     *
-     * 失败处理：段缺失或大小异常 → 不解，master 保持全零 →
-     *   ncg_head_unlock 检测到全零即判定"未锁"直接返回 0。
-     *   这是 fail-safe 而非 fail-open：未锁状态下 .ncx 本就是明文。 */
-    {
-        uint32_t ro_addr = ncg_rd32(slot + NC_OFF_HEADRO_ADDR);
-        uint32_t ro_size = ncg_rd32(slot + NC_OFF_HEADRO_SIZE);
-        if (ro_addr != 0 && ro_size > 0 && ro_size <= (1u << 16)) {
-            uint8_t *ro = (uint8_t *)(img_base + ro_addr);
-            uintptr_t ps2 = getpagesize();
-            uintptr_t rs = (uintptr_t) ro & ~(ps2 - 1);
-            uintptr_t re = ((uintptr_t) ro + ro_size - 1 & ~(ps2 - 1)) + ps2;
-            if (mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE) == 0) {
-                /* ⚠️ 必须用【.text 里的函数】解密，不能调 ncg_rc4 ——
-                 * ncg_rc4 本身就在 .ncxh 段里，此刻还是密文，
-                 * 调用它会踩密文（实测卡死/SIGILL）。这是本文件第二次
-                 * 踩同一个坑（head 段锁箱也不能用 rc4，见 lock_head 注释）
-                 * ——规矩是：**stub 能碰到的函数只能是 .text 里的**。
-                 * ncg_ctr_xor 就在 .text（见其定义处的注释），满足纪律。
-                 *
-                 * ⚠️ 2026-10-30：原为 16 字节周期 XOR，改为 SHA-256-CTR
-                 *   且 dom=0x02（与 head 段的 0x01 分域）。 */
-                ncg_ctr_xor(k, NC_CTR_DOM_HEADRO, ro, ro_size);
-                /* ⚠️ 恢复成 RW 而不是 R —— 实测踩过：
-                 * .ncxhr 与 .data / .bss 【同页】
-                 * （实测 arm64：.data 0x13ca8、head_ro 0x13cd0、
-                 *   .bss 0x13cf0，全在页 0x13000 内）。
-                 * mprotect 粒度是页，设成 READ 会把 .bss 也变只读 →
-                 * 后续任何 .bss 写入即 SIGSEGV。
-                 * 这个页本来就是 RW（.data/.bss 所在），恢复 RW 才是
-                 * 还原原状；密文段保护不靠页权限，靠"内容是密文"。 */
-                (void) mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE);
-            }
-        }
-    }
+     * 抽成独立函数后两半各自压力减半，都能通过预算。
+     * ⚠️ 时序完全未变：仍然是"先验 MAC → mprotect → 解 head → 解 master"，
+     *    仍然是同一把 k_stub、同一个调用链位置。
+     * ⚠️ 两个函数都开 VMP（同一文件），保护强度不降。 */
+    ncguard_headro_unlock(k, slot, img_base);
+
 
     __builtin___clear_cache((char *) start, (char *)(start + head_size));
     /* 用后即毁的交接：把明文区间交给 .text 全局（head 自毁时读）。

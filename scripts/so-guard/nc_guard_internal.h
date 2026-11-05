@@ -99,7 +99,7 @@ int ncg_slot_read(const char *so_path, uintptr_t base,
 
 /* XOR_KEY 重组（定义在 nc_guard_xor.c）。从已解密的槽拼回 8 字节，
  * 调用方用完必须 ncg_wipe。 */
-void ncg_xor_key(const uint8_t *slot, uint8_t out[8]);
+void ncg_xor_key(const volatile uint8_t *slot, uint8_t out[8]);
 
 #endif /* _NC_GUARD_INTERNAL_H_ */
 

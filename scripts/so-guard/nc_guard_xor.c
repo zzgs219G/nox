@@ -39,8 +39,8 @@ static const uint8_t NCG_XOR_FRAG[8] = NC_XOR_FRAG_INIT;
  *
  * ⚠️ 非 static（2026-11-06 拆分）：跨编译单元调用。
  *    符号面由 -fvisibility=hidden 收敛，不会进 .dynsym。 */
-void ncg_xor_key(const uint8_t *slot, uint8_t out[8]) {
-    const uint8_t *fr = slot + NC_OFF_FRAGS;
+void ncg_xor_key(const volatile uint8_t *slot, uint8_t out[8]) {
+    const volatile uint8_t *fr = slot + NC_OFF_FRAGS;
     for (int i = 0; i < 8; i++) {
         uint16_t v = (uint16_t)(fr[NCG_XOR_FRAG[i] * 2]
                                | (fr[NCG_XOR_FRAG[i] * 2 + 1] << 8));
