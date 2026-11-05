@@ -309,6 +309,37 @@ static int ncg_slot_read(const char *so_path, uintptr_t base,
  * ⚠️ 2026-10-29 改动：原实现直接读全局 ncg_slot_live（.bss 常驻明文）。
  *    现在改为由调用方传槽指针，调用方用完立刻擦 —— 不在任何地方留副本。
  * ⚠️ 不缓存结果（缓存=又一处常驻明文），每次重算，调用方用完必须 ncg_wipe。 */
+/* ── Amice 混淆标注（2026-11-05，可选择性启用）─────────────────────
+ *
+ * 目的：让攻击者"读懂解密逻辑"的成本上升。
+ *   当前拿到的 so 里，这个函数是明文（它必须先于解锁运行，不能进 .ncx），
+ *   符号虽被 strip，但 -mbranch-protection=standard 的 bti c 标出了
+ *   函数边界（实测 182 个入口），反汇编即可读懂 XOR_KEY 重组规则。
+ *
+ * 为什么可以安全加：
+ *   · Amice 是编译期 pass，不改变 ELF 段结构 → .ncx/.ncxh 六段不受影响
+ *   · 混淆改变 .text 内容 → crc32(.text) 变 → 但 code_len 由锁箱期
+ *     Python 按段表重算并写入 slot（nc_guard_boot.c:1974），幂等自洽
+ *   · 未装 Amice 时 NC_AMICE_ANNOTATE 展开为空 → 编译行为与之前逐字节一致
+ *
+ * ⚠️ 只标 MBA，不标 flatten：
+ *   flatten 会重排控制流，在 constructor(50) 关键路径上风险高（一旦有边界
+ *   错误就是随机崩溃，且混淆后的反汇编我们自己也不好查）。MBA 是
+ *   算术/逻辑等价的局部替换，风险低一个量级。
+ *   验证充分后再考虑加 +flatten。
+ *
+ * ⚠️ 用宏条件化而不是直接写 __attribute__：
+ *   宿主测试（test-so-lock.sh 的 T22 二进制等价）与未装 Amice 的构建
+ *   都必须走"无标注"路径，否则会把不可用的属性带进 clang 18。
+ */
+#if defined(NC_AMICE_ANNOTATE)
+#  define NC_OBF \
+     __attribute__((noinline, annotate("+mba")))
+#else
+#  define NC_OBF
+#endif
+
+NC_OBF
 static void ncg_xor_key(const uint8_t *slot, uint8_t out[8]) {
     const uint8_t *fr = slot + NC_OFF_FRAGS;
     for (int i = 0; i < 8; i++) {
@@ -489,7 +520,10 @@ static int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
 
 /* 计算 boot_key（16 字节）。调用方用完必须 ncg_wipe。
  * 参数：so_path（由调用方用 dladdr 取得）、base（镜像基址）。
- * 返回 0 成功；-1 表示 .text 定位失败或区间配置错误（fail-closed）。 */
+ * 返回 0 成功；-1 表示 .text 定位失败或区间配置错误（fail-closed）。
+ * ⚠️ NC_OBF（见 ncg_xor_key 上方的说明）：攻击者读懂本函数就能复现
+ *    boot_key → 解 .ncks → 拿 k_stub → 解 .ncxh。所以它是最值得混淆的一个。 */
+NC_OBF
 static int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
     ncg_shdr_t text;
     if (ncg_stub_find_text(so_path, &text) != 0) return -1;
