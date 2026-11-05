@@ -148,15 +148,41 @@ jobs:
       #   是段错误（实测 clang 18 加载 r29 插件 → exit 139）。
       # ⚠️ if 用 == 'true' 而不是裸 inputs.obfuscate：
       #   tag 推送触发时 inputs 为空，裸写法在某些上下文会报错。
+      # ── 混淆开关的单一判定（2026-11-06）────────────────────────────
+      # 两条路都能开混淆，且互不干扰：
+      #   ① 打 tag 且 tag 名以 -obf 结尾     → git tag v1.0.0-obf && git push --tags
+      #   ② 手动 dispatch 且勾选 obfuscate
+      #
+      # 为什么需要 tag 这条路：push tag 触发时 workflow_dispatch 的 inputs
+      # 全为空，`inputs.obfuscate == true` 恒假 → 打标签永远出普通版。
+      # 而"打标签就出正式包"是正常预期，不该要求人记得去点手动流程。
+      #
+      # 版本号里带 -obf 本身就是最清楚的记录：看 tag 名就知道这版有没有混淆。
+      - name: 判定是否启用混淆
+        id: obf
+        run: |
+          set -euo pipefail
+          ON=false
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            REF="${{ github.ref_name }}"
+            # 唯一后缀：-obf。不含它的 tag 一律出普通版。
+            if [[ "$REF" == *-obf* ]]; then ON=true; fi
+            echo "tag 触发: $REF → 混淆=$ON"
+          else
+            if [[ "${{ inputs.obfuscate }}" == "true" ]]; then ON=true; fi
+            echo "手动触发: obfuscate=${{ inputs.obfuscate }} → 混淆=$ON"
+          fi
+          echo "on=$ON" >> "$GITHUB_OUTPUT"
+
       - name: 取 Amice bundle
-        if: inputs.obfuscate == true
+        if: steps.obf.outputs.on == 'true'
         uses: actions/cache@v4
         with:
           path: ~/amice-bundle
           key: amice-r29-v0.1.6-beta.1
 
       - name: 下载 Amice bundle（cache 未命中时）
-        if: inputs.obfuscate == true
+        if: steps.obf.outputs.on == 'true'
         run: |
           set -euo pipefail
           if [[ -f ~/amice-bundle/amice/lib/libamice.so ]]; then
@@ -175,7 +201,7 @@ jobs:
 
       - name: 打包（静态库形态）
         env:
-          OBFUSCATE: ${{ inputs.obfuscate }}
+          OBFUSCATE: ${{ steps.obf.outputs.on }}
         run: |
           # 发的是 .a 形态：只给头文件 + Python 工具 + 双 ABI libnox.a，
           # 不给 C 源码。脚本内部会先交叉编译再打包，一条命令走完。
