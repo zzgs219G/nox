@@ -54,7 +54,7 @@ jobs:
           fi
           ls -la fixtures/sample.apk
 
-      - name: 自测（14 项）
+      - name: 自测（V1–V9，判据 0 失败）
         run: |
           chmod +x test.sh
           ./test.sh
@@ -261,6 +261,20 @@ jobs:
             || { echo "✗ 产物不是 AArch64（.a 架构与目标不符？）"; exit 1; }
           echo "✔ 用户代码加密成功、含 .ncx 段、符号已清空、架构 AArch64"
 
+          # 元数据清理必须生效（2026-11-06 补）。
+          # 为什么在 CI 也验一遍：test.sh 的 V9 已经验了，但这里验的是
+          # 【.a 形态 + 真实 --abi 交叉编译】这条生产路径 —— 它与 V9 走的
+          # 源码形态不是同一条链路。AGENTS.md §5.4 要求"必须清理"，
+          # 两条路径都得钉住，否则漏一条就是静默失效。
+          for sec in .eh_frame .eh_frame_hdr .comment; do
+            if readelf -SW libuser.so | grep -q -- "$sec"; then
+              echo "✗ 产物残留 $sec（--strip-meta 没生效？）"; exit 1
+            fi
+          done
+          strings -n 5 libuser.so | grep -qiE 'Android \(|clang version' \
+            && { echo "✗ 产物残留 clang 工具链指纹"; exit 1; }
+          echo "✔ 元数据已清理（.eh_frame/.comment/指纹 零命中）"
+
       - name: 生成校验和
         run: |
           cd dist
@@ -312,7 +326,7 @@ jobs:
 
           \`\`\`bash
           unzip nox-*.zip && cd nox
-          ./test.sh                 # 14 项自测，验证工具链
+          ./test.sh                 # 自测 V1–V9，判据 0 失败
           cd example && ./run.sh    # 完整演示：加密前后对比
           \`\`\`
 

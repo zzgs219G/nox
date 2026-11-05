@@ -491,6 +491,58 @@ else
     skip "V8 无二级锁箱产物"
 fi
 
+# ── V9 CLI 全链路：nox protect 必须自带元数据清理（2026-11-06 新增）──
+# 为什么单独立一项，而不是靠 V8：
+#   V8 验的是【手工】调 --strip-meta 有没有效。而 AGENTS.md §5.4 写的是
+#   「三道锁箱之后必须再跑一次元数据清理」，这条"必须"要落到【最常用的
+#   那条命令】上才有意义。实测 2026-11-06 之前 nox protect 压根没调它：
+#       .eh_frame 2108 B（70 个 FDE）+ .eh_frame_hdr 580 B 全部残留
+#   —— 手工三步锁箱的人有保护，用一条命令的人没有。
+#
+# ⚠️ 这一项必须验【产物】而非日志：本仓库的 .comment 曾因"失败但继续"
+#    的日志措辞连续三个月零生效（AGENTS.md §3.3），日志有输出 ≠ 防护生效。
+# ⚠️ 反向验证过（AGENTS.md §3.2）：拿"编译+两级锁箱但未清理"的产物喂给
+#    nox 的 _assert_meta_clean，会列出 .comment/.debug_line/.eh_frame
+#    并 exit 1；干净产物放行。不是恒真断言。
+echo "── V9 nox protect 自带元数据清理 ──"
+if [ -f "$ROOT/nox" ] && [ "$CAN_EXEC" = "1" ]; then
+    N9=$(mktemp -d)
+    cat > "$N9/u.c" <<'V9SRC'
+__attribute__((section(".ncx"), used, retain))
+int v9_secret(int a) { return (a ^ 0x5A) * 3; }
+__attribute__((visibility("default")))
+int v9_call(int a) { return v9_secret(a); }
+V9SRC
+    if ( cd "$N9" && python3 "$ROOT/nox" protect u.c --apk "$APK" \
+             --package "$PKG_FIX" -o v9.so >v9.log 2>&1 ); then
+        ok "V9 nox protect 执行成功"
+        _v9eh=$(readelf -SW "$N9/v9.so" 2>/dev/null | grep -c "eh_frame" || true)
+        _v9cm=$(readelf -SW "$N9/v9.so" 2>/dev/null | grep -c "\.comment" || true)
+        _v9fp=$(strings -n 5 "$N9/v9.so" 2>/dev/null | grep -ciE "Android \(|clang version" || true)
+        if [ "$_v9eh" = "0" ] && [ "$_v9cm" = "0" ] && [ "$_v9fp" = "0" ]; then
+            ok "V9 产物元数据零命中（.eh_frame/.comment/指纹）"
+        else
+            bad "V9 nox protect 产物残留元数据（eh_frame=$_v9eh comment=$_v9cm clang=$_v9fp）—— CLI 又漏了 --strip-meta？"
+        fi
+        # 六段必须都还在：清理不能把加密段一起删掉（那是产物级回归）
+        _v9miss=""
+        for _s in .ncx .ncxh .ncxhr .nck .ncks; do
+            readelf -SW "$N9/v9.so" 2>/dev/null | awk '{print $2}' | grep -qxF "$_s" \
+                || _v9miss="$_v9miss $_s"
+        done
+        if [ -z "$_v9miss" ]; then
+            ok "V9 清理后六个加密段仍齐全"
+        else
+            bad "V9 加密段缺失:$_v9miss"
+        fi
+    else
+        bad "V9 nox protect 失败"; tail -8 "$N9/v9.log"
+    fi
+    rm -rf "$N9"
+else
+    skip "V9 需要源码形态且可执行（.a 形态/交叉产物跳过）"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
