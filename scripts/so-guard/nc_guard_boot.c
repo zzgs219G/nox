@@ -364,11 +364,20 @@ static int ncg_slot_read(const char *so_path, uintptr_t base,
        annotate("+shuffle_blocks"), \
        annotate("+split_basic_block"), \
        annotate("+indirect_call")))
+/* VMP 试验（2026-11-06）：只给最小的那个函数（ncg_xor_key，源码 8 行）
+ * 上指令级虚拟化，验证三件事后再决定是否推广：
+ *   ① 体积涨多少   ② 启动慢多少   ③ 崩了能不能排查
+ * vm_runtime_scope=func：解释器内联进本函数，不引入模块级 runtime
+ * （module 模式会把解释器作为独立符号，更容易被定位）。 */
+#  define NC_OBF_VMP \
+     __attribute__((noinline, \
+       annotate("+vm_virtualize,vm_runtime_scope=func")))
 #else
 #  define NC_OBF
+#  define NC_OBF_VMP
 #endif
 
-NC_OBF
+NC_OBF_VMP
 static void ncg_xor_key(const uint8_t *slot, uint8_t out[8]) {
     const uint8_t *fr = slot + NC_OFF_FRAGS;
     for (int i = 0; i < 8; i++) {
