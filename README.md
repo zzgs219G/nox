@@ -12,6 +12,12 @@
 | **继续做混淆**（剩余工作、优先级、验收清单） | [docs/混淆计划.md](docs/混淆计划.md) |
 | 改代码前的硬约束（冻结清单、加密纪律） | [AGENTS.md](AGENTS.md) |
 
+判断混淆/VMP 有没有生效（只看目标文件，不看 so）：
+
+```bash
+./scripts/check-obf.sh <libnox.a>    # 0=VMP 生效，1=未检出
+```
+
 ## 三十秒上手
 
 ```bash
