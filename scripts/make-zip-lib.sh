@@ -125,13 +125,14 @@ for abi in arm64-v8a armeabi-v7a; do
         #   address uses" 并跳过（实测 CI 42075245237 的 debug 日志）。
         #   所以这些文件不含 annotate，改用文件级 AMICE_VM_VIRTUALIZE。
         #
-        #   只对【单函数文件】开 —— 全局开会让整个编译单元的所有函数都被
-        #   虚拟化（体积 +300~500%，且崩溃不可排查）。
-        #   判断标准：这个文件里只有一个函数值得保护。
-        #     nc_guard_xor     → 只有 ncg_xor_key
-        #     nc_guard_crypto  → 只有 ncg_boot_key
-        #   nc_guard_boot.c 里还有 ncg_stub_recover（走 annotate 的 MBA+FLA），
-        #   所以它不能进这份清单 —— 整文件 VMP 会连 25+ 个无关函数一起虚拟化。
+        #   判断标准：这个文件里的函数是否【全部】值得保护、且没有会被
+        #   VMP 跳过的构造。满足才可以整文件开。
+        #     nc_guard_xor     → ncg_xor_key（1 个）
+        #     nc_guard_crypto  → ncg_boot_key + ncguard_stub_recover（2 个）
+        #   两个都是"造钥匙的配方"，且都已用 check-vmp-eligibility.py 预检
+        #   （无取自身地址等 non-call use）。
+        #   nc_guard_boot.c 不能进这份清单 —— 它还有 25+ 个无关函数
+        #   （含 open/pread/close 重型 I/O），整文件 VMP 会让体积暴涨。
         case "$f" in
             nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
             *) _vmp=0 ;;
@@ -189,6 +190,15 @@ cp test.sh "$STAGE/"
 chmod +x "$STAGE/test.sh"
 cp README.md "$STAGE/"
 cp AGENTS.md "$STAGE/"   # AI 接手维护时的必读契约
+
+# 混淆相关的验收工具（2026-11-06）
+# 为什么必须进包：这两个脚本的用途是"验产物"，而消费方拿到的正是产物。
+# 不发的话，消费方无法确认自己手里的 .a 到底有没有 VMP —— 而那正是
+# 本项目最容易误判的一点（曾在确认 VMP 的产物上，用 grep 特征指令的
+# 办法得出完全相反的结论；正确判据是看目标文件的 VM 子段数）。
+mkdir -p "$STAGE/scripts"
+cp scripts/check-obf.sh scripts/check-vmp-eligibility.py "$STAGE/scripts/"
+chmod +x "$STAGE/scripts/check-obf.sh" "$STAGE/scripts/check-vmp-eligibility.py"
 
 # 版本标记：解压后 `cat nox/VERSION` 即知版本，不用回仓库查 tag。
 # 消费者（artifact-pipeline 的 ensure_nox）也靠它做版本校验与日志。

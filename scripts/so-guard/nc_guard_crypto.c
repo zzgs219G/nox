@@ -54,10 +54,20 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>            /* mprotect：ncguard_stub_recover 用 */
+#include <dlfcn.h>               /* Dl_info：本文件已不直接用，保留以免
+                                  * 调用方头文件顺序变化时踩空 */
 
 #include "nc_guard_layout.h"
 #include "nc_guard_internal.h"
-#include "nc_guard_key.h"        /* khkdf_sha256 */
+#include "nc_guard_key.h"        /* khkdf_sha256 / khmac_sha256 */
+
+/* CTR 域分隔（2026-11-06 随 ncguard_stub_recover 上移到本文件）。
+ * head 与 master 共用同一把 k_stub_eff，若都从 counter=0 起算即构成
+ * two-time pad（密文 XOR 可还原明文 XOR）。dom 区分两段。
+ * ⚠️ 与 so-section-lock.py 的 CTR_DOM_HEAD / CTR_DOM_HEADRO 必须逐一相等。 */
+#define NC_CTR_DOM_HEAD    0x01
+#define NC_CTR_DOM_HEADRO  0x02
 
 /* 计算 boot_key（16 字节）。调用方用完必须 ncg_wipe。
  * 参数：so_path（由调用方用 dladdr 取得）、base（镜像基址）。
@@ -95,4 +105,213 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
                  out, 16);
     ncg_wipe(ikm, sizeof(ikm));
     return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 第二部分：二级锁箱的开箱本体（2026-11-06 从 boot.c 拆出）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* 明文 stub：把 .ncxh 还原成明文。
+ * 全程无循环展开以外的分支、无 libc 调用、无磁盘 I/O。
+ * 未锁（slot magic 不匹配）时直接返回——段本就是明文。
+ *
+ * ⚠️ 2026-11-06：本函数已拆到 nc_guard_crypto.c 上 VMP。
+ *    拆走的直接原因是【本函数原先取了自己的地址】：
+ *        dladdr((const void *)&ncg_stub_recover, &info)
+ *    Amice 的 vm_virtualize 会检查函数的所有 use，除"直接调用"和
+ *    "@llvm.global.annotations" 之外一律判为 "has non-call address uses"
+ *    并【静默跳过】该函数（crates/amice/src/aotu/vm_virtualize/mod.rs:128）。
+ *    取自身地址传给 dladdr 正是这种 use，所以原样搬过去必然被跳过。
+ *
+ *    改法：把"取地址"移到调用方 ncguard_unlock（.text，不虚拟化）——
+ *    它本来就已经为自绑定 CRC 算好了 so_path / base（见其定义处），
+ *    这里改成参数传入，零额外成本、零新增依赖。
+ *
+ * ⚠️ 参数语义：
+ *    so_path  自身的 .so 路径（由调用方 dladdr 取得，非 NULL）
+ *    base     镜像基址（同上）
+ *    两者都由调用方保证非空；本函数不再自己取。
+ *
+ * ⚠️ 时序约束（与拆分前完全一致，未变）：
+ *    先验 MAC 再 mprotect 再解密；用后即毁。
+ *    VMP 引入的 VM 帧（sub sp,sp,#0xc0）不影响这个顺序 —— 它只是把
+ *    函数体编译成字节码，控制流语义不变。
+ */
+void ncguard_stub_recover(const char *so_path, uintptr_t base) {
+    /* ── T4（2026-10-28 / 2026-10-29 修正）：解密槽到【本函数栈缓冲】───
+     * 修正理由见 ncg_slot_read 上方注释：不再有 .bss 常驻明文副本。
+     * 本函数用完即 wipe，全进程不留第二份。 */
+    static int recovered = 0;
+    if (recovered) return;                         /* 本进程已解过 */
+
+    /* ⚠️ 2026-11-06：原先这里自己 dladdr(&ncg_stub_recover) 取路径与基址。
+     * 那是一次"取自身地址"的 non-call use → VMP 判定跳过本函数。
+     * 现在两个值由调用方 ncguard_unlock 传入（它本来就算好了）。 */
+    if (!so_path || !base) return;                  /* fail-closed */
+
+    uint8_t slot[NC_STUB_SIZE];
+    if (ncg_slot_read(so_path, base, slot) != 0) {
+        ncg_wipe(slot, sizeof(slot));
+        return;                                    /* fail-closed */
+    }
+
+    /* 恢复 k_stub：slot[8:24] ^ XOR_KEY，再混入自身代码 CRC（阶段3 自绑定）。
+     *
+     * 混入方式刻意选【异或进密钥】而不是"算 CRC 后比较、不等就 return"：
+     *   - 比较式：攻击者 patch 掉那条比较分支即可绕过（只多 1 处 patch）
+     *   - 混入式：CRC 错了密钥就错，head 解出乱码 → 后续所有校验都失效，
+     *     没有单点可以 patch 掉。这是"链式依赖"对"独立 patch"的本质差别。
+     * 代码改一位 → CRC 变 → k_stub 变 → head 段解出乱码 → SIGILL。 */
+    uint8_t k[16];
+    {
+        uint8_t xk[8];
+        ncg_xor_key(slot, xk);
+        for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
+        ncg_wipe(xk, sizeof(xk));
+        /* 把 4 字节 CRC 折叠进 16 字节密钥（每 4 字节异或一次同一 CRC，
+         * 保证 16 字节全部参与，且不引入额外依赖） */
+        uint32_t crc = ncg_self_crc;
+        for (int i = 0; i < 16; i++)
+            k[i] ^= (uint8_t)((crc >> ((i & 3) * 8)) & 0xFF);
+        crc = 0;
+    }
+
+    uint32_t stub_sh_addr = ncg_rd32(slot + 24);
+    uint32_t head_sh_addr = ncg_rd32(slot + 28);
+    uint32_t head_size    = ncg_rd32(slot + 32);
+
+    /* 合理性守卫：任一为 0 或段大小荒谬 → 视为未锁/损坏，直接放弃 */
+    if (head_size == 0 || head_size > (64u << 20)
+        || stub_sh_addr == 0 || head_sh_addr == 0) return;
+
+    /* 镜像基址 = slot 自身运行期地址 − slot 链接期地址。
+     * &ncg_stub_slot 由编译器生成 PC 相对引用（adr/add），运行期天然正确，
+     * 且该符号是 static —— strip .symtab 不影响它的可链接性（本地编译产物
+     * 里 nm 看不到它，但代码照常引用）。这是绕开"符号表被 strip"的关键。 */
+    uintptr_t img_base = (uintptr_t) &ncg_stub_slot - stub_sh_addr;
+
+    /* head 段起始 = 基址 + head 段链接期虚拟地址 */
+    uint8_t *start = (uint8_t *)(img_base + head_sh_addr);
+
+    /* ── P0-b：先验 MAC 再解密（2026-10-18）──────────────────────
+     * 对【密文】算 HMAC-SHA256，与 slot 里的期望值恒定时间比较。
+     * 位置刻意在 mprotect/解密【之前】：一旦不符，head 一个字都不改 → 段保持
+     * 密文 → 后续调用踩密文 = SIGILL（fail-closed，与 .ncx 的 -11 语义
+     * 完全对等）。此前 head 只有 XOR，攻击者可改"unlock 本体里的 MAC 校验
+     * 函数"那几位，把 .ncx 的 HMAC 保护改成恒真从而绕过。
+     *
+     * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ XOR_KEY。
+     * 调用 khmac_sha256 不破坏"stub 无智力"约束——它只是复用 .text 里
+     * 现成的密码学原语（nc_guard_key.c 的函数全在明文段），stub 本身仍没有
+     * ELF 解析、没有 RC4 S 盒、没有密钥派生、没有 slot 布局解释。 */
+    uint8_t k_mac[16], got_mac[32];
+    {
+        uint8_t xk[8];
+        ncg_xor_key(slot, xk);
+        for (int i = 0; i < 16; i++)
+            k_mac[i] = (uint8_t)(slot[NC_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
+        ncg_wipe(xk, sizeof(xk));
+    }
+    khmac_sha256(k_mac, 16, start, head_size, got_mac);
+    {
+        const volatile unsigned char *want = slot + NC_OFF_EXPMAC_HEAD;
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++)
+            diff |= (uint8_t)(got_mac[i] ^ want[i]);
+        ncg_wipe(k_mac, sizeof(k_mac));
+        ncg_wipe(got_mac, sizeof(got_mac));
+        if (diff != 0) {
+            /* 密文段被改过（或密钥与密文不匹配）→ 不解密、不动 mprotect */
+            ncg_wipe(k, sizeof(k));
+            return;
+        }
+    }
+
+    uintptr_t ps = getpagesize();
+    uintptr_t s = (uintptr_t) start & ~(ps - 1);
+    uintptr_t e = ((uintptr_t) start + head_size - 1 & ~(ps - 1)) + ps;
+    /* ⚠️ 2026-10-20 补返回值检查（此前未查，是本文件 5 个 mprotect 调用点
+     *    里唯一漏的一处）。
+     *
+     * 不查的后果：mprotect 失败时下面那个 XOR 循环会往【仍只读】的页里写
+     * → SIGSEGV。而 SIGSEGV 与"密文段被改过"的 SIGILL 是两种死法，
+     * 排查时会被误导成"段被篡改"，实际是权限没改成功。
+     *
+     * 失败处理：直接 return，让 head 段【保持密文】。这与 655/666 的
+     * -8/-10 语义对等（fail-closed），也与本函数上方 MAC 校验失败分支
+     * （return、不动 mprotect）完全一致。本函数是 static void、无返回值
+     * 通道，故用 return 而非返回码；后续对 head 段函数的调用都会踩密文
+     * → SIGILL，从"非法指令"而非"段错误"即可判断是解密链路失败。
+     *
+     * 为什么早先不查：本函数在 .text 明文 stub 里，曾担心多加分支会改变
+     * stub 形态。该顾虑不成立——CRC 自绑定是每次构建时对【当次】.text
+     * 现算的（so-section-lock.py 的 lock_head），锁箱与运行天然自洽；
+     * 且已发布 .so 是独立二进制，源码改动碰不到它。 */
+    if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        ncg_wipe(k, sizeof(k));
+        return;   /* 权限没改成功 → 不解密，段保持密文 → 调用即 SIGILL */
+    }
+
+    /* ⚠️ 2026-10-30：原为 16 字节周期 XOR（`start[i] ^= k[i & 15]`），
+     *   对已知明文完全透明（ARM64 序言可猜 → 自相关恢复密钥）。
+     *   改为 SHA-256-CTR，与构建期 so-section-lock.py 的 ctr_xor() 对应。
+     *   dom=0x01 与 master 段（dom=0x02）分开，避免 two-time pad。 */
+    ncg_ctr_xor(k, NC_CTR_DOM_HEAD, start, head_size);
+
+    /* ── 顺带解开 master 数据段（2026-10-19）──────────────────────
+     * 与 head 用同一把 k_stub、同一次遍历：master 只有解开这段才能读到，
+     * 而这段的定位信息在 slot 的 NC_OFF_HEADRO_ADDR(96) 与
+     * NC_OFF_HEADRO_SIZE(100) 两个 u32 里（.ncks 扩容到 104 时装它们）。
+     *
+     * 为什么必须在这里解、而不是在 ncg_head_unlock 里：
+     *   ncg_master 是 head 段【外面】的另一个段，head 本体解完之后才能
+     *   拿到 k_so；而取得 master 是派生 k_so 的前置。所以必须由 stub
+     *   （唯一持有 k_stub 的地方）在解完 head 后立刻解它。
+     *
+     * 失败处理：段缺失或大小异常 → 不解，master 保持全零 →
+     *   ncg_head_unlock 检测到全零即判定"未锁"直接返回 0。
+     *   这是 fail-safe 而非 fail-open：未锁状态下 .ncx 本就是明文。 */
+    {
+        uint32_t ro_addr = ncg_rd32(slot + NC_OFF_HEADRO_ADDR);
+        uint32_t ro_size = ncg_rd32(slot + NC_OFF_HEADRO_SIZE);
+        if (ro_addr != 0 && ro_size > 0 && ro_size <= (1u << 16)) {
+            uint8_t *ro = (uint8_t *)(img_base + ro_addr);
+            uintptr_t ps2 = getpagesize();
+            uintptr_t rs = (uintptr_t) ro & ~(ps2 - 1);
+            uintptr_t re = ((uintptr_t) ro + ro_size - 1 & ~(ps2 - 1)) + ps2;
+            if (mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE) == 0) {
+                /* ⚠️ 必须用【.text 里的函数】解密，不能调 ncg_rc4 ——
+                 * ncg_rc4 本身就在 .ncxh 段里，此刻还是密文，
+                 * 调用它会踩密文（实测卡死/SIGILL）。这是本文件第二次
+                 * 踩同一个坑（head 段锁箱也不能用 rc4，见 lock_head 注释）
+                 * ——规矩是：**stub 能碰到的函数只能是 .text 里的**。
+                 * ncg_ctr_xor 就在 .text（见其定义处的注释），满足纪律。
+                 *
+                 * ⚠️ 2026-10-30：原为 16 字节周期 XOR，改为 SHA-256-CTR
+                 *   且 dom=0x02（与 head 段的 0x01 分域）。 */
+                ncg_ctr_xor(k, NC_CTR_DOM_HEADRO, ro, ro_size);
+                /* ⚠️ 恢复成 RW 而不是 R —— 实测踩过：
+                 * .ncxhr 与 .data / .bss 【同页】
+                 * （实测 arm64：.data 0x13ca8、head_ro 0x13cd0、
+                 *   .bss 0x13cf0，全在页 0x13000 内）。
+                 * mprotect 粒度是页，设成 READ 会把 .bss 也变只读 →
+                 * 后续任何 .bss 写入即 SIGSEGV。
+                 * 这个页本来就是 RW（.data/.bss 所在），恢复 RW 才是
+                 * 还原原状；密文段保护不靠页权限，靠"内容是密文"。 */
+                (void) mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE);
+            }
+        }
+    }
+
+    __builtin___clear_cache((char *) start, (char *)(start + head_size));
+    /* 用后即毁的交接：把明文区间交给 .text 全局（head 自毁时读）。
+     * volatile 写：该值跨"函数返回"被另一个 TU 段的代码读取，
+     * 且时机在攻击者可见的窗口内，编译器不得缓存/重排。 */
+    ncg_head_live = start;
+    ncg_head_live_len = head_size;
+    ncg_wipe(k, sizeof(k));
+    /* ⚠️ 2026-10-29：槽副本用完必须立刻擦（本函数是它唯一的生命周期边界）。
+     *    这样 .bss / 栈上都不留密钥材料。 */
+    ncg_wipe(slot, sizeof(slot));
+    recovered = 1;
 }

@@ -59,4 +59,47 @@ void ncg_wipe(void *p, size_t n);
  * 与 so-section-lock.py 的 _derive_boot_key() 逐字节同规则。 */
 int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]);
 
+
+/* ── 以下为 ncg_stub_recover 的依赖，定义仍在 nc_guard_boot.c ────────
+ * 2026-11-06 拆 ncg_stub_recover 到 crypto.c 时上移到此处。
+ * ⚠️ 全部必须在 .text（明文）：它们要在 .ncxh 尚未解密时就能用。 */
+
+/* 二级密钥槽本体（.ncks 段）。crypto.c 用它反推镜像基址：
+ *     img_base = (uintptr_t)&ncg_stub_slot - stub_sh_addr
+ * ⚠️ 改外部符号后该引用从 PC 相对变成 GOT 间接（实测 4 对
+ *    ADR_GOT_PAGE/LD64_GOT_LO12_NC），但 GOT 里存的就是段表 sh_addr，
+ *    两者实测相等 → 反推结果不变。详见 docs/混淆计划.md §3.2。 */
+extern const volatile unsigned char ncg_stub_slot[];
+
+/* 小端读 32 位（slot 字段解析）。 */
+uint32_t ncg_rd32(const volatile unsigned char *p);
+
+/* SHA-256-CTR 加解密（head 与 master 两段，用 dom 分域）。
+ * 与 so-section-lock.py 的 ctr_xor() 逐字节一致。 */
+void ncg_ctr_xor(const uint8_t k[16], uint8_t dom, uint8_t *buf, uint32_t len);
+
+/* 自身代码 CRC（由 ncguard_unlock 在调用 stub 前算好，stub 折进 k_stub）。 */
+extern uint32_t ncg_self_crc;
+
+/* 用后即毁交接区：stub 解出 .ncxh 明文后写这里，ncguard_unlock 消费。 */
+extern volatile uint8_t  *ncg_head_live;
+extern volatile uint32_t  ncg_head_live_len;
+
+/* ── 定义在 nc_guard_crypto.c ─────────────────────────────────────────
+ * 把 .ncxh 还原成明文。签名带 so_path/base 参数【而不是自己 dladdr】——
+ * 取自身地址会被 VMP 判为 non-call use 并跳过（见 nc_guard_crypto.c 头）。
+ * 返回 void；失败一律 fail-closed（段保持密文 → 调用即 SIGILL）。 */
+void ncguard_stub_recover(const char *so_path, uintptr_t base);
+
+
+/* 读 .ncks 并解出槽明文（stub 阶段唯一持有 boot_key 的地方）。
+ * 返回 0 成功；-1 = fail-closed（调用方必须放弃解密）。 */
+int ncg_slot_read(const char *so_path, uintptr_t base,
+                  uint8_t out[]);
+
+/* XOR_KEY 重组（定义在 nc_guard_xor.c）。从已解密的槽拼回 8 字节，
+ * 调用方用完必须 ncg_wipe。 */
+void ncg_xor_key(const uint8_t *slot, uint8_t out[8]);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */
+
