@@ -111,6 +111,53 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
  * 第二部分：二级锁箱的开箱本体（2026-11-06 从 boot.c 拆出）
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* 前向声明：ncguard_head_decrypt 调用它，但它的定义在文件靠后。 */
+static void ncguard_headro_unlock(const uint8_t k[16],
+                                  const volatile unsigned char *slot,
+                                  uintptr_t img_base);
+
+/* 改权限 → 解密 .ncxh → 交接明文区间 → 解 master（2026-11-06 第三次拆分）。
+ * 与 ncguard_stub_recover / ncguard_head_mac_ok 同因：降寄存器压力。
+ *
+ * ⚠️ 时序与拆分前逐字对应，不可改：
+ *    1. mprotect 成 RWX（失败 → return，段保持密文 → 调用即 SIGILL）
+ *    2. ncg_ctr_xor 解 head（dom=0x01）
+ *    3. clear_cache + 交接明文区间给 ncg_head_live
+ *    4. 解 master 段（dom=0x02）
+ *
+ * ⚠️ mprotect 失败必须【立即 return】，不能继续解密 —— 那是 fail-closed
+ *    与 fail-open 的分界（历史上这里曾漏查返回值，导致往只读页写 → SIGSEGV，
+ *    且症状与"段被篡改"的 SIGILL 混淆，排查方向完全错）。
+ * ⚠️ noinline 不可省（-Oz 会内联回去，拆分失效）。
+ */
+__attribute__((noinline))
+static void ncguard_head_decrypt(const uint8_t k[16],
+                                 const volatile unsigned char *slot,
+                                 uintptr_t img_base,
+                                 uint8_t *start, uint32_t head_size) {
+    uintptr_t ps = getpagesize();
+    uintptr_t s = (uintptr_t) start & ~(ps - 1);
+    uintptr_t e = ((uintptr_t) start + head_size - 1 & ~(ps - 1)) + ps;
+    if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return;   /* 权限没改成功 → 不解密，段保持密文 → 调用即 SIGILL */
+    }
+
+    /* dom=0x01 与 master 段（0x02）分域，避免 two-time pad。 */
+    ncg_ctr_xor(k, NC_CTR_DOM_HEAD, start, head_size);
+
+    __builtin___clear_cache((char *) start, (char *)(start + head_size));
+
+    /* 用后即毁的交接：把明文区间交给 .text 全局（head 自毁时读）。
+     * volatile 写：该值跨"函数返回"被另一个 TU 段的代码读取，且时机在
+     * 攻击者可见的窗口内，编译器不得缓存/重排。 */
+    ncg_head_live = start;
+    ncg_head_live_len = head_size;
+
+    /* 解 master 段。失败不阻断 —— master 保持全零时 ncg_head_unlock
+     * 会判定"未锁"返回 0（fail-safe：未锁状态下 .ncx 本就是明文）。 */
+    ncguard_headro_unlock(k, slot, img_base);
+}
+
 /* 校验 .ncxh 密文的 HMAC（P0-b）。
  * 2026-11-06 从 ncguard_stub_recover 拆出 —— 与 ncguard_headro_unlock 同因：
  * 降低单函数寄存器压力，好让 VMP 能接受（原因见 ncguard_headro_unlock 注释）。
@@ -296,58 +343,16 @@ void ncguard_stub_recover(const char *so_path, uintptr_t base) {
     }
 
 
-    uintptr_t ps = getpagesize();
-    uintptr_t s = (uintptr_t) start & ~(ps - 1);
-    uintptr_t e = ((uintptr_t) start + head_size - 1 & ~(ps - 1)) + ps;
-    /* ⚠️ 2026-10-20 补返回值检查（此前未查，是本文件 5 个 mprotect 调用点
-     *    里唯一漏的一处）。
-     *
-     * 不查的后果：mprotect 失败时下面那个 XOR 循环会往【仍只读】的页里写
-     * → SIGSEGV。而 SIGSEGV 与"密文段被改过"的 SIGILL 是两种死法，
-     * 排查时会被误导成"段被篡改"，实际是权限没改成功。
-     *
-     * 失败处理：直接 return，让 head 段【保持密文】。这与 655/666 的
-     * -8/-10 语义对等（fail-closed），也与本函数上方 MAC 校验失败分支
-     * （return、不动 mprotect）完全一致。本函数是 static void、无返回值
-     * 通道，故用 return 而非返回码；后续对 head 段函数的调用都会踩密文
-     * → SIGILL，从"非法指令"而非"段错误"即可判断是解密链路失败。
-     *
-     * 为什么早先不查：本函数在 .text 明文 stub 里，曾担心多加分支会改变
-     * stub 形态。该顾虑不成立——CRC 自绑定是每次构建时对【当次】.text
-     * 现算的（so-section-lock.py 的 lock_head），锁箱与运行天然自洽；
-     * 且已发布 .so 是独立二进制，源码改动碰不到它。 */
-    if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        ncg_wipe(k, sizeof(k));
-        return;   /* 权限没改成功 → 不解密，段保持密文 → 调用即 SIGILL */
-    }
-
-    /* ⚠️ 2026-10-30：原为 16 字节周期 XOR（`start[i] ^= k[i & 15]`），
-     *   对已知明文完全透明（ARM64 序言可猜 → 自相关恢复密钥）。
-     *   改为 SHA-256-CTR，与构建期 so-section-lock.py 的 ctr_xor() 对应。
-     *   dom=0x01 与 master 段（dom=0x02）分开，避免 two-time pad。 */
-    ncg_ctr_xor(k, NC_CTR_DOM_HEAD, start, head_size);
-
-    /* ── 解 master 数据段（2026-11-06 抽成独立函数）──────────────
-     * 为什么抽出去：本函数原先在这里还有一整段 mprotect + 解密，
-     * 与前面"验 MAC + 解 head"叠在一起，导致单个 call 点上同时存活
-     * 18 个 SSA 值 —— 超过 Amice VM 的 x0..x31 虚拟寄存器预算，
-     * 整个函数被 VMP 静默跳过（CI 日志：VM x-register budget exceeded）。
-     *
-     * 抽成独立函数后两半各自压力减半，都能通过预算。
-     * ⚠️ 时序完全未变：仍然是"先验 MAC → mprotect → 解 head → 解 master"，
-     *    仍然是同一把 k_stub、同一个调用链位置。
-     * ⚠️ 两个函数都开 VMP（同一文件），保护强度不降。 */
-    ncguard_headro_unlock(k, slot, img_base);
-
-
-    __builtin___clear_cache((char *) start, (char *)(start + head_size));
-    /* 用后即毁的交接：把明文区间交给 .text 全局（head 自毁时读）。
-     * volatile 写：该值跨"函数返回"被另一个 TU 段的代码读取，
-     * 且时机在攻击者可见的窗口内，编译器不得缓存/重排。 */
-    ncg_head_live = start;
-    ncg_head_live_len = head_size;
+    /* ── mprotect + 解 head + 交接（2026-11-06 第三次拆分）──────────
+     * 前两轮把峰值存活从 18 降到 14/13，仍超 32 的预算
+     * （CI：values=14 Some(Xor) / values=13 Some(GetElementPtr)，
+     *   spilled=1 used_spill_slots=1 —— 溢出槽也用到了极限）。
+     * 剩余压力是算法本质：slot[112] + k[16] + start + head_size + img_base
+     * 必须同时活到末尾，收窄作用域压不下去。所以把收尾整段移出去，
+     * 本函数只做「准备 → 校验 → 委派」。 */
+    ncguard_head_decrypt(k, slot, img_base, start, head_size);
     ncg_wipe(k, sizeof(k));
-    /* ⚠️ 2026-10-29：槽副本用完必须立刻擦（本函数是它唯一的生命周期边界）。
+    /* ⚠️ 槽副本用完必须立刻擦（本函数是它唯一的生命周期边界）。
      *    这样 .bss / 栈上都不留密钥材料。 */
     ncg_wipe(slot, sizeof(slot));
     recovered = 1;
