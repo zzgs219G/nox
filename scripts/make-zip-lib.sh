@@ -40,6 +40,36 @@ OUT="dist/nox-${VER}.zip"
 CFLAGS="-fPIC -fvisibility=hidden -fno-ident -Oz \
         -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED \
         -I$GUARD"
+
+# ── Amice 混淆（2026-11-06，用户要求）────────────────────────────────
+# 为什么在【发布时】混淆而不是消费方编译时：
+#   本脚本产出的是 libnox.a（已编译好的机器码），消费方直接链接。
+#   Amice 是编译期 LLVM pass，只能在【编译源码】时生效 —— 消费方拿到 .a
+#   后已经无法再混淆里面的函数了。
+#   这正是之前混淆空转的根因：消费方开了 AMICE_MBA=true，但
+#   nc_guard_boot.c 是以 .a 形式链接进来的，插件碰不到它。
+#   实测证据（2026-11-05）：ncg_boot_key 里 HKDF 调用处
+#   （adrp+add 取 "nc-boot-v1"）在混淆前后的反汇编逐条指令一致。
+#
+# 用法：设了 AMICE_BUNDLE 就混淆，没设就普通编译（默认，保持向后兼容）
+#   AMICE_BUNDLE=/path/to/amice-android-ndk-rXX-linux-x86_64 ./scripts/make-zip-lib.sh
+#
+# 混淆只作用于带 NC_OBF 标注的函数（nc_guard_boot.c 里的 3 个解密链函数），
+# 不是全局 —— 全局混淆会把 RC4/HMAC/ELF 解析也搅乱，收益为零且体积翻倍。
+if [[ -n "${AMICE_BUNDLE:-}" ]]; then
+    [[ -f "$AMICE_BUNDLE/amice/lib/libamice.so" ]] || {
+        echo "✗ AMICE_BUNDLE 指向的目录缺 amice/lib/libamice.so: $AMICE_BUNDLE" >&2
+        exit 1
+    }
+    [[ -d "$AMICE_BUNDLE/amice/llvm-lib" ]] || {
+        echo "✗ 缺 amice/llvm-lib —— 插件依赖的 host libLLVM.so 在此（官方 NDK 不含）" >&2
+        exit 1
+    }
+    CFLAGS+=" -DNC_AMICE_ANNOTATE -fpass-plugin=$AMICE_BUNDLE/amice/lib/libamice.so"
+    echo "▶ Amice 混淆已启用（只作用于 NC_OBF 标注的函数）"
+else
+    echo "▶ 未设 AMICE_BUNDLE，普通编译（无混淆）"
+fi
 # ⚠️ 必须包含 nc_guard_jni：它提供 Java_com_nc_link_NcLink_selftest()。
 #    jian_box 的 inject-javacheck.py 会注入对 NcLink.selftest() 的调用，
 #    缺这个符号 → UnsatisfiedLinkError → Guard 的 .catch 判定"so 缺失"
@@ -61,6 +91,22 @@ for abi in arm64-v8a armeabi-v7a; do
     esac
     CC=$(ls -d "$_prebuilt"/*/bin/"$_tgt" 2>/dev/null | head -1)
     [ -n "$CC" ] || { echo "✗ NDK 里找不到 $_tgt" >&2; exit 1; }
+
+    # 混淆时编译器必须来自 bundle 自带的 NDK：
+    # Amice 插件按 LLVM 主版本编译，与 NDK clang 严格绑定。错配不是报错，
+    # 是段错误（实测 CI 42055440429：clang 18 加载 r29 插件 → exit 139）。
+    if [[ -n "${AMICE_BUNDLE:-}" ]]; then
+        _bundle_ndk=$(find "$AMICE_BUNDLE" -maxdepth 1 -type d -name 'android-ndk-*' | head -1)
+        [[ -n "$_bundle_ndk" ]] || {
+            echo "✗ bundle 里找不到自带的 NDK（期望 android-ndk-rXX/）" >&2
+            echo "  插件与 NDK clang 必须配套，用别的 NDK 会段错误" >&2
+            exit 1
+        }
+        _bcc=$(ls -d "$_bundle_ndk"/toolchains/llvm/prebuilt/*/bin/"$_tgt" 2>/dev/null | head -1)
+        [[ -n "$_bcc" ]] || { echo "✗ bundle NDK 里找不到 $_tgt" >&2; exit 1; }
+        CC="$_bcc"
+        export LD_LIBRARY_PATH="$AMICE_BUNDLE/amice/llvm-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
 
     _out="$LIBROOT/$abi"
     mkdir -p "$_out"

@@ -1639,7 +1639,14 @@ static void ncg_ctr_xor(const uint8_t k[16], uint8_t dom,
 
 /* 明文 stub：把 .ncxh 还原成明文。
  * 全程无循环展开以外的分支、无 libc 调用、无磁盘 I/O。
- * 未锁（slot magic 不匹配）时直接返回——段本就是明文。 */
+ * 未锁（slot magic 不匹配）时直接返回——段本就是明文。
+ *
+ * ⚠️ NC_OBF（2026-11-06）：本函数是攻击者【唯一入口】—— 它把 k_stub 拼出来
+ *    （rc4 解 .ncxh 的钥匙）。读懂它 = 知道怎么解 unlock 本体。混淆它比
+ *    混淆下游任何函数都值。
+ *    ⚠️ 混淆后 flatten 会重排控制流，而本函数在 constructor(50) 关键路径上。
+ *       验证方式：混淆产物真机 selftest==59（解密链完整走通）。 */
+NC_OBF
 static void ncg_stub_recover(void) {
     /* ── T4（2026-10-28 / 2026-10-29 修正）：解密槽到【本函数栈缓冲】───
      * 修正理由见 ncg_slot_read 上方注释：不再有 .bss 常驻明文副本。
