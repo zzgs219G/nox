@@ -66,6 +66,10 @@ if [[ -n "${AMICE_BUNDLE:-}" ]]; then
         exit 1
     }
     CFLAGS+=" -DNC_AMICE_ANNOTATE -fpass-plugin=$AMICE_BUNDLE/amice/lib/libamice.so"
+    # 打印 pass 的跳过原因（VMP 遇到不支持的函数会静默保留原实现，
+    # 没有日志就分不清"混淆生效"和"被跳过"——2026-11-06 实测踩过：
+    # ncg_xor_key 的 VMP 指令数反而从 210 降到 15，实际是被跳过+退回原样）
+    export RUST_LOG="${RUST_LOG:-amice=debug}"
     echo "▶ Amice 混淆已启用（只作用于 NC_OBF 标注的函数）"
 else
     echo "▶ 未设 AMICE_BUNDLE，普通编译（无混淆）"
