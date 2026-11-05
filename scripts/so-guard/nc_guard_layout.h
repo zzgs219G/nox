@@ -132,6 +132,24 @@
 #define NC_BOOT_SALT_INIT \
     { 0x6e, 0x63, 0x1f, 0x2b, 0x7a, 0x44, 0x91, 0xd8, \
       0x03, 0x5c, 0xe6, 0x18, 0xaf, 0x72, 0x39, 0xc4 }  /* "nc" + 16B 区分值 */
+/* HKDF 的 info 参数（boot 域）。
+ *
+ * ⚠️ 2026-11-06 P0：本宏【只作 so-section-lock.py 的抽取源】，
+ *    C 代码不得直接引用它 —— 一旦被 .c 引用，字符串就以明文进 .rodata。
+ *    实测 v0.9.5 产物："nc-boot-v1" 在 .rodata 0xcd96，r2 一条
+ *        axt 0xcd96  →  0x389bc（VM wrapper 旁边）
+ *    就把"这里是 boot_key 派生"告诉了攻击者，VMP 的保护被绕过一半。
+ *
+ *    现在 C 侧走 nc_guard_key.c 的 ncg_label_boot()，从 XOR 0x5A 密文表
+ *    还原到栈缓冲，二进制里不留常量。派生结果逐字节不变（已对拍）。
+ *
+ *    为什么不像别处那样改成整数表：so-section-lock.py:114 用正则
+ *    `#define\s+NC_BOOT_INFO\s+"([^"]+)"` 从这里抽字符串给 Python 侧算，
+ *    改成整数会让正则抽不到 → 锁箱 fail-fast。
+ *    宏不被 C 引用就不会进二进制（已实测确认），所以保留字符串是安全的。
+ *
+ * ⚠️ 改本值等于改派生产物 → 所有历史产物失效。真要改必须同步
+ *    nc_guard_key.c 的 ncg_label_enc_boot[] 与 Python 侧 derive。 */
 #define NC_BOOT_INFO        "nc-boot-v1"
 #define NC_OFF_FRAGS_ENC    8   /* .ncks 加密区间起点（magic 之后）*/
 

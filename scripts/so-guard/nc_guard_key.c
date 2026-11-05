@@ -38,6 +38,72 @@
 
 #include "nc_guard_key.h"
 
+/* ── HKDF 域 label 的密文存储（2026-11-06，P0）────────────────────
+ *
+ * 问题：label 是 HKDF 的 info 参数，运行期必须参与运算，所以它必然
+ *   在二进制里。实测 v0.9.5 产物：
+ *       strings libnc.so | grep nc-boot-v1   → 命中（.rodata 0xcd96）
+ *       r2: axt 0xcd96                        → 0x389bc（VM wrapper 旁边）
+ *   攻击者 5 秒就能定位到"这里是 boot_key 派生"，VMP 保护了函数体却
+ *   没保护这个路标。这就是 AGENTS §3.4「加密了内容 ≠ 隐藏了结构」。
+ *
+ * 为什么不能"拆成两段运行期拼"（曾以为可行，实测无效）：
+ *   LLVM 会把相邻的字符串字面量合并成一个常量：
+ *       "\x." "nc-bo" "ot-v1"  →  .rodata.str1.1 里出现
+ *       nc-boot-v1.nc-bo.ot-v1
+ *   三段挨在一起，strings 照样扫得到全文，收益为零。
+ *   （这正是 nc_guard_boot.c 记的"LLVM 做函数间常量传播"同源问题。）
+ *
+ * 现方案：整数表存储，运行期逐字节 XOR 还原。
+ *   · 每字节 ^ 0x5A 存成 uint8_t，编译期不会有任何字符串字面量
+ *   · 与本设施既有做法一致（ncg_apk_path_fault 的规则表也是 XOR 0x5A）
+ *   · 派生结果【逐字节不变】→ 历史产物兼容性零影响（已实测对拍）
+ *
+ * ⚠️ 这是【混淆】不是【加密】：0x5A 就在源码里，愿意读的人能还原。
+ *    它买的是"strings/grep 自动扫描失效 + xref 断链"，不是抗人工逆向。
+ *    与 layout.h 里 magic seed 的诚实口径一致，别高估。
+ *
+ * ⚠️ 改这三张表必须同步 so-section-lock.py 的 derive_app_keys()：
+ *    Python 侧用明文 label 算（构建期，不进产物），两侧结果必须逐字节一致。
+ *    对拍方法见下方 ncg_label_so 的注释。 */
+
+/* 各 label 的明文长度（不含 NUL） */
+#define NCGL_SO       8    /* "nc-so-v1" */
+#define NCGL_MAC     12    /* "nc-so-mac-v1" */
+#define NCGL_SO_R    10    /* "nc-so-r-v1" */
+#define NCGL_BOOT    10    /* "nc-boot-v1" */
+
+/* 存储序：enc[i] = label[i] ^ 0x5A
+ * 生成方式（可复核，改表前用它校验）：
+ *     printf '%s' "nc-so-v1" | od -An -tx1 | tr -d ' \n'
+ *     → 6e632d736f2d7631   再逐字节 ^ 0x5A
+ */
+static const uint8_t ncg_label_enc_so[NCGL_SO] = {
+    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x2c, 0x6b,
+};
+static const uint8_t ncg_label_enc_mac[NCGL_MAC] = {
+    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x37, 0x3b,
+    0x39, 0x77, 0x2c, 0x6b,
+};
+static const uint8_t ncg_label_enc_so_r[NCGL_SO_R] = {
+    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x28, 0x77,
+    0x2c, 0x6b,
+};
+static const uint8_t ncg_label_enc_boot[NCGL_BOOT] = {
+    0x34, 0x39, 0x77, 0x38, 0x35, 0x35, 0x2e, 0x77,
+    0x2c, 0x6b,
+};
+
+/* 把密文表还原进调用方缓冲（不写 NUL —— 调用方按长度用 memcpy 拼包名）。
+ * ⚠️ 用 volatile 写：防止编译器把"解码后立刻使用"优化成常量折叠，
+ *    那样明文又会回到 .rodata（本文件已踩过同类坑）。
+ * ⚠️ 不返回指针：避免指向内部静态区，也让调用方必须自己管缓冲寿命。 */
+__attribute__((noinline))
+static void ncg_label_decode(const uint8_t *enc, size_t n, uint8_t *out) {
+    volatile uint8_t *v = (volatile uint8_t *)out;
+    for (size_t i = 0; i < n; i++) v[i] = (uint8_t)(enc[i] ^ 0x5A);
+}
+
 /* ── SHA-256（FIPS 180-4）───────────────────────────────────────────
  * 照抄 scripts/sigcheck/src/sig_check.c:239-305 的已验证实现
  * （test-sig-guard2.sh 与 test-lsgs-strings.sh 6/6 对拍钉死）。
@@ -415,7 +481,9 @@ int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
                     const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
     uint8_t info[128]; size_t n=0;
-    memcpy(info,"nc-so-v1",8); n=8;
+    /* label 从密文表还原（2026-11-06 P0：消除 .rodata 明文锚点，见文件头） */
+    ncg_label_decode(ncg_label_enc_so, NCGL_SO, info);
+    n=NCGL_SO;
     { size_t l=strlen(pkg); if(l>sizeof info-9) l=sizeof info-9; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
@@ -464,7 +532,8 @@ int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
     uint8_t info[128]; size_t n=0;
-    memcpy(info,"nc-so-mac-v1",12); n=12;
+    ncg_label_decode(ncg_label_enc_mac, NCGL_MAC, info);
+    n=NCGL_MAC;
     { size_t l=strlen(pkg); if(l>sizeof info-13) l=sizeof info-13; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
@@ -484,7 +553,8 @@ int ncg_derive_k_so_r(const uint8_t master[32],const uint8_t cert_sha256[32],
                       const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
     uint8_t info[128]; size_t n=0;
-    memcpy(info,"nc-so-r-v1",10); n=10;
+    ncg_label_decode(ncg_label_enc_so_r, NCGL_SO_R, info);
+    n=NCGL_SO_R;
     { size_t l=strlen(pkg); if(l>sizeof info-11) l=sizeof info-11; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
@@ -505,4 +575,27 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
     int rc=ncg_derive_k_so_r(master,sha,pkg,out);
     memset(sha,0,sizeof sha);
     return rc;
+}
+
+/* ── 还原 HKDF 的 boot label（2026-11-06 P0）────────────────────────
+ * 给 ncg_boot_key 用（它在 nc_guard_crypto.c，为本文件的外部调用方）。
+ *
+ * 为什么不把 NC_BOOT_INFO 宏直接暴露过去：
+ *   那个宏是字符串字面量，被任何 .c 引用就会以明文进 .rodata ——
+ *   正是本文件头要消除的那个泄露点。改成函数把解码过程封起来，
+ *   明文只存在于调用方的栈缓冲里，二进制中不留常量。
+ *
+ * 为什么不放进 nc_guard_layout.h 一起改：
+ *   那是【产物格式契约】文件，且 so-section-lock.py:114 用正则
+ *   `#define\s+NC_BOOT_INFO\s+"([^"]+)"` 从它抽取字符串给 Python 侧算。
+ *   改成整数表会让该正则抽不到 → 锁箱直接 fail-fast。
+ *   所以 layout.h 保留字符串（仅作 Python 的抽取源，本仓库 C 代码
+ *   不再引用它 → 宏不进二进制，已实测确认）。
+ *
+ * out 需要至少 10 字节；返回写入长度（不含 NUL）。
+ * ⚠️ 调用方用完应擦除缓冲（含密钥材料的派生输入）。 */
+size_t ncg_label_boot(uint8_t *out, size_t cap) {
+    if (!out || cap < NCGL_BOOT) return 0;
+    ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, out);
+    return NCGL_BOOT;
 }

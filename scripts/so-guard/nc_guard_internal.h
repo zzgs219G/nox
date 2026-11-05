@@ -101,5 +101,10 @@ int ncg_slot_read(const char *so_path, uintptr_t base,
  * 调用方用完必须 ncg_wipe。 */
 void ncg_xor_key(const volatile uint8_t *slot, uint8_t out[8]);
 
+/* 还原 HKDF 的 boot label（定义在 nc_guard_key.c）。
+ * 2026-11-06 P0：不再暴露 NC_BOOT_INFO 宏，避免明文字符串进 .rodata。
+ * out 至少 10 字节；返回长度（不含 NUL），0 = 参数错误。 */
+size_t ncg_label_boot(uint8_t *out, size_t cap);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */
 

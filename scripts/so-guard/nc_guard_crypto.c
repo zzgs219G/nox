@@ -100,9 +100,23 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
     memcpy(ikm + 20, lo + span - 16, 16);
 
     static const uint8_t salt[16] = NC_BOOT_SALT_INIT;
-    khkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt),
-                 (const uint8_t *)NC_BOOT_INFO, strlen(NC_BOOT_INFO),
-                 out, 16);
+    /* ⚠️ 2026-11-06 P0：info 不再直接用 NC_BOOT_INFO 字面量。
+     * 那个宏一旦被本文件引用，字符串就会以明文进 .rodata ——
+     * 实测 v0.9.5 产物里 "nc-boot-v1" 在 0xcd96，r2 一条 axt 就
+     * 定位到 VM wrapper 旁边，等于告诉攻击者"这里是 boot_key 派生"。
+     * 现在从密文表还原到栈缓冲，二进制里不留常量。
+     * 派生结果逐字节不变（已用同一 ikm/salt 对拍验证）。 */
+    {
+        uint8_t info[16];
+        size_t ilen = ncg_label_boot(info, sizeof(info));
+        if (ilen == 0) {                    /* 配置错误 → fail-closed */
+            ncg_wipe(ikm, sizeof(ikm));
+            return -1;
+        }
+        khkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt),
+                     info, ilen, out, 16);
+        ncg_wipe(info, sizeof(info));       /* 派生输入用完即擦 */
+    }
     ncg_wipe(ikm, sizeof(ikm));
     return 0;
 }

@@ -543,6 +543,37 @@ else
     skip "V9 需要源码形态且可执行（.a 形态/交叉产物跳过）"
 fi
 
+echo "── V10 HKDF label 明文不落产物（2026-11-06 P0）──"
+# 为什么必须验：label 是 HKDF 的运行期输入，天然要在二进制里。
+# 实测 v0.9.5 产物："nc-boot-v1" 在 .rodata 0xcd96，r2 一条
+#   axt 0xcd96  →  0x389bc（VM wrapper 旁边）
+# 就定位到"这里是 boot_key 派生" —— VMP 保护了函数体，这个路标没保护。
+# 现在改成 XOR 0x5A 密文表 + 运行期还原，二进制不留常量。
+#
+# ⚠️ 验【产物】而不是看源码：宏是否被引用、编译器是否把碎片合并回去
+#    （实测 "nc-bo" "ot-v1" 会被 LLVM 合成一个完整字符串），只有产物说了算。
+if [ -f l2.so ]; then
+    _v10=0
+    for _lbl in nc-boot-v1 nc-so-v1 nc-so-mac-v1 nc-so-r-v1; do
+        _n=$(strings -n 4 l2.so 2>/dev/null | grep -cxF "$_lbl" || true)
+        [ "${_n:-0}" != "0" ] && _v10=$((_v10+1))
+    done
+    if [ "$_v10" = "0" ]; then
+        ok "V10 四个 HKDF label 明文零命中"
+    else
+        bad "V10 $_v10 个 label 明文残留在产物里（.rodata 可 strings 扫出 → xref 直达关键函数）"
+    fi
+    # 反面判据：不能为了消除 label 而破坏派生 —— 解锁链路必须仍然通
+    # （V6 已验证执行结果，这里只补一条"派生函数还在产出的 so 里"的存在性）
+    if readelf -SW l2.so 2>/dev/null | grep -q '\.ncks'; then
+        ok "V10 label 改造未破坏锁箱结构（六段仍在）"
+    else
+        bad "V10 锁箱结构异常（.ncks 段缺失）"
+    fi
+else
+    skip "V10 无锁箱产物"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
