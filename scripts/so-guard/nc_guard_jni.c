@@ -26,6 +26,19 @@
  *
  * ⚠️ 调用本函数即触发【一次性】解锁。再次调用走幂等分支返回 0
  *   （不再是 59）—— 故自检只调一次。
+ *
+ * ⚠️⚠️ 2026-11-04（改动态注册时实测踩到）：本函数必须带
+ *   __attribute__((used, retain))。原因：
+ *   动态注册后它【没有任何直接调用者】—— 下游 nc_link_jni.c 里只有一个
+ *   weak 引用（`if (nc_link_jni_selftest != NULL)`），而 weak 引用不构成
+ *   强依赖。静态库形态（libnox.a）+ 消费方 -Wl,--gc-sections 时，
+ *   链接器判定"这段没人要" → 整个 .text.nc_link_jni_selftest 被回收。
+ *   实测：不加 retain 时 `llvm-nm libnc.so | grep selftest` 无输出，
+ *        加 retain 后符号存在（segment flags 里出现 G = SHF_GNU_RETAIN）。
+ *   后果是【静默】的：构建全绿、判决与心跳照常，只是 selftest 永远
+ *   UnsatisfiedLinkError —— 与报错四十九（自检类没生成、异常被吞）
+ *   是同一类"假绿"。retain 是唯一在 .o 侧就能钉住的办法：
+ *   在消费方加 used/retain 对 extern 声明无效（属性只对定义生效）。
  */
 #include <jni.h>
 #include <stdatomic.h>
@@ -55,6 +68,7 @@ static atomic_int ncg_selftest_done = 0;
  *   Java 侧调用抛 UnsatisfiedLinkError。这是【允许】的：注入的 smali 已把
  *   selftest 包在独立 try/catch 里（报错四十九的教训），不影响心跳与判决。
  *   代价只是失去自检可观测性，不构成安全降级（selftest 本就不参与判定）。 */
+__attribute__((used, retain))
 jint nc_link_jni_selftest(JNIEnv *env, jobject thiz) {
     (void)env; (void)thiz;
     int expected = 0;
