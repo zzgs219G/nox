@@ -333,8 +333,37 @@ static int ncg_slot_read(const char *so_path, uintptr_t base,
  *   都必须走"无标注"路径，否则会把不可用的属性带进 clang 18。
  */
 #if defined(NC_AMICE_ANNOTATE)
+/* 混淆组合（2026-11-06）：按"强度/代价"权衡后选定 5 项。
+ *
+ * 为什么是这几项（都是【逐函数】生效，不设全局 AMICE_* 环境变量）：
+ *   +flatten        控制流平坦化 —— 唯一能改变控制流结构的，是质变。
+ *                   不选它，MBA 只是"跳过去还能看到原指令"。
+ *   +mba            混合布尔算术 —— 算术等价替换，风险最低，做基础噪声。
+ *   +shuffle_blocks 基本块乱序 —— 打乱布局，配合 flatten 增强。
+ *   +split_basic_block 基本块拆分 —— 把一个块拆成多个，增大 CFG 重建成本。
+ *                   用默认 num=1，不调大：体积随 num 线性增长。
+ *   +indirect_call  间接调用 —— 打断调用链，静态看不到"谁调了谁"。
+ *
+ * 刻意【不选】的：
+ *   +vm_flatten / +vm_virtualize  VMP 虚拟化 —— 体积 +300~500%，
+ *       启动路径上（constructor(50)）会明显拖慢；且崩溃时 pc 落在
+ *       解释器里，看不出是哪个函数，连我们自己都排不了障。
+ *   +bogus_control_flow  BCF —— 虚假分支会让体积翻几倍，且分支多了
+ *       在关键路径上是实打实的执行开销。
+ *   +alias_access / +clone_function —— 收益限于表达式局部，对
+ *       "读懂解密链"帮助很小。
+ *
+ * ⚠️ flatten 会重排控制流，而这三个函数都在 constructor(50) 里。
+ *    一旦有边界错误就是随机崩溃，且混淆后的反汇编我们自己也不好查。
+ *    唯一有效的验证是真机 selftest==59（CI x86_64 跑不了 ARM64）。
+ *    所以：先在【只勾 sigcheck】的最小组合上验证通过，再扩大使用。 */
 #  define NC_OBF \
-     __attribute__((noinline, annotate("+mba")))
+     __attribute__((noinline, \
+       annotate("+flatten"), \
+       annotate("+mba"), \
+       annotate("+shuffle_blocks"), \
+       annotate("+split_basic_block"), \
+       annotate("+indirect_call")))
 #else
 #  define NC_OBF
 #endif
