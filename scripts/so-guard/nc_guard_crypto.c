@@ -111,6 +111,40 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]) {
  * 第二部分：二级锁箱的开箱本体（2026-11-06 从 boot.c 拆出）
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* 从已解密的槽恢复 k_stub（16 字节）。
+ * 2026-11-06 从 ncguard_stub_recover 拆出（第四次拆分）。
+ *
+ * 两段循环：
+ *   ① k[i] = slot[8+i] ^ XOR_KEY[i&7]        —— wrapped k_stub 拆封
+ *   ② k[i] ^= fold(crc32(.text))             —— 代码自绑定（阶段3）
+ *
+ * ⚠️ 为什么必须混入 CRC 而不是"算 CRC 后比较、不等就 return"：
+ *    比较式只需 patch 掉那条分支即可绕过（单点）；
+ *    混入式则 CRC 错→密钥错→head 解出乱码→后续校验全失效，没有单点可 patch。
+ *    这就是"链式依赖"对"独立 patch"的本质差别。
+ *
+ * ⚠️ noinline 不可省（-Oz 会内联回去，拆分失效 → 基本块数不降）。
+ */
+__attribute__((noinline))
+static void ncguard_derive_kstub(const volatile unsigned char *slot,
+                                 uint8_t k[16]) {
+    uint8_t xk[8];
+    ncg_xor_key(slot, xk);
+
+    /* ① 拆封 wrapped k_stub */
+    for (int i = 0; i < 16; i++)
+        k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
+    ncg_wipe(xk, sizeof(xk));
+
+    /* ② 把 4 字节 CRC 折叠进 16 字节密钥（每 4 字节异或一次同一 CRC，
+     *    保证 16 字节全部参与，且不引入额外依赖）。 */
+    {
+        uint32_t crc = ncg_self_crc;
+        for (int i = 0; i < 16; i++)
+            k[i] ^= (uint8_t)((crc >> ((i & 3) * 8)) & 0xFF);
+    }
+}
+
 /* 前向声明：ncguard_head_decrypt 调用它，但它的定义在文件靠后。 */
 static void ncguard_headro_unlock(const uint8_t k[16],
                                   const volatile unsigned char *slot,
@@ -298,19 +332,14 @@ void ncguard_stub_recover(const char *so_path, uintptr_t base) {
      *   - 混入式：CRC 错了密钥就错，head 解出乱码 → 后续所有校验都失效，
      *     没有单点可以 patch 掉。这是"链式依赖"对"独立 patch"的本质差别。
      * 代码改一位 → CRC 变 → k_stub 变 → head 段解出乱码 → SIGILL。 */
+    /* 恢复 k_stub（2026-11-06 第四次拆分：算法搬进独立函数）。
+     * 原先是两段 for 循环内联在此 —— 每个循环展开成 ~6 个基本块，
+     * 合计把本函数推到 16 个基本块。而 Amice 的 translator 会把
+     * 【跨 basic-block 的值 pin 到 VM 寄存器】（translator.rs:2876），
+     * 于是 slot/k/start/head_size 全被钉死 → values 逼近 32 上限。
+     * 抽出去后本函数基本块数降到个位数。 */
     uint8_t k[16];
-    {
-        uint8_t xk[8];
-        ncg_xor_key(slot, xk);
-        for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
-        ncg_wipe(xk, sizeof(xk));
-        /* 把 4 字节 CRC 折叠进 16 字节密钥（每 4 字节异或一次同一 CRC，
-         * 保证 16 字节全部参与，且不引入额外依赖） */
-        uint32_t crc = ncg_self_crc;
-        for (int i = 0; i < 16; i++)
-            k[i] ^= (uint8_t)((crc >> ((i & 3) * 8)) & 0xFF);
-        crc = 0;
-    }
+    ncguard_derive_kstub(slot, k);
 
     uint32_t stub_sh_addr = ncg_rd32(slot + 24);
     uint32_t head_sh_addr = ncg_rd32(slot + 28);
