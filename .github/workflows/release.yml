@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+      obfuscate:
+        description: '是否用 Amice 混淆解密链（MBA）。产物 .a 里函数已混淆，消费方无需 Amice'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write    # 创建 Release 需要
@@ -130,10 +135,60 @@ jobs:
           ls "$NDK_DIR/toolchains/llvm/prebuilt/"
           ls "$NDK_DIR"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang
 
+      # ── Amice bundle（仅勾选 obfuscate 时）─────────────────────────
+      # 为什么混淆必须在【这里】做，而不是消费方编译时：
+      #   本仓库发的是 libnox.a（已编译机器码），消费方直接链接。
+      #   Amice 是编译期 pass，只能在编译源码时生效 —— 消费方拿到 .a
+      #   后无法再混淆其中函数。
+      #   2026-11-05 实测过这个空转：消费方开 AMICE_MBA=true 后，
+      #   ncg_boot_key 里 HKDF 调用处的反汇编与无混淆版逐条指令一致。
+      #
+      # ⚠️ 混淆时 make-zip-lib.sh 会用 bundle 自带的 NDK（不是上面的 r27d）：
+      #   插件按 LLVM 主版本编译，与 NDK clang 严格绑定。错配不是报错，
+      #   是段错误（实测 clang 18 加载 r29 插件 → exit 139）。
+      # ⚠️ if 用 == 'true' 而不是裸 inputs.obfuscate：
+      #   tag 推送触发时 inputs 为空，裸写法在某些上下文会报错。
+      - name: 取 Amice bundle
+        if: inputs.obfuscate == true
+        uses: actions/cache@v4
+        with:
+          path: ~/amice-bundle
+          key: amice-r29-v0.1.6-beta.1
+
+      - name: 下载 Amice bundle（cache 未命中时）
+        if: inputs.obfuscate == true
+        run: |
+          set -euo pipefail
+          if [[ -f ~/amice-bundle/amice/lib/libamice.so ]]; then
+            echo "OK: cache 命中"; exit 0
+          fi
+          mkdir -p ~/amice-bundle && cd ~/amice-bundle
+          URL=https://github.com/fuqiuluo/amice/releases/download/v0.1.6-beta.1/amice-android-ndk-r29-linux-x86_64.tar.gz
+          curl -fL --retry 3 -o a.tar.gz "$URL"
+          curl -fsSL -o a.sha256 "$URL.sha256"
+          WANT=$(awk '{print $1}' a.sha256); GOT=$(sha256sum a.tar.gz | awk '{print $1}')
+          [[ "$WANT" == "$GOT" ]] || { echo "sha256 不符"; exit 1; }
+          tar xzf a.tar.gz && rm -f a.tar.gz
+          SRC=$(find . -maxdepth 1 -type d -name 'amice-android-ndk-*' | head -1)
+          mv "$SRC"/* . && rmdir "$SRC"
+          echo "OK: 解压完成"
+
       - name: 打包（静态库形态）
+        env:
+          OBFUSCATE: ${{ inputs.obfuscate }}
         run: |
           # 发的是 .a 形态：只给头文件 + Python 工具 + 双 ABI libnox.a，
           # 不给 C 源码。脚本内部会先交叉编译再打包，一条命令走完。
+          #
+          # 勾了 obfuscate → 设 AMICE_BUNDLE，脚本会用 bundle 的 NDK +
+          #   -fpass-plugin 编译，产出的 .a 里解密链 3 函数已混淆。
+          # 不勾 → AMICE_BUNDLE 为空，普通编译（行为与改动前一致）。
+          if [[ "${OBFUSCATE:-false}" == "true" ]]; then
+            export AMICE_BUNDLE="$HOME/amice-bundle"
+            echo "混淆已启用: $AMICE_BUNDLE"
+          else
+            echo "普通编译（无混淆）"
+          fi
           chmod +x scripts/make-zip-lib.sh
           ./scripts/make-zip-lib.sh "${{ steps.ver.outputs.version }}"
 
