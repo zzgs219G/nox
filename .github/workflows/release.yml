@@ -370,11 +370,16 @@ jobs:
           PLUGIN="$HOME/amice-bundle/amice/lib/libamice.so"
           PROFILE="$PWD/scripts/so-guard/vmp-profile-func"
 
+          # ⚠️ 编译参数必须与 make-zip-lib.sh 的 $CFLAGS 完全一致，
+          #    尤其 -ffunction-sections -fdata-sections —— 少了它们
+          #    VMP 无法为每个函数生成独立段，VM 子段数会是 0
+          #    （实测踩过：诊断里漏了这两个参数，误判成"VMP 没生效"）。
           echo "════════ 关键一：VMP 对每个函数的决策 ════════"
           RUST_LOG=amice=debug AMICE_VM_VIRTUALIZE=true \
             AMICE_VM_PROFILE_PATH="$PROFILE" \
-            "$CC" -c -fPIC -Oz -DNC_GUARD_SECTIONED -I scripts/so-guard \
-            -fpass-plugin="$PLUGIN" \
+            "$CC" -c -fPIC -fvisibility=hidden -fno-ident -Oz \
+            -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED \
+            -I scripts/so-guard -fpass-plugin="$PLUGIN" \
             scripts/so-guard/nc_guard_crypto.c -o /tmp/crypto.o 2>&1 \
             | grep -iE 'VmVirtualize|skip|virtualiz' | head -60 || true
 
