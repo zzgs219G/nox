@@ -1501,25 +1501,8 @@ void ncg_wipe(void *p, size_t n) {
 #define NC_CTR_DOM_HEAD    0x01
 #define NC_CTR_DOM_HEADRO  0x02
 
-__attribute__((noinline))
-void ncg_ctr_xor(const uint8_t k[16], uint8_t dom,
-                        uint8_t *buf, uint32_t len) {
-    uint8_t msg[21], ks[32];
-    memcpy(msg, k, 16);
-    msg[16] = dom;
-    for (uint32_t off = 0, ctr = 0; off < len; off += 32, ctr++) {
-        msg[17] = (uint8_t)ctr;
-        msg[18] = (uint8_t)(ctr >> 8);
-        msg[19] = (uint8_t)(ctr >> 16);
-        msg[20] = (uint8_t)(ctr >> 24);
-        ksha256(msg, 21, ks);
-        uint32_t n = (len - off > 32) ? 32 : (len - off);
-        for (uint32_t j = 0; j < n; j++) buf[off + j] ^= ks[j];
-    }
-    /* 密钥材料用完即毁（同 ncg_wipe 纪律：memset 会被优化掉） */
-    ncg_wipe(msg, sizeof msg);
-    ncg_wipe(ks, sizeof ks);
-}
+/* ncg_ctr_xor 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
+
 
 /* ── ncguard_stub_recover 已拆到 nc_guard_crypto.c（2026-11-06）──────
  *

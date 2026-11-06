@@ -563,3 +563,29 @@ void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
  *    窗口内，编译器不得缓存/重排。 */
 volatile uint8_t *ncg_head_live;
 volatile uint32_t ncg_head_live_len;
+
+/* ── SHA-256-CTR 解密（报告 0x402f8 decodeBits）─────────────────────
+ * 2026-11-06 从 nc_guard_boot.c 迁入，随本文件被 VMP 覆盖。
+ * ⚠️ 它此前迁入过一次，CI 的 V7 崩了（执行结果空），当时回滚。
+ *    现在做诊断实验：先迁入，用 vmp-diag job 看 VMP 是跳过还是生成
+ *    错误代码 —— 两种情况的修法完全不同。
+ */
+__attribute__((noinline))
+void ncg_ctr_xor(const uint8_t k[16], uint8_t dom,
+                        uint8_t *buf, uint32_t len) {
+    uint8_t msg[21], ks[32];
+    memcpy(msg, k, 16);
+    msg[16] = dom;
+    for (uint32_t off = 0, ctr = 0; off < len; off += 32, ctr++) {
+        msg[17] = (uint8_t)ctr;
+        msg[18] = (uint8_t)(ctr >> 8);
+        msg[19] = (uint8_t)(ctr >> 16);
+        msg[20] = (uint8_t)(ctr >> 24);
+        ksha256(msg, 21, ks);
+        uint32_t n = (len - off > 32) ? 32 : (len - off);
+        for (uint32_t j = 0; j < n; j++) buf[off + j] ^= ks[j];
+    }
+    /* 密钥材料用完即毁（同 ncg_wipe 纪律：memset 会被优化掉） */
+    ncg_wipe(msg, sizeof msg);
+    ncg_wipe(ks, sizeof ks);
+}

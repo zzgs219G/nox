@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      vmp_diag:
+        description: '【诊断】只编 nc_guard_crypto.c 并打印 Amice 的 VMP 决策日志，不出包'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write    # 创建 Release 需要
@@ -313,6 +318,84 @@ jobs:
           path: |
             dist/*.zip
             dist/SHA256SUMS.txt
+
+  # ── 诊断 job：只编 nc_guard_crypto.c，打印 Amice 的 VMP 决策 ──────
+  # 用途（2026-11-06 加）：确认某个函数迁入 nc_guard_crypto.c 后，
+  # VMP 到底是【跳过】还是【生成了错误代码】。两种情况的排查方向
+  # 完全不同，而不看 Amice 自己的 debug 日志无法区分。
+  #
+  # 背景：ncg_ctr_xor 迁入后 CI 的 V7 崩（执行结果空），本地 clang 21
+  # 不复现。盲试了两轮都没定位，所以加这个诊断入口，一次看清。
+  #
+  # 只在手动触发且勾 vmp_diag 时跑，不影响正常发版。
+  vmp-diag:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' && inputs.vmp_diag
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang binutils python3 curl unzip
+
+      - name: 取 Amice bundle
+        uses: actions/cache@v4
+        with:
+          path: ~/amice-bundle
+          key: amice-r29-v0.1.6-beta.1
+
+      - name: 下载 Amice bundle
+        run: |
+          set -euo pipefail
+          if [[ -f ~/amice-bundle/amice/lib/libamice.so ]]; then
+            echo "OK: cache 命中"; exit 0
+          fi
+          mkdir -p ~/amice-bundle && cd ~/amice-bundle
+          URL=https://github.com/fuqiuluo/amice/releases/download/v0.1.6-beta.1/amice-android-ndk-r29-linux-x86_64.tar.gz
+          curl -fL --retry 3 -o a.tar.gz "$URL"
+          curl -fsSL -o a.sha256 "$URL.sha256"
+          WANT=$(awk '{print $1}' a.sha256); GOT=$(sha256sum a.tar.gz | awk '{print $1}')
+          [[ "$WANT" == "$GOT" ]] || { echo "sha256 不符"; exit 1; }
+          tar xzf a.tar.gz && rm -f a.tar.gz
+          SRC=$(find . -maxdepth 1 -type d -name 'amice-android-ndk-*' | head -1)
+          mv "$SRC"/* . && rmdir "$SRC"
+
+      - name: 编译 nc_guard_crypto.c 并抓 VMP 决策日志
+        run: |
+          set -euo pipefail
+          NDK=$(find ~/amice-bundle -maxdepth 1 -type d -name 'android-ndk-*' | head -1)
+          CC=$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang | head -1)
+          export LD_LIBRARY_PATH="$HOME/amice-bundle/amice/llvm-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PLUGIN="$HOME/amice-bundle/amice/lib/libamice.so"
+          PROFILE="$PWD/scripts/so-guard/vmp-profile-func"
+
+          echo "════════ 关键一：VMP 对每个函数的决策 ════════"
+          RUST_LOG=amice=debug AMICE_VM_VIRTUALIZE=true \
+            AMICE_VM_PROFILE_PATH="$PROFILE" \
+            "$CC" -c -fPIC -Oz -DNC_GUARD_SECTIONED -I scripts/so-guard \
+            -fpass-plugin="$PLUGIN" \
+            scripts/so-guard/nc_guard_crypto.c -o /tmp/crypto.o 2>&1 \
+            | grep -iE 'VmVirtualize|skip|virtualiz' | head -60 || true
+
+          echo ""
+          echo "════════ 关键二：VM 子段数（>0 = 至少生成了一套）════════"
+          readelf -SW /tmp/crypto.o | grep -c 'L\.L__' || true
+
+          echo ""
+          echo "════════ 关键三：各函数是否变成 VM 包装 ════════"
+          for fn in ncg_boot_key ncguard_stub_recover ncguard_derive_kstub \
+                    ncguard_head_mac_ok ncguard_head_decrypt ncguard_headro_unlock \
+                    ncg_magic_ok ncg_rd32 ncg_ctr_xor ncg_self_pkg \
+                    ncg_find_apk_path ncg_pkg_fault; do
+            n=$(llvm-objdump -d --disassemble-symbols=$fn /tmp/crypto.o 2>/dev/null \
+                | grep -cE '^\s+[0-9a-f]+:' || echo 0)
+            # VM 包装的特征：有 sub sp,sp,#0xc0 且指令数很少
+            frame=$(llvm-objdump -d --disassemble-symbols=$fn /tmp/crypto.o 2>/dev/null \
+                    | grep -c 'sub.*sp, sp, #0xc0' || echo 0)
+            printf "  %-26s %4s 条指令  VM帧=%s %s\n" "$fn" "$n" "$frame" \
+              "$([ "$frame" != "0" ] && echo '← VMP 包装' || echo '← 明文！')"
+          done
 
   # ── 第三关：发布 ────────────────────────────────────────────────
   release:
