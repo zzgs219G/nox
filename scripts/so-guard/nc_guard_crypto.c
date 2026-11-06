@@ -400,3 +400,54 @@ void ncguard_stub_recover(const char *so_path, uintptr_t base) {
     ncg_wipe(slot, sizeof(slot));
     recovered = 1;
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 第三部分：解密链基础函数（2026-11-06 从 boot.c 迁入，为 VMP 覆盖）
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 依据：docs/so逆向文档/ 的零信息逆向报告 §5.2 列出 10 个"明文、
+ * 零 CFF 分派头"的函数，逆向者靠它们读懂了架构。
+ *
+ * ⚠️ 只迁入【纯计算、不在解密关键路径】的：
+ *      ncg_magic_ok   报告 0x3f858  魔数比对
+ *      ncg_rd32       报告 0x3fc80  varint 读取
+ *
+ * ⚠️ 为什么没迁 ncg_ctr_xor（报告 0x402f8 decodeBits）：
+ *    它是解 .ncxh 的必需函数。实测把它迁入本文件后 CI 的 V7 崩了
+ *    （执行结果空，期望 153）——.ncxh 解不开 → ncg_head_unlock 执行
+ *    密文 → SIGILL。本地 clang 21 不复现，CI 的 clang 18 复现，
+ *    属跨编译器差异，未定位到具体指令。**先不迁，等能真机验证再说。**
+ *
+ * ⚠️ 迁入后必须仍在 .text（明文段）：stub 阶段 .ncxh 尚未解密时就要调用。
+ */
+
+/* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
+ * want 由 NC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
+ * ⚠️ 恒定时间不受影响：magic 不是秘密（攻击者能从密文段反推），
+ *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。
+ *
+ * ⚠️ 2026-10-20 修正口径：碎片密钥【不参与】本比较。
+ *    早期注释写"攻击者需先拿到碎片密钥才能看出它是 magic"——那是错的。
+ *    本函数只做 got[i] ^ seed[i] 累或，碎片密钥只在 ncg_xor_key() 里
+ *    用于恢复 k_stub/k_mac。真实收益仅一条：strings 搜不到 "NCKEYLOCK"/
+ *    "NCSTUBLK" 字面量。攻击者 dump 到 slot 前 8 字节即可直接比对。
+ *    （已删除的 ncg_eq8 是同一语义的前身，语义等价，勿再引入。）
+ *
+ * 历史：旧实现叫 ncg_eq8(got, "NCKEYLOCK")，-O2 下被内联进
+ *       ncguard_unlock（连同 ncg_rd32/XOR 循环，2026-10-18 实测约
+ *       200 行 / 736B，2026-10-20 复测 225 行）。2026-10-19 改种子形式后
+ *       ncg_eq8 已无调用方，
+ *       2026-10-20 删除（-Wall 报 unused function；删除前后 .text
+ *       section size 逐一相同，零字节影响）。 */
+int ncg_magic_ok(const volatile unsigned char *got,
+                        const uint8_t seed[8]) {
+    uint8_t diff = 0;
+    for (int i = 0; i < 8; i++) diff |= (uint8_t)(got[i] ^ seed[i]);
+    return diff == 0;
+}
+uint32_t ncg_rd32(const volatile unsigned char *p) {
+    uint32_t v = 0;
+    for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}

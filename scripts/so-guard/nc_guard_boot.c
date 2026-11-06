@@ -135,7 +135,7 @@
  *   使 T22 的二进制等价性验证失效。 */
 static const uint8_t NCG_MAGIC_SEED_SLOT[8] = NC_SEED_SLOT_INIT;
 static const uint8_t NCG_MAGIC_SEED_STUB[8] = NC_SEED_STUB_INIT;
-static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
+int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
 
 /* 不可优化的清零（实现在第二部分 .text）。前向声明：密钥清零调用点
  * 在 .ncxh 段的 ncg_head_unlock 里，而本函数在 .text —— 两侧都必须能
@@ -1515,35 +1515,10 @@ static void ncg_baseline_init(uint8_t *const *addrs, const uint32_t *sizes,
  * stub（ncg_stub_recover）解出 .ncxh 后把明文区间写这里，
  * ncg_head_unlock 完成使命后按它自毁。 */
 
-/* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
- * want 由 NC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
- * ⚠️ 恒定时间不受影响：magic 不是秘密（攻击者能从密文段反推），
- *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。
- *
- * ⚠️ 2026-10-20 修正口径：碎片密钥【不参与】本比较。
- *    早期注释写"攻击者需先拿到碎片密钥才能看出它是 magic"——那是错的。
- *    本函数只做 got[i] ^ seed[i] 累或，碎片密钥只在 ncg_xor_key() 里
- *    用于恢复 k_stub/k_mac。真实收益仅一条：strings 搜不到 "NCKEYLOCK"/
- *    "NCSTUBLK" 字面量。攻击者 dump 到 slot 前 8 字节即可直接比对。
- *    （已删除的 ncg_eq8 是同一语义的前身，语义等价，勿再引入。）
- *
- * 历史：旧实现叫 ncg_eq8(got, "NCKEYLOCK")，-O2 下被内联进
- *       ncguard_unlock（连同 ncg_rd32/XOR 循环，2026-10-18 实测约
- *       200 行 / 736B，2026-10-20 复测 225 行）。2026-10-19 改种子形式后
- *       ncg_eq8 已无调用方，
- *       2026-10-20 删除（-Wall 报 unused function；删除前后 .text
- *       section size 逐一相同，零字节影响）。 */
-static int ncg_magic_ok(const volatile unsigned char *got,
-                        const uint8_t seed[8]) {
-    uint8_t diff = 0;
-    for (int i = 0; i < 8; i++) diff |= (uint8_t)(got[i] ^ seed[i]);
-    return diff == 0;
-}
-uint32_t ncg_rd32(const volatile unsigned char *p) {
-    uint32_t v = 0;
-    for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
+/* ncg_magic_ok 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
+
+/* ncg_rd32 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
+
 
 /* ── 不可优化的清零（2026-10-22）──────────────────────────────────────
  * 为什么不能直接用 memset：编译器有权删除"死存储"——当它判定某块栈内存

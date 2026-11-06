@@ -106,5 +106,16 @@ void ncg_xor_key(const volatile uint8_t *slot, uint8_t out[8]);
  * out 至少 10 字节；返回长度（不含 NUL），0 = 参数错误。 */
 size_t ncg_label_boot(uint8_t *out, size_t cap);
 
+
+/* ── 迁入 nc_guard_crypto.c 的解密链基础函数（2026-11-06）────────────
+ * 报告 §5.2 点名的"明文函数"，逆向者靠它们读懂架构。迁入后随 crypto.c
+ * 一起被 VMP 覆盖。⚠️ 仍必须在 .text（明文）：stub 阶段就要调用。 */
+
+/* 魔数比对（报告 0x3f858）。返回 1 = 匹配（已锁箱）。 */
+int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
+
+/* 小端读 32 位（报告 0x3fc80）。 */
+uint32_t ncg_rd32(const volatile unsigned char *p);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */
 
