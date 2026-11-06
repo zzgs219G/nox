@@ -138,7 +138,33 @@ for abi in arm64-v8a armeabi-v7a; do
             *) _vmp=0 ;;
         esac
         if [[ "$_vmp" == "1" && -n "${AMICE_BUNDLE:-}" ]]; then
-            AMICE_VM_VIRTUALIZE=true "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+            # ── VMP profile 选择（2026-11-06）──────────────────────────
+            # 默认用本仓库自带的 nox-vmp-func（= 官方 ruoke 示例同款配置）：
+            #   runtime.scope = func          每函数独立分派运行时
+            #   handler_clone = func          每函数独立 handler 副本
+            # 而不是 Amice 内置的 amice-simple-vmp（module 级共享）——
+            # 后者让 6~7 个受保护函数共用一套解释器/opcode 编码，
+            # 攻击者逆一次 VM 语义就能读全部，成本不是 ×N 而是 ×1。
+            #
+            # ⚠️ 为什么用 AMICE_VM_PROFILE_PATH 而不是 annotate("vm_profile=...")：
+            #    annotate 会与 VMP 自身的地址引用检查冲突（本文件上方已说明
+            #    两者互斥），所以只能走环境变量这条路。
+            # ⚠️ 关掉 nox-vmp-func 的办法：设 AMICE_VMP_PROFILE=simple
+            #    回退到内置 profile（体积小一半，但失去函数级隔离）。
+            _vmpprof="${AMICE_VMP_PROFILE:-func}"
+            if [[ "$_vmpprof" == "func" ]]; then
+                _profdir="$GUARD/vmp-profile-func"
+                [[ -f "$_profdir/manifest.toml" ]] || {
+                    echo "✗ VMP profile 缺失: $_profdir/manifest.toml" >&2
+                    echo "  该目录是函数级隔离的配置源，缺了会静默退回 module 共享" >&2
+                    echo "  如需回退：AMICE_VMP_PROFILE=simple" >&2
+                    exit 1
+                }
+                AMICE_VM_VIRTUALIZE=true AMICE_VM_PROFILE_PATH="$_profdir" \
+                    "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+            else
+                AMICE_VM_VIRTUALIZE=true "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+            fi
         else
             "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
         fi
@@ -169,6 +195,15 @@ chmod +x "$STAGE/nox"
 #    放错层级 = 链接期找不到 = 空壳 so。
 mkdir -p "$STAGE/so-guard/lib"
 cp scripts/so-guard/*.h scripts/so-guard/*.py "$STAGE/so-guard/"
+# VMP profile（2026-11-06）：函数级隔离的配置源。
+# ⚠️ 必须随包发：消费方的源码形态若自己开混淆（protect.sh 的 AMICE_BUNDLE
+#    分支）需要它；且 amice bundle 里【不含】profile 源码（profile 是编进
+#    libamice.so 的），所以只能我们提供。
+# ⚠️ 体积 628 KB（isa.vm 184K + lowering.vm 420K），压完约 60 KB。
+#    不能省：缺了它 make-zip-lib.sh 会 fail-fast（见 VMP 分支的检查）。
+if [ -d scripts/so-guard/vmp-profile-func ]; then
+    cp -R scripts/so-guard/vmp-profile-func "$STAGE/so-guard/"
+fi
 rm -rf "$STAGE/so-guard/__pycache__"
 cp -R "$LIBROOT"/arm64-v8a "$LIBROOT"/armeabi-v7a "$STAGE/so-guard/lib/"
 

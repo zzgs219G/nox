@@ -1,0 +1,52 @@
+registers { # 声明 VMPDesign 要求的固定 VM 寄存器模型
+  bank x range x0..x31 type u64 # x0 到 x31 保存整数和指针类 VM 值
+  bank q range q0..q64 type v128 # q0 到 q64 是固定宽寄存器组，当前配置通过策略禁止宽值降低
+  q.lowering = disabled # 当前内置配置包明确禁用 q 寄存器降低
+  alias lr = x30 # lr 是 abi.vm 使用的 VM 链接寄存器别名
+  alias sp = x31 # sp 是 VM 栈或基址指针别名
+} # 结束寄存器模型声明
+
+control_state { # 声明独立于通用寄存器组的控制状态
+  pc: label # pc 保存当前解码后的字节码指令索引
+  flags: u64 # flags 保存配置可见的条件状态
+} # 结束控制状态声明
+
+# ═══ 本仓库唯一改动（2026-11-06）═══════════════════════════════════
+# 由 amice-simple-vmp 复制而来，只改了下述三项。原因：
+#   simple-vmp 是 module 级共享运行时 —— 本设施有 6~7 个受保护函数，
+#   它们共用同一套解释器/opcode 编码/寄存器映射。攻击者只要逆一次 VM
+#   语义，全部函数都能读（成本不是 ×N 而是 ×1）。
+# 改成函数级后：每个函数派生独立的 bytecode key、opcode 别名选择和
+#   handler 克隆，破一个只能读一个。
+#
+# 三项改动（其余与 upstream amice-simple-vmp 逐字节相同）：
+#   runtime.scope        module  → func
+#   （runtime.entry 保持 call —— 见下方说明）
+#   enhance handler_clone disabled → func
+#
+# ⚠️ 为什么没改 entry=inline（本想改，先撤了）：
+#    inline 能消除每个函数体里的 `bl <dispatcher>` 明路标，收益明确。
+#    但官方唯一的 func-scope 示例（amice-vm/profiles/ruoke）用的仍是
+#    entry=call，inline + func scope 这个组合【没有任何先例或测试】。
+#    在拿不到 Amice 源码离线验证的环境里，盲配一个未经组合验证的选项
+#    风险不划算 —— 一旦 verifier 拒绝或生成错误 IR，整条发版链就断。
+#    先用官方验证过的 scope=func + handler_clone=func（= ruoke 同款），
+#    inline 等后续单独用一次 CI 试。
+# ⚠️ 代价：体积显著上涨（每个函数一套运行时），编译变慢。
+#    实测数据见 docs/流程文档.md 4.3 节。
+# ⚠️ threaded_dispatch / indirect_branch_dispatch 仍保持 disabled：
+#    这两个 Amice 当前 emitter 未实现，verifier 会直接拒绝
+#    （crates/amice-vm/src/verify.rs:849）。不是我们保守。
+runtime.scope = func # 每个被保护函数生成独立分派运行时（本仓库改动①）
+runtime.entry = call # ⚠️ 暂不改 inline：官方 ruoke 示例用的是 call，inline 配 func scope 无先例（本仓库改动②已回退）
+polymorph.scope = func # 每个被保护函数独立派生 key、opcode 选择和 handler 克隆后缀
+runtime.emit_markers = false # 生产默认不生成 AMICEVMP、AMICE_VMP_RUNTIME_BYTECODE 和 .amice.vm.meta 调试 marker
+
+dispatch = switch # 生成的运行时通过 LLVM switch 分派处理器
+
+enhance threaded_dispatch = disabled # 当前内置配置包不启用 threaded dispatch
+enhance indirect_branch_dispatch = disabled # 当前内置配置包不启用 indirect branch dispatch
+enhance handler_splitting = enabled # 运行时将每个处理器拆成入口块和执行块以增加控制流形态
+enhance handler_order_shuffle = enabled # 分派器中的处理器块按配置包和函数名派生顺序打散
+enhance opcode_alias = enabled # 编码器允许对同一语义的多个操作码别名按函数选择
+enhance handler_clone = func # 每函数独立 handler 克隆，破除跨函数指纹复用（本仓库改动③）

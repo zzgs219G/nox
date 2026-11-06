@@ -1,0 +1,15 @@
+version = 1 # AMICE VMP 接受的配置包格式版本
+name = "nox-vmp-func" # 本仓库自用：函数级独立运行时（见 runtime.vm 头注释）
+
+[target] # 校验器检查的目标约束
+pointer_bits = 64
+endian = "little"
+
+[profile] # 各个配置 DSL 片段的入口文件
+
+abi = "abi.vm"
+isa = "isa.vm"
+lowering = "lowering.vm"
+bytecode = "bytecode.vm"
+decoder = "decoder.vm"
+runtime = "runtime.vm"
