@@ -1778,3 +1778,55 @@ __attribute__((constructor(50)))
 static void ncg_boot_init(void) {
     (void) ncguard_unlock();
 }
+
+/* maps 扫描子函数（2026-11-06 从 ncg_find_apk_path 拆出）。
+ * 为什么拆：主函数有 17 个基本块、5 个 phi，VMP 实测报
+ *     skip function "ncg_find_apk_path": values=22
+ *     VM x-register budget exceeded
+ * phi 会被 translator 固定到 VM 寄存器贯穿全函数，是压力主因。
+ * 拆出扫描循环后主函数只剩线性调度，压力大降。
+ *
+ * ⚠️ noinline 不可省（-Oz 会内联回去，拆分失效）。 */
+__attribute__((noinline))
+int ncg_scan_maps_for_base_apk(const char *maps_path,
+                                      char *out, size_t cap) {
+    int fd = open(maps_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    /* maps 可能上百 KB，按块读，逐行拼装。
+     * buf 只是【读块】，line 才累积一行 —— 换行符跨块时 ll 继续累积，
+     * 所以 buf 小于 line 不影响正确性。 */
+    static char buf[512];
+    char line[600];
+    size_t ll = 0;
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n') {
+                line[ll] = 0;
+                ll = 0;
+                const char *p = strstr(line, "base.apk");
+                if (p) {
+                    /* 行格式：addr perms offset dev inode  path
+                     * 路径从第一个 '/' 开始 */
+                    const char *sl = strchr(line, '/');
+                    if (sl && sl <= p) {
+                        size_t l = (size_t)(p - sl) + 8;   /* 含 "base.apk" */
+                        if (l < cap) {
+                            memcpy(out, sl, l);
+                            out[l] = 0;
+                            close(fd);
+                            return 0;
+                        }
+                    }
+                }
+            } else if (ll + 1 < sizeof(line)) {
+                line[ll++] = c;
+            }
+        }
+    }
+    close(fd);
+    return -1;
+}
+

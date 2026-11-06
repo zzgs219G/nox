@@ -383,19 +383,22 @@ jobs:
           readelf -SW /tmp/crypto.o | grep -c 'L\.L__' || true
 
           echo ""
-          echo "════════ 关键三：各函数是否变成 VM 包装 ════════"
-          for fn in ncg_boot_key ncguard_stub_recover ncguard_derive_kstub \
-                    ncguard_head_mac_ok ncguard_head_decrypt ncguard_headro_unlock \
-                    ncg_magic_ok ncg_rd32 ncg_ctr_xor ncg_self_pkg \
-                    ncg_find_apk_path ncg_pkg_fault; do
-            n=$(llvm-objdump -d --disassemble-symbols=$fn /tmp/crypto.o 2>/dev/null \
-                | grep -cE '^\s+[0-9a-f]+:' || echo 0)
-            # VM 包装的特征：有 sub sp,sp,#0xc0 且指令数很少
-            frame=$(llvm-objdump -d --disassemble-symbols=$fn /tmp/crypto.o 2>/dev/null \
-                    | grep -c 'sub.*sp, sp, #0xc0' || echo 0)
-            printf "  %-26s %4s 条指令  VM帧=%s %s\n" "$fn" "$n" "$frame" \
-              "$([ "$frame" != "0" ] && echo '← VMP 包装' || echo '← 明文！')"
-          done
+          echo "════════ 关键三：每个符号所在段（.text.<fn> = 已虚拟化）════════"
+          # ⚠️ 不用 llvm-objdump --disassemble-symbols：实测在 CI 的 Ubuntu
+          #    工具链上对含大量自定义段的 .o 会返回空（v0.9.9 产物明明有
+          #    200 个 VM 子段，这里却全 0）。改用 readelf 列符号表，
+          #    规律：VMP 虚拟化后函数体被搬走，符号只剩一个薄包装，
+          #    且会出现 .text.<fn> 这样的独立段。
+          readelf -sW /tmp/crypto.o | awk '$4=="FUNC" && $8!="" {print $8}' \
+            | grep -v '\.' | sort -u > /tmp/fns.txt || true
+          echo "  crypto.o 里的函数符号:"
+          sed 's/^/    /' /tmp/fns.txt
+          echo ""
+          echo "  VM 子段（.text..L.L__* / .rodata..L.L__*）:"
+          readelf -SW /tmp/crypto.o | grep -o '\.\(text\|rodata\)\.\.L\.L__[0-9a-f]*' \
+            | sort -u | head -20
+          echo ""
+          echo "  合计 VM 子段: $(readelf -SW /tmp/crypto.o | grep -c 'L\.L__')"
 
   # ── 第三关：发布 ────────────────────────────────────────────────
   release:

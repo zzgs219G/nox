@@ -488,65 +488,29 @@ int ncg_self_pkg(char *out, size_t cap) {
     memset(buf, 0, sizeof(buf));
     return 0;
 }
+/* maps 扫描子函数已移到 nc_guard_boot.c（2026-11-06）。
+ * 为什么移走：它有 13 个基本块 / 6 个 phi，VMP 会尝试虚拟化它并因
+ * 寄存器预算超限而报警（phi 被固定到 VM 寄存器贯穿全函数）。
+ * 放回非 VMP 的 boot.c 后 VMP 根本不会看它 —— 与"整文件不虚拟化"
+ * 同样的效果，但保留了 ncg_find_apk_path 本身可被 VMP 覆盖。 */
+
+/* 定位自身 APK 路径：先扫 /proc/self/maps，再按 so 路径反推。
+ * ⚠️ 必须在 .text（明文）：stub 阶段就要用它读证书。 */
 int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
     const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
-    int fd = _mp ? open(_mp, O_RDONLY) : -1;
-    if (fd >= 0) {
-        /* maps 可能上百 KB，按块读，逐行拼装。
-         * ⚠️ 2026-11-06 从 8192 降到 512：为让本函数能过 VMP 寄存器预算。
-         * 安全性：maps 的行格式是 "addr perms offset dev inode  path"，
-         * 单行长度上限由内核控制（PATH_MAX=4096 是路径上限，但 maps 里
-         * 的实际路径是 APK 路径，通常 <200 字节）。
-         * ⚠️ 关键：下面用 line[600] 累积，buf 只是【读块】——
-         *    读块大小不影响正确性，因为换行符跨块时 ll 会继续累积。
-         *    512 < 600 仍能让单行跨块拼接，逻辑不变。 */
-        static char buf[512];
-        ssize_t n;
-        char line[600];
-        size_t ll = 0;
-        while ((n = read(fd, buf, sizeof(buf))) > 0) {
-            for (ssize_t i = 0; i < n; i++) {
-                char c = buf[i];
-                if (c == '\n') {
-                    line[ll] = 0;
-                    ll = 0;
-                    const char *p = strstr(line, "base.apk");
-                    if (p) {
-                        /* 行格式：addr perms offset dev inode  path
-                         * 路径从第一个 '/' 开始 */
-                        const char *s = strchr(line, '/');
-                        if (s && s <= p) {
-                            size_t l = (size_t)(p - s) + 8;   /* 含 "base.apk" */
-                            if (l < cap) {
-                                memcpy(out, s, l);
-                                out[l] = 0;
-                                close(fd);
-                                return 0;
-                            }
-                        }
-                    }
-                } else if (ll + 1 < sizeof(line)) {
-                    line[ll++] = c;
-                }
-            }
-        }
-        close(fd);
-    }
+    if (_mp && ncg_scan_maps_for_base_apk(_mp, out, cap) == 0) return 0;
 
-    /* ② 从 so 路径反推：.../lib/arm64-v8a/libnc.so → .../base.apk */
+    /* 回退：从 so 路径反推 .../lib/<abi>/libnc.so → .../base.apk */
     const char *lib = strstr(so_path, "/lib/");
-    if (lib) {
-        size_t dirlen = (size_t)(lib - so_path);
-        const char *base = "/base.apk";
-        size_t bl = strlen(base);
-        if (dirlen + bl < cap) {
-            memcpy(out, so_path, dirlen);
-            memcpy(out + dirlen, base, bl + 1);
-            return 0;
-        }
-    }
-    return -1;
+    if (!lib) return -1;
+    size_t dirlen = (size_t)(lib - so_path);
+    static const char kBase[] = "/base.apk";
+    size_t bl = sizeof(kBase) - 1;
+    if (dirlen + bl >= cap) return -1;
+    memcpy(out, so_path, dirlen);
+    memcpy(out + dirlen, kBase, bl + 1);
+    return 0;
 }
 void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
                           uint8_t fault[8]) {

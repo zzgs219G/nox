@@ -131,5 +131,10 @@ int ncg_find_apk_path(const char *so_path, char *out, size_t cap);
 /* 包名指纹偏差（全 0 = 匹配）。刻意返回偏差而非 bool，避免可 patch 的判定点。 */
 void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg, uint8_t fault[8]);
 
+/* 扫 /proc/self/maps 找 base.apk 路径（定义在 nc_guard_boot.c）。
+ * ⚠️ 刻意放在【非 VMP 文件】：它有 13 个基本块 / 6 个 phi，
+ *    在 VMP 文件里会因寄存器预算超限被跳过并刷告警日志。 */
+int ncg_scan_maps_for_base_apk(const char *maps_path, char *out, size_t cap);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */
 
