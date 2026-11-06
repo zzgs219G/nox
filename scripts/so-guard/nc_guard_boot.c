@@ -749,24 +749,8 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
  * 主进程能通过指纹校验、子进程全部 fail-closed(-12) → 正常功能挂掉。
  * 这里统一截到第一个 ':' 之前，与 AndroidManifest 的 package 对齐。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_self_pkg(char *out, size_t cap) {
-    char _cb[24];
-    const char *_cp = ncg_path_s(NCG_PATH_CMDLINE, _cb, sizeof(_cb));
-    int fd = _cp ? open(_cp, O_RDONLY) : -1;
-    if (fd < 0) return -1;
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    buf[n] = 0;
-    char *colon = strchr(buf, ':');
-    if (colon) *colon = 0;
-    size_t l = strlen(buf);
-    if (l == 0 || l >= cap) return -1;
-    memcpy(out, buf, l + 1);
-    memset(buf, 0, sizeof(buf));
-    return 0;
-}
+/* ncg_self_pkg 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
+
 
 /* 包名指纹：把构建期写入 slot[NC_OFF_PKG_SHA] 的 8 字节与运行期算出的
  * SHA256(包名)[:8] 做【异或，并返回该偏差】——不是返回 bool。
@@ -789,14 +773,8 @@ static int ncg_self_pkg(char *out, size_t cap) {
  * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。存指纹而非明文包名
  * 的理由：明文会暴露"密钥与包名有关"这条线索，而 slot 是明文段。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
-                          uint8_t fault[8]) {
-    const uint8_t *want = slotdata + NC_OFF_PKG_SHA;
-    uint8_t h[32];
-    ksha256((const uint8_t *)pkg, strlen(pkg), h);
-    for (int i = 0; i < 8; i++) fault[i] = (uint8_t)(h[i] ^ want[i]);
-    ncg_wipe(h, sizeof(h));
-}
+/* ncg_pkg_fault 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
+
 
 /* ── 反多开：APK 路径白名单（2026-11-02，对齐 Epic report §2.4）────────
  *
@@ -937,64 +915,17 @@ static void ncg_apk_path_fault(const char *apk_path, uint8_t fault[8]) {
  * 与 sig_check.c:find_apk_path() 同思路，但不复用它——那是冻结模块，
  * 且这里在密文段里，必须自包含。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
-    char _mb[24];
-    const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
-    int fd = _mp ? open(_mp, O_RDONLY) : -1;
-    if (fd >= 0) {
-        /* maps 可能上百 KB，按块读，逐行拼装 */
-        static char buf[8192];
-        ssize_t n;
-        char line[600];
-        size_t ll = 0;
-        while ((n = read(fd, buf, sizeof(buf))) > 0) {
-            for (ssize_t i = 0; i < n; i++) {
-                char c = buf[i];
-                if (c == '\n') {
-                    line[ll] = 0;
-                    ll = 0;
-                    const char *p = strstr(line, "base.apk");
-                    if (p) {
-                        /* 行格式：addr perms offset dev inode  path
-                         * 路径从第一个 '/' 开始 */
-                        const char *s = strchr(line, '/');
-                        if (s && s <= p) {
-                            size_t l = (size_t)(p - s) + 8;   /* 含 "base.apk" */
-                            if (l < cap) {
-                                memcpy(out, s, l);
-                                out[l] = 0;
-                                close(fd);
-                                return 0;
-                            }
-                        }
-                    }
-                } else if (ll + 1 < sizeof(line)) {
-                    line[ll++] = c;
-                }
-            }
-        }
-        close(fd);
-    }
-
-    /* ② 从 so 路径反推：.../lib/arm64-v8a/libnc.so → .../base.apk */
-    const char *lib = strstr(so_path, "/lib/");
-    if (lib) {
-        size_t dirlen = (size_t)(lib - so_path);
-        const char *base = "/base.apk";
-        size_t bl = strlen(base);
-        if (dirlen + bl < cap) {
-            memcpy(out, so_path, dirlen);
-            memcpy(out + dirlen, base, bl + 1);
-            return 0;
-        }
-    }
-    return -1;
-}
+/* ncg_find_apk_path 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
 
 
-/* 用后即毁交接区（定义在第二部分，stub 解密后写、此处读）——前向声明 */
-volatile uint8_t *ncg_head_live;
-volatile uint32_t ncg_head_live_len;
+
+/* 用后即毁交接区 —— 定义已移到 nc_guard_crypto.c（2026-11-06）。
+ * ⚠️ 为什么不能定义在本文件：本文件混有 .ncxh（AXR 可执行）段的函数，
+ * 无段属性的全局变量会被 clang 归到「当前段」，与 ncg_rc4 冲突并报
+ *     'ncg_head_live' causes a section type conflict with 'ncg_rc4'
+ * 这是 AGENTS.md §2.2 记的老坑（数据不能进 AXR 段）。
+ * 挪到 crypto.c（该文件无 AXR 段，两个变量会进通常的 .bss/.data）。
+ * 声明见 nc_guard_internal.h。 */
 
 /* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。

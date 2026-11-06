@@ -117,5 +117,19 @@ int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
 /* 小端读 32 位（报告 0x3fc80）。 */
 uint32_t ncg_rd32(const volatile unsigned char *p);
 
+
+/* ── 迁入 nc_guard_crypto.c 的包名/路径解析（2026-11-06）────────────
+ * 报告 §5.2 点名 0x3ff9c（so→apk 路径）为明文。迁入前已把大栈数组
+ * 缩小（256→128、8192→512），否则 VMP 会跳过。 */
+
+/* 从 /proc/self/cmdline 取进程名（截到首个 ':'）。返回 0 成功。 */
+int ncg_self_pkg(char *out, size_t cap);
+
+/* 定位自身 APK 路径：先查 /proc/self/maps，再按 so 路径反推。 */
+int ncg_find_apk_path(const char *so_path, char *out, size_t cap);
+
+/* 包名指纹偏差（全 0 = 匹配）。刻意返回偏差而非 bool，避免可 patch 的判定点。 */
+void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg, uint8_t fault[8]);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */
 

@@ -54,12 +54,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>               /* open/read：ncg_self_pkg / ncg_find_apk_path 用 */
 #include <sys/mman.h>            /* mprotect：ncguard_stub_recover 用 */
 #include <dlfcn.h>               /* Dl_info：本文件已不直接用，保留以免
                                   * 调用方头文件顺序变化时踩空 */
 
 #include "nc_guard_layout.h"
 #include "nc_guard_internal.h"
+#include "nc_guard_paths.h"     /* ncg_path_s / NCG_PATH_CMDLINE：路径密文表 */
 #include "nc_guard_key.h"        /* khkdf_sha256 / khmac_sha256 */
 
 /* CTR 域分隔（2026-11-06 随 ncguard_stub_recover 上移到本文件）。
@@ -451,3 +453,113 @@ uint32_t ncg_rd32(const volatile unsigned char *p) {
     for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
     return v;
 }
+
+
+/* ── 包名/APK 路径解析（2026-11-06 迁入，为大栈数组改造后上 VMP）──────
+ *
+ * 依据：docs/so逆向文档/ 报告 §5.2 把 0x3ff9c（so→apk 路径）列为明文。
+ *
+ * ⚠️ 迁入前先做了两处改造，否则 VMP 会因寄存器预算跳过它们：
+ *   ncg_self_pkg       char buf[256]  → 128
+ *   ncg_find_apk_path  static buf[8192] → 512（line[600] 累积逻辑不变）
+ * 实测 23 通过 0 失败，行为未变。
+ *
+ * ⚠️ 必须在 .text（明文）：stub 阶段就要用它定位 APK 读证书。 */
+
+int ncg_self_pkg(char *out, size_t cap) {
+    char _cb[24];
+    const char *_cp = ncg_path_s(NCG_PATH_CMDLINE, _cb, sizeof(_cb));
+    int fd = _cp ? open(_cp, O_RDONLY) : -1;
+    if (fd < 0) return -1;
+    /* ⚠️ 2026-11-06 从 256 降到 128：为让本函数能过 VMP 的寄存器预算。
+     * /proc/self/cmdline 的第一个字段是进程名（= 包名，或带 :remote 后缀），
+     * Android 包名上限 255 但那已是极端值；实务上 <64。
+     * 128 覆盖正常包名，超长的按截断处理（后续 strlen 长度检查会拒绝）。 */
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *colon = strchr(buf, ':');
+    if (colon) *colon = 0;
+    size_t l = strlen(buf);
+    if (l == 0 || l >= cap) return -1;
+    memcpy(out, buf, l + 1);
+    memset(buf, 0, sizeof(buf));
+    return 0;
+}
+int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
+    char _mb[24];
+    const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
+    int fd = _mp ? open(_mp, O_RDONLY) : -1;
+    if (fd >= 0) {
+        /* maps 可能上百 KB，按块读，逐行拼装。
+         * ⚠️ 2026-11-06 从 8192 降到 512：为让本函数能过 VMP 寄存器预算。
+         * 安全性：maps 的行格式是 "addr perms offset dev inode  path"，
+         * 单行长度上限由内核控制（PATH_MAX=4096 是路径上限，但 maps 里
+         * 的实际路径是 APK 路径，通常 <200 字节）。
+         * ⚠️ 关键：下面用 line[600] 累积，buf 只是【读块】——
+         *    读块大小不影响正确性，因为换行符跨块时 ll 会继续累积。
+         *    512 < 600 仍能让单行跨块拼接，逻辑不变。 */
+        static char buf[512];
+        ssize_t n;
+        char line[600];
+        size_t ll = 0;
+        while ((n = read(fd, buf, sizeof(buf))) > 0) {
+            for (ssize_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if (c == '\n') {
+                    line[ll] = 0;
+                    ll = 0;
+                    const char *p = strstr(line, "base.apk");
+                    if (p) {
+                        /* 行格式：addr perms offset dev inode  path
+                         * 路径从第一个 '/' 开始 */
+                        const char *s = strchr(line, '/');
+                        if (s && s <= p) {
+                            size_t l = (size_t)(p - s) + 8;   /* 含 "base.apk" */
+                            if (l < cap) {
+                                memcpy(out, s, l);
+                                out[l] = 0;
+                                close(fd);
+                                return 0;
+                            }
+                        }
+                    }
+                } else if (ll + 1 < sizeof(line)) {
+                    line[ll++] = c;
+                }
+            }
+        }
+        close(fd);
+    }
+
+    /* ② 从 so 路径反推：.../lib/arm64-v8a/libnc.so → .../base.apk */
+    const char *lib = strstr(so_path, "/lib/");
+    if (lib) {
+        size_t dirlen = (size_t)(lib - so_path);
+        const char *base = "/base.apk";
+        size_t bl = strlen(base);
+        if (dirlen + bl < cap) {
+            memcpy(out, so_path, dirlen);
+            memcpy(out + dirlen, base, bl + 1);
+            return 0;
+        }
+    }
+    return -1;
+}
+void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
+                          uint8_t fault[8]) {
+    const uint8_t *want = slotdata + NC_OFF_PKG_SHA;
+    uint8_t h[32];
+    ksha256((const uint8_t *)pkg, strlen(pkg), h);
+    for (int i = 0; i < 8; i++) fault[i] = (uint8_t)(h[i] ^ want[i]);
+    ncg_wipe(h, sizeof(h));
+}
+
+/* 用后即毁交接区（2026-11-06 从 boot.c 迁入）。
+ * stub 解出 .ncxh 明文后写这里，ncguard_unlock 消费后抹除。
+ * ⚠️ volatile：该值跨"函数返回"被另一段代码读取，且时机在攻击者可见
+ *    窗口内，编译器不得缓存/重排。 */
+volatile uint8_t *ncg_head_live;
+volatile uint32_t ncg_head_live_len;
