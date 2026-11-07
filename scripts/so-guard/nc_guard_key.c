@@ -37,6 +37,12 @@
 #include <elf.h>
 
 #include "nc_guard_key.h"
+/* 2026-11-08：label 基值从 NC_BOOT_SALT_INIT 派生（见 ncg_label_key），
+ * 且 ncg_label_boot 用完要 ncg_wipe —— 两者分别来自这两个头。
+ * ⚠️ layout.h 是"零 include 零逻辑"的契约文件，引它不会带来循环依赖
+ *    （它自己不 include 任何东西）。internal.h 只声明 .text 里的函数。 */
+#include "nc_guard_layout.h"
+#include "nc_guard_internal.h"
 
 /* ── HKDF 域 label 的密文存储（2026-11-06，P0）────────────────────
  *
@@ -73,36 +79,113 @@
 #define NCGL_SO_R    10    /* "nc-so-r-v1" */
 #define NCGL_BOOT    10    /* "nc-boot-v1" */
 
-/* 存储序：enc[i] = label[i] ^ 0x5A
- * 生成方式（可复核，改表前用它校验）：
- *     printf '%s' "nc-so-v1" | od -An -tx1 | tr -d ' \n'
- *     → 6e632d736f2d7631   再逐字节 ^ 0x5A
+/* ── 2026-11-08：四张表各自独立基值（不再统一 0x5A）────────────────
+ *
+ * 修的是什么（实测发现，见 docs/so层防御/简盒样本验证报告-2026-11-08.md）：
+ *   原方案四张表全部 ^0x5A，且【在 .rodata 里连排】：
+ *       0x349e0: 34 39 77 29 35 77 2c 6b   → nc-so-v1
+ *       0x349e8: 34 39 77 29 35 77 37 3b   → nc-so-mac-v1
+ *       0x349f4: 34 39 77 29 35 77 28 77   → nc-so-r-v1
+ *       0x349fe: 34 39 77 38 35 35 2e 77   → nc-boot-v1
+ *   攻击者只需：搜 `34 39 77`（"nc"^0x5A）→ 找到连排四表 → 试 XOR 0x5A。
+ *   【完全不需要碰 VMP】。而 VMP 保护的 13 个函数全部以 label 为输入，
+ *   等于 VMP 的输入参数是公开的。
+ *
+ * 本改动的三个层次：
+ *   ① 每张表用【不同】基值 → 四张表不再是同一模式的序列，`34 39 77`
+ *      这个签名消失（so 表保留 0x5A 只是因为它恰好是基准，无特殊性）
+ *   ② 基值不连续、无规律（0x5A / 0xA7 / 0x3C / 0xE1）
+ *   ③ 基值本身也不裸放：从 NC_BOOT_SALT_INIT 派生（见 ncg_label_key）
+ *      —— 那个常量已经在产物里（boot_key 派生要用），复用它不新增泄露面
+ *
+ * ⚠️ 强度边界（如实，勿高估）：
+ *   这是【混淆】不是【加密】。基值可由 SALT 静态算出，攻击者愿意反汇编
+ *   ncg_label_key 就能还原。它买到的是"自动扫描失效 + 四表不再互相印证"，
+ *   不是抗人工逆向。与 layout.h 里 magic seed 的诚实口径一致。
+ *
+ * ⚠️ 派生结果【逐字节不变】：label 明文本身一个字节没改，只是换了存储编码。
+ *   所以历史产物兼容性零影响（test.sh V10 验这一点）。
+ *
+ * 生成方式（改表前用它校验）：
+ *     printf '%s' "nc-so-v1" | od -An -tx1 | tr -d ' \n'   → 6e632d736f2d7631
+ *     再逐字节 ^ 对应基值（见下方每张表的注释）
  */
-static const uint8_t ncg_label_enc_so[NCGL_SO] = {
-    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x2c, 0x6b,
+/* 存储格式（2026-11-08 二次加固）：每张表 = 2n 字节，偶数位放真实字节、
+ * 奇数位放噪声。这样四张表不再是"连续可读的常量块"，而是四段噪声。
+ *
+ * 为什么必须交错（而不是只换基值）：
+ *   实测只换基值后，四张表仍在 .rodata 里【紧邻】排布（间隔 8/12/10 字节，
+ *   总跨度 40 字节）。攻击者即使不知道基值，也能看到"40 字节的常量块"，
+ *   然后对每个字节试 256 种 XOR —— 四张表一起解出来的概率不低。
+ *   交错后真实字节被噪声隔开，单字节试错不再能还原整串。
+ *
+ * 噪声来源：SALT 的确定性派生（不用 rand，保证构建可复现）。
+ *   noise(i, kidx) = SALT[(i*5 + kidx*3) % 16] ^ 0x9E
+ * ⚠️ 不同表的噪声序列有重叠片段（都来自同一 SALT 循环），这是已知弱点：
+ *    攻击者若识别出噪声规律，可跳读偶数位。但它至少要求"先认出这是交错表"，
+ *    比"直接看到一个 40 字节块"高一层门槛。如实记录，勿高估。
+ */
+/* 噪声说明（表已由构建期脚本生成，运行期不再重算噪声）：
+ *   noise(i, kidx) = SALT[(i*5 + kidx*3) % 16] ^ 0x9E
+ * 生成方式见 scripts/gen-label-tables.py（可复核、可重新生成）。 */
+
+/* 四张表：偶数位 = label[i] ^ 基值，奇数位 = 噪声
+ * 基值见 ncg_label_key()：0x5A / 0xA7 / 0x3C / 0xE1 */
+static const uint8_t ncg_label_enc_so[NCGL_SO * 2] = {
+    0x34, 0xf0, 0x39, 0xda, 0x77, 0x78, 0x29, 0x5a,
+    0x35, 0xe4, 0x77, 0xc2, 0x2c, 0xa7, 0x6b, 0xb5,
 };
-static const uint8_t ncg_label_enc_mac[NCGL_MAC] = {
-    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x37, 0x3b,
-    0x39, 0x77, 0x2c, 0x6b,
+static const uint8_t ncg_label_enc_mac[NCGL_MAC * 2] = {
+    0xc9, 0xb5, 0xc4, 0x9d, 0x8a, 0xec, 0xd4, 0x81,
+    0xc8, 0x46, 0x8a, 0x31, 0xca, 0xfd, 0xc6, 0x0f,
+    0xc4, 0x86, 0x8a, 0xf0, 0xd1, 0xda, 0x96, 0x78,
 };
-static const uint8_t ncg_label_enc_so_r[NCGL_SO_R] = {
-    0x34, 0x39, 0x77, 0x29, 0x35, 0x77, 0x28, 0x77,
-    0x2c, 0x6b,
+static const uint8_t ncg_label_enc_so_r[NCGL_SO_R * 2] = {
+    0x52, 0x0f, 0x5f, 0x86, 0x11, 0xf0, 0x4f, 0xda,
+    0x53, 0x78, 0x11, 0x5a, 0x4e, 0xe4, 0x11, 0xc2,
+    0x4a, 0xa7, 0x0d, 0xb5,
 };
-static const uint8_t ncg_label_enc_boot[NCGL_BOOT] = {
-    0x34, 0x39, 0x77, 0x38, 0x35, 0x35, 0x2e, 0x77,
-    0x2c, 0x6b,
+static const uint8_t ncg_label_enc_boot[NCGL_BOOT * 2] = {
+    0x8f, 0xc2, 0x82, 0xa7, 0xcc, 0xb5, 0x83, 0x9d,
+    0x8e, 0xec, 0x8e, 0x81, 0x95, 0x46, 0xcc, 0x31,
+    0x97, 0xfd, 0xd0, 0x0f,
 };
 
 /* 把密文表还原进调用方缓冲（不写 NUL —— 调用方按长度用 memcpy 拼包名）。
  * ⚠️ 用 volatile 写：防止编译器把"解码后立刻使用"优化成常量折叠，
  *    那样明文又会回到 .rodata（本文件已踩过同类坑）。
- * ⚠️ 不返回指针：避免指向内部静态区，也让调用方必须自己管缓冲寿命。 */
+ * ⚠️ 不返回指针：避免指向内部静态区，也让调用方必须自己管缓冲寿命。
+ * ⚠️ noinline 不可省：内联后编译器可能把 enc[] 与 key 一起折叠成常量。 */
 __attribute__((noinline))
-static void ncg_label_decode(const uint8_t *enc, size_t n, uint8_t *out) {
+static void ncg_label_decode(const uint8_t *enc, size_t n, uint8_t key,
+                             uint8_t *out) {
+    /* 跳读：enc[0], enc[2], enc[4], ... 是真实字节；奇数位是噪声 */
     volatile uint8_t *v = (volatile uint8_t *)out;
-    for (size_t i = 0; i < n; i++) v[i] = (uint8_t)(enc[i] ^ 0x5A);
+    for (size_t i = 0; i < n; i++) v[i] = (uint8_t)(enc[i * 2] ^ key);
 }
+
+/* 从 SALT 派生四个基值。返回值与上面四张表的 ^ 值逐一对应：
+ *   0x5A / 0xA7 / 0x3C / 0xE1
+ * ⚠️ 私有扰动量（0x34/0xDD/0x3F/0x4E）与 SALT 的对应字节异或后
+ *    恰好产出上述四个基值。改 SALT 或改这里任一字节都会导致 label 错
+ *    → k_so 错 → .ncx 解出乱码 → 全链崩（fail-closed，不会静默）。 */
+__attribute__((noinline))
+static void ncg_label_key(uint8_t out[4]) {
+    static const uint8_t salt[16] = NC_BOOT_SALT_INIT;
+    /* SALT 索引：0 / 4 / 8 / 12（每 4 字节取一个，避开相邻字节）
+     * 私有扰动：0x34 / 0xDD / 0x3F / 0x4E （本文件私有，无外部契约）
+     * 逐项校验：
+     *   salt[0]=0x6e ^ 0x34 = 0x5A   ✓
+     *   salt[4]=0x7a ^ 0xDD = 0xA7   ✓
+     *   salt[8]=0x03 ^ 0x3F = 0x3C   ✓
+     *   salt[12]=0xaf ^ 0x4E = 0xE1  ✓ */
+    volatile uint8_t *v = (volatile uint8_t *)out;
+    v[0] = (uint8_t)(salt[0]  ^ 0x34);
+    v[1] = (uint8_t)(salt[4]  ^ 0xDD);
+    v[2] = (uint8_t)(salt[8]  ^ 0x3F);
+    v[3] = (uint8_t)(salt[12] ^ 0x4E);
+}
+
 
 /* ── SHA-256（FIPS 180-4）───────────────────────────────────────────
  * 照抄 scripts/sigcheck/src/sig_check.c:239-305 的已验证实现
@@ -480,9 +563,11 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
 int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
                     const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0;
-    /* label 从密文表还原（2026-11-06 P0：消除 .rodata 明文锚点，见文件头） */
-    ncg_label_decode(ncg_label_enc_so, NCGL_SO, info);
+    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    /* label 从密文表还原（2026-11-06 P0：消除 .rodata 明文锚点，见文件头）
+     * 2026-11-08：基值不再统一 0x5A，从 SALT 派生（见 ncg_label_key） */
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_so, NCGL_SO, lk[0], info);
     n=NCGL_SO;
     { size_t l=strlen(pkg); if(l>sizeof info-9) l=sizeof info-9; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
@@ -531,8 +616,9 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
 int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0;
-    ncg_label_decode(ncg_label_enc_mac, NCGL_MAC, info);
+    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_mac, NCGL_MAC, lk[1], info);
     n=NCGL_MAC;
     { size_t l=strlen(pkg); if(l>sizeof info-13) l=sizeof info-13; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
@@ -552,8 +638,9 @@ int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
 int ncg_derive_k_so_r(const uint8_t master[32],const uint8_t cert_sha256[32],
                       const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0;
-    ncg_label_decode(ncg_label_enc_so_r, NCGL_SO_R, info);
+    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_so_r, NCGL_SO_R, lk[2], info);
     n=NCGL_SO_R;
     { size_t l=strlen(pkg); if(l>sizeof info-11) l=sizeof info-11; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
@@ -596,6 +683,9 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
  * ⚠️ 调用方用完应擦除缓冲（含密钥材料的派生输入）。 */
 size_t ncg_label_boot(uint8_t *out, size_t cap) {
     if (!out || cap < NCGL_BOOT) return 0;
-    ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, out);
+    uint8_t lk[4];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, lk[3], out);
+    ncg_wipe(lk, sizeof(lk));
     return NCGL_BOOT;
 }
