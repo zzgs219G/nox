@@ -37,12 +37,13 @@
 #include <elf.h>
 
 #include "nc_guard_key.h"
-/* 2026-11-08：label 基值从 NC_BOOT_SALT_INIT 派生（见 ncg_label_key），
- * 且 ncg_label_boot 用完要 ncg_wipe —— 两者分别来自这两个头。
- * ⚠️ layout.h 是"零 include 零逻辑"的契约文件，引它不会带来循环依赖
- *    （它自己不 include 任何东西）。internal.h 只声明 .text 里的函数。 */
+/* 2026-11-08：label 基值从 NC_BOOT_SALT_INIT 派生（见 ncg_label_key）。
+ * ⚠️ 只引 layout.h（零 include 零逻辑的契约文件），不引 internal.h ——
+ *    本文件被 test-so-lock.sh 的 T32 对拍驱动【单独链接】，
+ *    多引一个头就等于多一份跨 TU 依赖，而 internal.h 里的 ncg_wipe
+ *    定义在 nc_guard_boot.c（T32 不链它）。本文件已改为就地 volatile 清零，
+ *    不再需要任何外部函数。 */
 #include "nc_guard_layout.h"
-#include "nc_guard_internal.h"
 
 /* ── HKDF 域 label 的密文存储（2026-11-06，P0）────────────────────
  *
@@ -686,6 +687,14 @@ size_t ncg_label_boot(uint8_t *out, size_t cap) {
     uint8_t lk[4];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, lk[3], out);
-    ncg_wipe(lk, sizeof(lk));
+    /* 基值用完即擦。不用 ncg_wipe：它定义在 nc_guard_boot.c，而本文件
+     * 被 test-so-lock.sh 的 T32 对拍驱动【单独链接】（只链 nc_guard_key.c）
+     * —— 引它会 undefined symbol。这里就地用 volatile 写 0，
+     * 与 ncg_wipe 同语义（防 -Oz 当死存储删掉），零跨 TU 依赖。 */
+    {
+        volatile uint8_t *v = (volatile uint8_t *)lk;
+        size_t i;
+        for (i = 0; i < sizeof(lk); i++) v[i] = 0;
+    }
     return NCGL_BOOT;
 }
