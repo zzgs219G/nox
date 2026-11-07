@@ -59,7 +59,7 @@ if ! command -v clang >/dev/null 2>&1; then
 fi
 
 W=$(mktemp -d)
-trap 'rm -rf "$W"' EXIT
+trap 'if [ -z "${NOX_KEEP_WORK:-}" ]; then rm -rf "$W"; else echo "⚠ NOX_KEEP_WORK=1：临时目录已保留 → $W"; fi' EXIT
 
 # 测试用的业务代码：一个函数进加密段，一个不进
 # 业务代码用 fixtures/sample.c（与文档示例同一份，避免"文档与测试不一致"）
@@ -377,6 +377,12 @@ EOF
         fi
     else
         bad "V5 二级锁箱失败"; tail -10 l2.log
+        # ⚠️ 2026-11-08：二级锁箱失败时删掉 l2.so。
+        #    否则残留一个残缺产物，下游 V8（读 l2.so 做 strip-meta）
+        #    与 V10（读 l2.so 查 .ncks）会拿到半成品，
+        #    报出「段缺失」这种指向完全错误方向的失败。
+        #    一次失败就该只报一次 —— 连环误报比原失败更难排查。
+        rm -f l2.so
     fi
 else
     skip "V5 无一级锁箱产物"
@@ -565,10 +571,23 @@ if [ -f l2.so ]; then
     fi
     # 反面判据：不能为了消除 label 而破坏派生 —— 解锁链路必须仍然通
     # （V6 已验证执行结果，这里只补一条"派生函数还在产出的 so 里"的存在性）
-    if readelf -SW l2.so 2>/dev/null | grep -q '\.ncks'; then
+    #
+    # ⚠️ 2026-11-08：本项曾间歇性报「.ncks 段缺失」（实测 9 次里 1 次）。
+    #    原判据 `readelf -SW l2.so | grep -q '\.ncks'` 只分"有/没有"两态，
+    #    但两者之外还有第三种：【l2.so 存在但不可解析】—— 文件被截断、
+    #    readelf 失败、或 l2.so 是上一次运行残留。那种情况 readelf 输出为空，
+    #    原判据会报"段缺失"，把「读不到」误判成「锁箱坏了」，指向完全错误的方向。
+    #    这正是 AGENTS.md §3.3「不许静默降级」的镜像问题：错误信息必须
+    #    指向真实原因，否则排查代价远高于失败本身。
+    #
+    #    修法：先验 l2.so 能否被 readelf 正常解析（有段表头就说明可解析），
+    #    不可解析 → 单独报"产物不可读"，不诬告锁箱结构。
+    if ! readelf -h l2.so >/dev/null 2>&1; then
+        bad "V10 l2.so 不可解析（readelf -h 失败）—— 产物损坏或为上次残留，非锁箱问题"
+    elif readelf -SW l2.so 2>/dev/null | awk '{print $2}' | grep -qxF '.ncks'; then
         ok "V10 label 改造未破坏锁箱结构（六段仍在）"
     else
-        bad "V10 锁箱结构异常（.ncks 段缺失）"
+        bad "V10 锁箱结构异常（.ncks 段缺失，但 l2.so 本身可解析）"
     fi
 else
     skip "V10 无锁箱产物"
