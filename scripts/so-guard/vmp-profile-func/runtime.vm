@@ -21,24 +21,37 @@ control_state { # 声明独立于通用寄存器组的控制状态
 #
 # 三项改动（其余与 upstream amice-simple-vmp 逐字节相同）：
 #   runtime.scope        module  → func
-#   （runtime.entry 保持 call —— 见下方说明）
+#   runtime.entry        call    → inline（2026-11-10，读 Amice 源码后确认可行）
 #   enhance handler_clone disabled → func
 #
-# ⚠️ 为什么没改 entry=inline（本想改，先撤了）：
-#    inline 能消除每个函数体里的 `bl <dispatcher>` 明路标，收益明确。
-#    但官方唯一的 func-scope 示例（amice-vm/profiles/ruoke）用的仍是
-#    entry=call，inline + func scope 这个组合【没有任何先例或测试】。
-#    在拿不到 Amice 源码离线验证的环境里，盲配一个未经组合验证的选项
-#    风险不划算 —— 一旦 verifier 拒绝或生成错误 IR，整条发版链就断。
-#    先用官方验证过的 scope=func + handler_clone=func（= ruoke 同款），
-#    inline 等后续单独用一次 CI 试。
+# ⚠️ entry=inline 的依据（2026-11-10 读 Amice 源码核实，推翻原"无先例"顾虑）：
+#   1) verify.rs:96-98  ——  verifier 对 entry 的判定是
+#         `RuntimeEntry::Call | RuntimeEntry::Inline => {}`
+#      两者【同等接受】，inline 没有额外前置条件。
+#   2) verify.rs:83-89  ——  runtime.scope / bytecode.scope / polymorph.scope
+#      是各自独立检查，与 entry【没有联合约束】。所以"inline + func scope"
+#      在验证器层面不存在冲突。
+#   3) profile.rs:9499  ——  有专门测试 `runtime_entry_inline_is_supported`，
+#      末尾 `verify_profile(&profile).expect("inline entry is implemented by
+#      wrapper CFG emission")` —— 实现是完整的，不是半成品。
+#   原注释说"inline + func scope 没有任何先例或测试"，是因为当时没有
+#   Amice 源码。现在仓库里有（crates/amice-vm），上述三处都能直接读到。
+#
+#   收益：inline 把 descriptor decode 和 VM dispatch CFG 直接嵌进 wrapper，
+#   消除每个受保护函数体里的 `bl <dispatcher>` 明路标。实测（2026-11-10）
+#   `entry=call` 时，13 个函数以完全相同的 prologue 开头：
+#       sub sp, sp, #0x50 / stp x30,xzr,[sp,#0x10] / stp x24,x23,[sp,#0x20]
+#       mov x19,x3 / x20,x2 / x21,x1 / x22,x0
+#   一条 grep 就能全定位 —— 等于给逆向者画好了靶子。
+#   体积：不增反降（不再有独立 dispatcher 函数）。
+#
 # ⚠️ 代价：体积显著上涨（每个函数一套运行时），编译变慢。
 #    实测数据见 docs/流程文档.md 4.3 节。
 # ⚠️ threaded_dispatch / indirect_branch_dispatch 仍保持 disabled：
 #    这两个 Amice 当前 emitter 未实现，verifier 会直接拒绝
 #    （crates/amice-vm/src/verify.rs:849）。不是我们保守。
 runtime.scope = func # 每个被保护函数生成独立分派运行时（本仓库改动①）
-runtime.entry = call # ⚠️ 暂不改 inline：官方 ruoke 示例用的是 call，inline 配 func scope 无先例（本仓库改动②已回退）
+runtime.entry = inline # 消除 `bl <dispatcher>` 明路标（本仓库改动②，2026-11-10 启用）
 polymorph.scope = func # 每个被保护函数独立派生 key、opcode 选择和 handler 克隆后缀
 runtime.emit_markers = false # 生产默认不生成 AMICEVMP、AMICE_VMP_RUNTIME_BYTECODE 和 .amice.vm.meta 调试 marker
 
