@@ -51,7 +51,21 @@ control_state { # 声明独立于通用寄存器组的控制状态
 #    这两个 Amice 当前 emitter 未实现，verifier 会直接拒绝
 #    （crates/amice-vm/src/verify.rs:849）。不是我们保守。
 runtime.scope = func # 每个被保护函数生成独立分派运行时（本仓库改动①）
-runtime.entry = inline # 消除 `bl <dispatcher>` 明路标（本仓库改动②，2026-11-10 启用）
+# ═══ runtime.entry（2026-11-11 回退到 call）═══════════════════════════
+# 原为 inline（2026-11-10 启用，为消除 `bl <dispatcher>` 路标）。
+# 实测（真机 libnc.so + nox .ncx 锁箱 + Amice VMP）：
+#   应用启动页加载到一半 SIGSEGV / SEGV_ACCERR，栈溢出。
+#   xCrash maps 证据：
+#     0x74a429e000-0x74a429f000  ---   [anon:stack_and_tls:30575]  ← guard page
+#     0x74a429f000-0x74a43a6000  rw-   (栈本体 0x107000 ≈ 1.03MB)
+#   崩溃 sp=0x74a429eff0 已跌进 guard page，pc 指向 vm runtime 的位读取器
+#   （str xzr,[sp,8] 即失败指令）。DefaultDispatch 是 ART 线程池线程，
+#   栈只有约 1MB（主线程 8MB），inline 把整个解释器内联进每个被保护函数、
+#   栈帧叠加后撑爆。
+# 回退到 call：解释器独立成一个函数，被保护函数只留下小而固定的栈帧。
+# 代价：`bl <dispatcher>` 这个路标回来了 —— 用可运行性换可发现性，
+#       这是正确的取舍（跑不起来的功能强度为零）。
+runtime.entry = call
 polymorph.scope = func # 每个被保护函数独立派生 key、opcode 选择和 handler 克隆后缀
 runtime.emit_markers = false # 生产默认不生成 AMICEVMP、AMICE_VMP_RUNTIME_BYTECODE 和 .amice.vm.meta 调试 marker
 
