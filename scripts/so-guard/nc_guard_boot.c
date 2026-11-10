@@ -1287,6 +1287,23 @@ int ncg_head_unlock(void) {
             int prot = PROT_READ;
             if (is_code) {
                 prot |= PROT_EXEC;
+                /* ⚠️ 2026-11-11 实验开关：NC_CODE_SEG_RWX
+                 *
+                 * 背景：VMP（Amice）改写过的函数需要运行期写入自己的
+                 * dispatch/token 区域，而这里原本只给 RX。实测开 --vmp 后
+                 * 必现 SIGSEGV / SEGV_ACCERR，崩溃地址低 12 位恒在页尾
+                 * （0xff0/0xff8），是典型的"写只读页"特征。
+                 * 同一份代码不开 --vmp 则完全正常（进程存活、签名校验通过）。
+                 *
+                 * 代价（如实，别低估）：RWX 段是 Frida 脚本的第一眼目标，
+                 * 也更容易被内存 dump —— 这是用「防动态分析」换「VMP 可用」。
+                 *
+                 * 默认不开。要验证推断时加 -DNC_CODE_SEG_RWX 重编 nox；
+                 * 长期方案应该是让 VMP 的数据落在独立可写段（amice 侧改），
+                 * 而不是把整个代码段放宽。 */
+#if defined(NC_CODE_SEG_RWX)
+                prot |= PROT_WRITE;
+#endif
             } else {
                 /* 数据段：同页若含 .data/.bss（原始权限可写），保持 RW，
                  * 否则会误伤。判据：检查覆盖该段的整页范围内，
