@@ -88,6 +88,30 @@ BUILTIN_RULES = {
         r'^([ \t]*)((?:JNIEXPORT|jint|jboolean|jobject|void|int|bool)'
         r'[ \t]+[A-Za-z_][A-Za-z0-9_]*)([ \t]*\()'
     ),
+    # dex2c 转译产物在【动态注册】形态下的 JNI 函数（writer.py:106）：
+    #   void Java_com_demo_app_MainActivity_onCreate(JNIEnv *env, jobject thiz, ...)
+    #
+    # 为什么不带 JNIEXPORT / JNICALL：`--dynamic-register` 走的是
+    # writer.py:106 的分支，只写「返回类型 + 空格 + 长名」，没有
+    # `extern "C" JNIEXPORT ... JNICALL` 那一行。产出的符号受
+    # -fvisibility=hidden 支配（这正是该开关的目的：业务方法名不进 .dynsym），
+    # 由 DynamicRegister.cpp 在 JNI_OnLoad 里 RegisterNatives 注册。
+    #
+    # ⚠️ 2026-11-10 修：protect.sh 一直传 --dynamic-register，而上面
+    #    dex2c-jni 规则要求 JNIEXPORT ... JNICALL → 实测命中 0，
+    #    dex2c 产物整批留在明文 .text（实测 .ncx 只 7.9KB 而 dex2c 产物
+    #    ≈24KB 全在 .text，onCreate@0x4254c 熵 6.179 = 明文）。
+    #    同一正则也被 protect.sh 的「静默失防」守卫复用，所以守卫同样数到 0
+    #    而放行 —— 规则与守卫一起失效，形成假绿。
+    #
+    # 只认 `Java_` 前缀（不是任意标识符）：这是 JNI 长名的必经前缀，
+    # 用它把范围锁死在「确实是 JNI 导出函数」，避免误标普通 C 函数。
+    # 返回类型取 util.get_native_type 可能产出的全集，含指针返回类型。
+    'dynamic-register-jni': (
+        r'^[ \t]*(?:jboolean|jbyte|jshort|jchar|jint|jlong|jfloat|jdouble'
+        r'|jstring|jobject|jarray|jclass|jthrowable|void|jsize)'
+        r'[ \t]+\**[ \t]*(Java_[A-Za-z0-9_]+)[ \t]*\('
+    ),
 }
 
 
