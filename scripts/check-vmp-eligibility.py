@@ -78,17 +78,40 @@ def function_body(ll, name):
     return m.group(0) if m else None
 
 
-def non_call_self_uses(body, name):
-    """返回函数体内对自身地址的非调用引用（每行一条）。"""
+def non_call_self_uses(body, name, ll=None):
+    """返回对自身地址的非调用引用（每行一条）。
+
+    ⚠️ 2026-11-10 修（盲区）：原实现只扫函数体（body），完全看不到
+    【模块级全局变量】里的地址引用。实测踩到：
+        @tbl = global [1 x %struct] [{ ptr @.str, ptr @.str.1,
+                                       ptr @Java_..._onCreate }]
+    这是 dex2c --dynamic-register 生成的 JNINativeMethod 表 —— 最典型的
+    non-call address use，Amice 必然跳过，而本脚本却报 ✓ 可虚拟化（假绿）。
+    现已改为扫整份 IR。
+
+    同时按 Amice 的真实判据（vm_virtualize/mod.rs:1067
+    has_unsupported_function_uses）实现豁免：
+      · 直接调用（call ... @name）            → 允许
+      · @llvm.global.annotations 表里的引用   → 允许（annotate 配置用）
+      · 其余一律算 offender，包括 @llvm.used（clang 因 used/retain 属性生成）
+    """
     pat = re.compile(r'@' + re.escape(name) + r'(?![.\w])')
     call_pat = re.compile(r'\bcall\b[^@]*@' + re.escape(name) + r'(?![.\w])')
+    # Amice 只豁免 global.annotations；llvm.used 也算违规（实测确认）
+    ann_ok = re.compile(r'@llvm\.global\.annotations')
+    scan = ll.splitlines() if ll is not None else body.splitlines()
     offenders = []
-    for line in body.splitlines()[1:]:          # 跳过 define 行
-        if not pat.search(line):
+    for line in scan:
+        s = line.strip()
+        if s.startswith('define') and ('@' + name) in s:
+            continue                             # 函数自身定义行
+        if not pat.search(s):
             continue
-        if call_pat.search(line):
+        if call_pat.search(s):
             continue                             # 直接调用：允许
-        offenders.append(line.strip())
+        if ann_ok.search(s):
+            continue                             # annotations 表：允许
+        offenders.append(s)
     return offenders
 
 
@@ -117,7 +140,7 @@ def main(argv):
             print('  ? %-28s 找不到定义（拼写错？被内联了？）' % name)
             bad += 1
             continue
-        off = non_call_self_uses(body, name)
+        off = non_call_self_uses(body, name, ll=ll)
         if not off:
             print('  ✓ %-28s 无自身引用 → 可虚拟化' % name)
         else:

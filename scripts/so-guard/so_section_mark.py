@@ -127,11 +127,23 @@ def _marked_above(out: list, line: str) -> bool:
     （见 mark_text 的 `'%s%s\\n%s%s'`），所以函数头行本身永远不含
     section 字样 —— 只查当前行会导致二次跑重复注入（实测 md5 变了）。
     这里查输出流的最后一行是否是刚插入的那种 attribute 行。
+
+    ⚠️ 2026-11-10 修：原实现用 `out[-1] == indent + ATTR` 精确比对整行，
+    但 ATTR 会随参数变化（如二次运行加上 --annotate 后 ATTR 多了
+    annotate(...)），于是"已标过段但没标 annotate"的行被判为未标记
+    → 重复注入第二行 attribute（同一函数两个 __attribute__ 合法但产物
+    形态变了，且 annotate 会重复）。改为结构判据：
+    上一行是不是一条【包含目标 section】的 __attribute__ 行。
+    要不要再补 annotate 由调用方决定（见 --annotate 的说明：
+    本脚本不做"增量补注"，同一函数请一次标全）。
     """
     if not out:
         return False
     indent = re.match(r'^[ \t]*', line).group(0)
-    return out[-1] == indent + ATTR
+    prev = out[-1]
+    if not prev.startswith(indent + '__attribute__((',):
+        return False
+    return ('section("%s")' % SECTION) in prev
 
 
 def _is_definition(lines, i):
@@ -294,11 +306,44 @@ def main(argv=None):
                          '典型：nc_guard_jni.c（它调 unlock，锁它=死锁）')
     ap.add_argument('--check', '--dry-run', action='store_true', dest='check',
                     help='只报告会改哪些行，不写文件')
+    ap.add_argument('--annotate', default='',
+                    help='额外注入 annotate("...")（可多次，逗号分隔的表达式原样写入）。'
+                         '典型用法：--annotate "+vm_virtualize" —— 让 Amice 的 VMP '
+                         '虚拟化这些函数。与段标记叠加在同一个 attribute 里，'
+                         '不产生第二行 attribute。')
     ap.add_argument('-v', '--verbose', action='store_true', help='列出每个命中位置')
     args = ap.parse_args(argv)
 
     SECTION = args.section
-    ATTR = '__attribute__((section("%s"), used, retain))' % SECTION
+    _attrs = ['section("%s")' % SECTION]
+    if args.annotate:
+        # ⚠️ 走 annotate 路径时【不能加 used / retain】：
+        #    实测 clang 会把它们变成 IR 的 @llvm.used 表，而表里存的是
+        #    `ptr @func` —— 即函数地址引用。Amice 的
+        #    has_unsupported_function_uses（vm_virtualize/mod.rs:1067）
+        #    只豁免「直接调用」和「@llvm.global.annotations」，
+        #    @llvm.used 会被判 non-call address use → VMP 静默跳过。
+        #    实测三种组合：
+        #      noinline+section+used+retain+annotate → llvm.used=1 ❌
+        #      noinline+section+retain+annotate      → llvm.used=1 ❌
+        #      noinline+section+used+annotate        → llvm.used=0 ❌（used 不产生，但 retain 也不加时…见下）
+        #      noinline+section+annotate             → llvm.used=0 ✅
+        #    安全性：section 归属本身就让函数不被当死代码删（段被锁箱器
+        #    引用），且这些是 JNI 入口（有外部调用者），无需 used/retain。
+        #
+        # annotate 可以有多个，用逗号分隔；每个包成独立 annotate(...)。
+        # ⚠️ 不把多个表达式塞进一个 annotate：Amice 按 annotate 逐条解析，
+        #    合并后会被当成单个无法识别的 flag 名。
+        for expr in args.annotate.split(','):
+            expr = expr.strip()
+            if expr:
+                _attrs.append('annotate("%s")' % expr)
+        # noinline：函数被内联掉就没有独立符号可虚拟化。
+        _attrs.insert(0, 'noinline')
+    else:
+        # 纯段标记路径保持原样（used/retain 是历史形态，产物不能变）。
+        _attrs += ['used', 'retain']
+    ATTR = '__attribute__((%s))' % ', '.join(_attrs)
 
     if not args.rule and not args.pattern:
         ap.error('必须指定 --rule 或 --pattern（不给规则 = 不知道要保护什么）')
