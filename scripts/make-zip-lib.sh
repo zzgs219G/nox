@@ -119,22 +119,50 @@ for abi in arm64-v8a armeabi-v7a; do
     for f in $LIB_SRCS; do
         # shellcheck disable=SC2086
         #
-        # ⚠️ VMP 文件清单（2026-11-06）：
-        #   VMP 与 annotate 互斥 —— annotate 会把函数地址写进
-        #   @llvm.global.annotations，vm_virtualize 判定 "has non-call
-        #   address uses" 并跳过（实测 CI 42075245237 的 debug 日志）。
-        #   所以这些文件不含 annotate，改用文件级 AMICE_VM_VIRTUALIZE。
+        # ⚠️⚠️ VMP 清单（2026-11-11 用户决定【关闭】）─────────────────────
         #
-        #   判断标准：这个文件里的函数是否【全部】值得保护、且没有会被
-        #   VMP 跳过的构造。满足才可以整文件开。
-        #     nc_guard_xor     → ncg_xor_key（1 个）
-        #     nc_guard_crypto  → ncg_boot_key + ncguard_stub_recover（2 个）
-        #   两个都是"造钥匙的配方"，且都已用 check-vmp-eligibility.py 预检
-        #   （无取自身地址等 non-call use）。
-        #   nc_guard_boot.c 不能进这份清单 —— 它还有 25+ 个无关函数
-        #   （含 open/pread/close 重型 I/O），整文件 VMP 会让体积暴涨。
+        # 原清单（2026-11-06 ~ 2026-11-11）：
+        #     nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
+        #     即 14 个解密链函数全部虚拟化，覆盖 boot_key 派生、k_stub 拼接、
+        #     .ncxh 解密、master 解锁、包名/路径读取。
+        #
+        # ── 为什么关掉（实测数据，不是判断）──────────────────────────
+        #
+        # 收益/成本严重倒挂：
+        #   · 成本：nc_guard_crypto.o 376,448 B，而 14 个函数原始指令合计
+        #           约 180 条 ≈ 720 B → 膨胀 520 倍。libnox.a(arm64) 449 KB
+        #           会打进每个 APK。
+        #   · 收益：对"执行型"攻击者 = 0。
+        #
+        # 实测（2026-11-11，零信息逆向，未读本仓库源码）：
+        #   unicorn 加载 libnc.so → 从 .init_array 执行 → 在 RC4 入口下钩子
+        #   → 17 分钟拿到 boot_key 与 .ncxh 明文。
+        #   那 14 个 VMP 函数它一个都没读懂，但全部拿到了输出。
+        #
+        # VMP 只挡「静态阅读」，不挡「执行」。而"解 .ncx / 拿 key"这类目标
+        # 根本不需要阅读 —— 跑一遍就有。混淆计划 §10 已给过同向结论
+        # （「抬高了读懂实现的成本，抬不高复现算法的成本」），但没有
+        # "无源码攻击者能多快"这个数据；本轮补上了：17 分钟。
+        #
+        # ── 关掉之后仍然有效的两条线（不要一起关）───────────────────
+        #   ① NC_OBF 宏（nc_guard_boot.c 的 3 个解密链函数）：
+        #      +flatten/+mba/+shuffle_blocks/+split_basic_block/+indirect_call
+        #      走的是 annotate 路径，与本文件的 AMICE_VM_VIRTUALIZE 无关，
+        #      本改动不影响它。
+        #   ② .text CRC 自绑定（k_stub ^ fold(crc32(.text))）：
+        #      防 patch 的能力完全来自这里，与 VMP 无关。
+        #
+        # ── 要恢复怎么做 ──────────────────────────────────────────
+        #   把下面两个分支换回来即可（保持 _vmp=1 的清单原样），无需改别处：
+        #       nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
+        #   恢复后必须重验两件事：
+        #       ./scripts/check-obf.sh 产出       → 确认 VM 子段数 > 0
+        #       真机 selftest                      → 确认 selftest == 59
+        #
+        # ⚠️ 保留 case 结构而不是删掉分支：canonical 的 VMP 开关逻辑
+        #    （profile 选择、bundle NDK 校验）在下面 if 里，删了分支会让
+        #    将来恢复时漏掉 profile 检查 → 静默退回 module 级共享。
         case "$f" in
-            nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
             *) _vmp=0 ;;
         esac
         if [[ "$_vmp" == "1" && -n "${AMICE_BUNDLE:-}" ]]; then
