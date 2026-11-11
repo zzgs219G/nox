@@ -184,7 +184,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/amice-bundle
-          key: amice-r29-v0.1.6-nox3
+          key: amice-r29-v0.1.6-nox4
 
       - name: 下载 Amice bundle（cache 未命中时）
         if: steps.obf.outputs.on == 'true'
@@ -194,7 +194,7 @@ jobs:
             echo "OK: cache 命中"; exit 0
           fi
           mkdir -p ~/amice-bundle && cd ~/amice-bundle
-          URL=https://github.com/zzgs219G/amice/releases/download/v0.1.6-nox3/amice-android-ndk-r29-linux-x86_64.tar.gz
+          URL=https://github.com/zzgs219G/amice/releases/download/v0.1.6-nox4/amice-android-ndk-r29-linux-x86_64.tar.gz
           curl -fL --retry 3 -o a.tar.gz "$URL"
           curl -fsSL -o a.sha256 "$URL.sha256"
           WANT=$(awk '{print $1}' a.sha256); GOT=$(sha256sum a.tar.gz | awk '{print $1}')
@@ -343,7 +343,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/amice-bundle
-          key: amice-r29-v0.1.6-nox3
+          key: amice-r29-v0.1.6-nox4
 
       - name: 下载 Amice bundle
         run: |
@@ -352,7 +352,7 @@ jobs:
             echo "OK: cache 命中"; exit 0
           fi
           mkdir -p ~/amice-bundle && cd ~/amice-bundle
-          URL=https://github.com/zzgs219G/amice/releases/download/v0.1.6-nox3/amice-android-ndk-r29-linux-x86_64.tar.gz
+          URL=https://github.com/zzgs219G/amice/releases/download/v0.1.6-nox4/amice-android-ndk-r29-linux-x86_64.tar.gz
           curl -fL --retry 3 -o a.tar.gz "$URL"
           curl -fsSL -o a.sha256 "$URL.sha256"
           WANT=$(awk '{print $1}' a.sha256); GOT=$(sha256sum a.tar.gz | awk '{print $1}')
