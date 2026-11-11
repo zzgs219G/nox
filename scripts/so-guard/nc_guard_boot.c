@@ -108,6 +108,40 @@
 #  define NC_OBF
 #endif
 
+/* ── NC_VMP_FUNC（2026-11-12）：给 .ncxh 里的解锁器逐函数上 VMP ────────
+ *
+ * 背景：nc_guard_boot.c 不能整文件开 VMP（25+ 个无关函数含重型 I/O，
+ * 体积会暴涨，见 make-zip-lib.sh 的清单注释）。但 .ncxh 里这 5 个函数
+ * 是攻击者解开 .ncxh 之后直接读到的**全部内容**：
+ *
+ *   ncg_head_unlock      解 .ncx 的主流程
+ *   ncg_rc4              RC4
+ *   ncg_resolve_self     dladdr 取基址
+ *   ncg_find_section     ELF 段查找
+ *   ncg_apk_path_fault   APK 路径污染
+ *
+ * 实测依据（本轮零信息逆向）：它能走到 .ncx 门口，靠的正是读这些函数的
+ * 明文反汇编 —— 具体是把 ncg_stub_descramble 的 16 次 XOR 循环误当成
+ * .ncx 解密，算法判断错后停手。**VMP 这一层，它连误判的机会都没有。**
+ *
+ * ⚠️ 依赖本 fork 的 @llvm.used 豁免补丁（amice 040ce6c）。
+ *    .ncxh 的函数带 used/retain，上游 Amice 会判 "non-call address use"
+ *    并跳过。换回上游 bundle 时这 5 个会被**静默跳过**（构建仍绿），
+ *    所以换 bundle 后必须跑 check-obf.sh 确认 VM 子段数。
+ *
+ * ⚠️ 与 NC_OBF 互斥使用：同一函数不能既 annotate "+flatten" 又
+ *    "+vm_virtualize"（实测两者叠加会让 vm_virtualize 跳过该函数）。
+ *    本宏只含 vm_virtualize，不要和其它 annotate 宏叠加。
+ *
+ * ⚠️ 不开时（无 NC_AMICE_ANNOTATE）宏为空 —— 与 NC_OBF 同款，
+ *    保证不用 Amice 的构建路径行为不变。 */
+#if defined(NC_AMICE_ANNOTATE)
+#  define NC_VMP_FUNC \
+     __attribute__((noinline, annotate("+vm_virtualize")))
+#else
+#  define NC_VMP_FUNC
+#endif
+
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
  * 为什么不能放 .ncx：那是 AXR（可执行）段，clang 拒绝让 const 数据
@@ -568,6 +602,7 @@ __attribute__((section(NC_SEC_HEADRO), used, retain, aligned(16)))
 static uint8_t ncg_master[32] = {0};
 
 /* RC4 —— 与 so-section-lock.py 的 rc4() 逐字节同算法 */
+NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static void ncg_rc4(const uint8_t *key, size_t keylen,
                     const uint8_t *in, uint8_t *out, size_t len) {
@@ -675,6 +710,7 @@ static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
  * 原先只支持 ELF64 且注释写"ELF32 是既有缺口，本轮不扩范围"——但
  * `APP_ABI := armeabi-v7a arm64-v8a`，v7a 产物就是 ELF32，缺口等于
  * 32 位设备上加固包必然 SIGILL。复用 ncg_elf_hdr / ncg_elf_shdr。 */
+NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_find_section(const char *so_path, const char *name,
                             ncg_shdr_t *out) {
@@ -717,6 +753,7 @@ static int ncg_find_section(const char *so_path, const char *name,
 
 /* so 路径解析：用 head 本体的地址 dladdr（dladdr 是 libc 的，但本体已在
  * 明文状态才被调用，所以这里用 libc 无妨——约束只针对明文 stub） */
+NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
     Dl_info info;
@@ -826,6 +863,7 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
  *    告诉攻击者。加密后文件里只有 0x75 0x3E 0x3B ... 这样的字节序列。
  *    生成方式见 commit message。
  *    这是【混淆】不是【加密】——如实标注，别高估。 */
+NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static void ncg_apk_path_fault(const char *apk_path, uint8_t fault[8]) {
     /* 扁平存储：所有规则拼在一个数组里，用 (off,len,bad) 索引。
@@ -930,6 +968,7 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 /* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
+NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 int ncg_head_unlock(void) {
     void *base;

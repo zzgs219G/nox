@@ -119,50 +119,45 @@ for abi in arm64-v8a armeabi-v7a; do
     for f in $LIB_SRCS; do
         # shellcheck disable=SC2086
         #
-        # ⚠️⚠️ VMP 清单（2026-11-11 用户决定【关闭】）─────────────────────
+        # ⚠️⚠️ VMP 清单（2026-11-12：恢复 + 覆盖 .ncxh 解锁器）──────────
         #
-        # 原清单（2026-11-06 ~ 2026-11-11）：
-        #     nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
-        #     即 14 个解密链函数全部虚拟化，覆盖 boot_key 派生、k_stub 拼接、
-        #     .ncxh 解密、master 解锁、包名/路径读取。
+        # ── 历史 ────────────────────────────────────────────────────
+        # 2026-11-06 ~ 2026-11-11：nc_guard_xor | nc_guard_crypto 整文件开。
+        # 2026-11-11：实测零信息逆向 17 分钟用 unicorn 执行绕过，遂全关。
+        # 2026-11-12：**部分恢复**，且扩大到 .ncxh 解锁器（见下）。
         #
-        # ── 为什么关掉（实测数据，不是判断）──────────────────────────
+        # ── 为什么恢复：区分「要结果」与「要逻辑」────────────────────
         #
-        # 收益/成本严重倒挂：
-        #   · 成本：nc_guard_crypto.o 376,448 B，而 14 个函数原始指令合计
-        #           约 180 条 ≈ 720 B → 膨胀 520 倍。libnox.a(arm64) 449 KB
-        #           会打进每个 APK。
-        #   · 收益：对"执行型"攻击者 = 0。
+        #   攻击者要「结果」（k_stub/master/.ncx 明文）→ 执行一遍就有，
+        #   VMP 无效。这一半的判断仍然成立。
         #
-        # 实测（2026-11-11，零信息逆向，未读本仓库源码）：
-        #   unicorn 加载 libnc.so → 从 .init_array 执行 → 在 RC4 入口下钩子
-        #   → 17 分钟拿到 boot_key 与 .ncxh 明文。
-        #   那 14 个 VMP 函数它一个都没读懂，但全部拿到了输出。
+        #   但攻击者要「逻辑」时 VMP 有效，而本轮实测证实它确实在要逻辑：
+        #   它解不开 .ncx，正是因为**读了 .ncxh 明文里的解锁器**，
+        #   把 `ncg_stub_descramble` 的 16 次 XOR 循环误当成 .ncx 解密
+        #   → 算法判断错 → 停在门口。
         #
-        # VMP 只挡「静态阅读」，不挡「执行」。而"解 .ncx / 拿 key"这类目标
-        # 根本不需要阅读 —— 跑一遍就有。混淆计划 §10 已给过同向结论
-        # （「抬高了读懂实现的成本，抬不高复现算法的成本」），但没有
-        # "无源码攻击者能多快"这个数据；本轮补上了：17 分钟。
+        #   换句话说：**它能走到门口，靠的是读 .ncxh 明文。**
+        #   那一层此前完全没有 VMP（nc_guard_boot.c 不在清单里）。
         #
-        # ── 关掉之后仍然有效的两条线（不要一起关）───────────────────
-        #   ① NC_OBF 宏（nc_guard_boot.c 的 3 个解密链函数）：
-        #      +flatten/+mba/+shuffle_blocks/+split_basic_block/+indirect_call
-        #      走的是 annotate 路径，与本文件的 AMICE_VM_VIRTUALIZE 无关，
-        #      本改动不影响它。
-        #   ② .text CRC 自绑定（k_stub ^ fold(crc32(.text))）：
-        #      防 patch 的能力完全来自这里，与 VMP 无关。
+        # ── 本次改动 ────────────────────────────────────────────────
+        #   ① nc_guard_crypto.c / nc_guard_xor.c 恢复整文件 VMP（13+1 个函数）
+        #   ② nc_guard_boot.c **仍不开整文件**（25+ 个无关函数，含重型 I/O），
+        #      改为在 C 侧用 NC_VMP_FUNC 宏逐函数标注 .ncxh 的 5 个关键函数：
+        #         ncg_head_unlock        ← 解 .ncx 主流程（最关键）
+        #         ncg_rc4                ← RC4 实现
+        #         ncg_resolve_self       ← dladdr 取基址
+        #         ncg_find_section       ← ELF 段查找
+        #         ncg_apk_path_fault     ← APK 路径污染
         #
-        # ── 要恢复怎么做 ──────────────────────────────────────────
-        #   把下面两个分支换回来即可（保持 _vmp=1 的清单原样），无需改别处：
-        #       nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
-        #   恢复后必须重验两件事：
-        #       ./scripts/check-obf.sh 产出       → 确认 VM 子段数 > 0
-        #       真机 selftest                      → 确认 selftest == 59
+        # ⚠️ ②依赖本 fork 的 @llvm.used 豁免补丁（040ce6c）。
+        #    .ncxh 的函数带 used/retain，上游 Amice 会判 "non-call address
+        #    use" 跳过；本 fork 已豁免，所以能过。
+        #    若换回上游 bundle，这 5 个函数会被静默跳过（构建仍绿）。
         #
-        # ⚠️ 保留 case 结构而不是删掉分支：canonical 的 VMP 开关逻辑
-        #    （profile 选择、bundle NDK 校验）在下面 if 里，删了分支会让
-        #    将来恢复时漏掉 profile 检查 → 静默退回 module 级共享。
+        # ⚠️ ②是 annotate 路径，与 ① 的文件级 AMICE_VM_VIRTUALIZE 互不冲突
+        #    （不同编译单元）。
         case "$f" in
+            nc_guard_xor|nc_guard_crypto) _vmp=1 ;;
             *) _vmp=0 ;;
         esac
         if [[ "$_vmp" == "1" && -n "${AMICE_BUNDLE:-}" ]]; then
