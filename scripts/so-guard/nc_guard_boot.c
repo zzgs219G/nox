@@ -970,6 +970,52 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 /* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
+/* ── 证书/包名派生 k_so（2026-11-12 从 ncg_head_unlock 拆出）──────────
+ *
+ * 为什么拆：主函数 428 行 / 34 个局部变量，Amice 报 values=25（预算 32）。
+ * 这一段自带 apk_path[512] 与三个派生/污染步骤，是峰值的主要来源之一。
+ *
+ * ⚠️ 语义完全不变，特别是那两条【污染】纪律：
+ *   ① 包名不符 → pkg_fault 非 0 → 摊进 k_so → 解出乱码（不是 if 分支）
+ *   ② APK 路径异常 → path_fault 非 0 → 同样摊进 k_so
+ *   刻意不做 `if (!path_ok) return -12` —— 那会变成可一条指令 patch
+ *   掉的判定点（2026-10-22 的教训）。改这段时不要"优化"成 if。
+ *
+ * 返回 0 成功并把派生结果写进 k_out；-12 = 证书/包名任一不可得（fail-closed）。 */
+NC_VMP_FUNC
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static int ncg_derive_kso_bound(const char *so_path,
+                                const uint8_t master[32],
+                                uint8_t *der, size_t *der_len,
+                                char *pkg, size_t pkgcap,
+                                const uint8_t *slotdata,
+                                uint8_t k_out[16]) {
+    char apk_path[512];
+
+    apk_path[0] = '\0';
+    if (ncg_find_apk_path(so_path, apk_path, sizeof(apk_path)) != 0) return -12;
+    if (ncg_apk_first_cert_der(apk_path, der, 1536, der_len) != 0) return -12;
+    if (ncg_self_pkg(pkg, pkgcap) != 0) return -12;
+    if (ncg_derive_k_so_from_der(master, der, *der_len, pkg, k_out) != 0)
+        return -12;
+
+    /* 污染一：包名（详见 ncg_pkg_fault 的注释） */
+    {
+        uint8_t fault[8];
+        ncg_pkg_fault(slotdata, pkg, fault);
+        for (int i = 0; i < 16; i++) k_out[i] ^= fault[i & 7];
+        ncg_wipe(fault, sizeof(fault));
+    }
+    /* 污染二：APK 路径（反多开）。与包名同款数据依赖，不做分支。 */
+    {
+        uint8_t pf[8];
+        ncg_apk_path_fault(apk_path, pf);
+        for (int i = 0; i < 16; i++) k_out[i] ^= pf[i & 7];
+        ncg_wipe(pf, sizeof(pf));
+    }
+    return 0;
+}
+
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 int ncg_head_unlock(const void *self_addr) {
@@ -1127,56 +1173,16 @@ int ncg_head_unlock(const void *self_addr) {
             return 0;
         }
     }
+    /* 2026-11-12：拆成独立函数（降寄存器压力）。两条污染纪律不变。 */
     {
         uint8_t k_cert[16];
-        int cert_ok = 0;
-
-        char apk_path[512];
-        apk_path[0] = '\0';
-        if (ncg_find_apk_path(so_path, apk_path, sizeof(apk_path)) == 0) {
-            if (ncg_apk_first_cert_der(apk_path, der_buf, sizeof(der_buf),
-                                       &der_len) == 0) {
-                /* ⚠️ 2026-10-22：包名校验不再是 if 条件，而是混进密钥。
-                 * 详见 ncg_pkg_fault 的说明——原写法
-                 *   `ncg_pkg_matches(...) && derive(...)`
-                 * 里那次调用可被 patch 成 return 1 绕过整个包名绑定。
-                 * 现在：包名不符 → fault 非 0 → k_cert 被污染 →
-                 *       解出乱码 → 后续全崩（不需要任何分支）。 */
-                if (ncg_self_pkg(pkg_buf, sizeof(pkg_buf)) == 0 &&
-                    ncg_derive_k_so_from_der(master, der_buf, der_len, pkg_buf,
-                                             k_cert) == 0) {
-                    uint8_t fault[8];
-                    ncg_pkg_fault(slotdata, pkg_buf, fault);
-                    /* 把 8 字节偏差摊到 16 字节密钥上（每字节用一次） */
-                    for (int i = 0; i < 16; i++) k_cert[i] ^= fault[i & 7];
-                    ncg_wipe(fault, sizeof(fault));
-
-                    /* ── 反多开（2026-11-02）：APK 路径白名单 ──────────
-                     * 与包名同款【数据依赖】：异常路径 → 污染 k_so →
-                     * 解出乱码 → MAC 失败 → fail-closed。
-                     * 刻意不做 `if (!path_ok) return -12`——那会变成可
-                     * 一条指令 patch 掉的判定点（2026-10-22 的教训）。 */
-                    {
-                        uint8_t pf[8];
-                        ncg_apk_path_fault(apk_path, pf);
-                        for (int i = 0; i < 16; i++) k_cert[i] ^= pf[i & 7];
-                        ncg_wipe(pf, sizeof(pf));
-                    }
-                    cert_ok = 1;
-                }
-            }
-        }
-
-        if (!cert_ok) {
-            /* fail-closed：证书/包名任一不可得 → 不解密。
-             * 代价是"未签名调试包"直接起不来——这是刻意的：
-             * 允许降级就等于允许攻击者把签名剥掉后照常跑。 */
+        if (ncg_derive_kso_bound(so_path, master, der_buf, &der_len,
+                                 pkg_buf, sizeof(pkg_buf), slotdata, k_cert) != 0) {
+            ncg_wipe(k_cert, sizeof(k_cert));
             ncg_wipe(key, sizeof(key));
             memset(slotdata, 0, sizeof(slotdata));
-            return -12;
+            return -12;   /* fail-closed：证书/包名任一不可得 */
         }
-
-        /* 用证书派生的 k_so 覆盖 slot 里的诱饵值 */
         memcpy(key, k_cert, 16);
         ncg_wipe(k_cert, sizeof(k_cert));
     }
