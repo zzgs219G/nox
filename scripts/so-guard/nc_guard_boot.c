@@ -755,10 +755,12 @@ static int ncg_find_section(const char *so_path, const char *name,
  * 明文状态才被调用，所以这里用 libc 无妨——约束只针对明文 stub） */
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
+static int ncg_resolve_self(const void *self_addr, void **base, char *path,
+                            size_t pathcap) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (dladdr((const void *)&ncg_resolve_self, &info) == 0
+    if (!self_addr) return -1;
+    if (dladdr(self_addr, &info) == 0
         || info.dli_fbase == NULL) return -1;
     *base = info.dli_fbase;
     if (info.dli_fname) {
@@ -970,10 +972,10 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-int ncg_head_unlock(void) {
+int ncg_head_unlock(const void *self_addr) {
     void *base;
     char so_path[512];
-    if (ncg_resolve_self(&base, so_path, sizeof(so_path)) != 0) return -1;
+    if (ncg_resolve_self(self_addr, &base, so_path, sizeof(so_path)) != 0) return -1;
 
     ncg_shdr_t sec, slot;
     if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) return -2;
@@ -1015,18 +1017,16 @@ int ncg_head_unlock(void) {
         }
     }
     if (so_locked && slot.size >= NC_SLOT_SIZE) {
+        /* 2026-11-12：原先这里再调一次 dladdr(&ncg_head_unlock) ——
+         * 那是本函数内的第二次「取自身地址」，会让 Amice 判定
+         * "non-call address uses" 并跳过 VMP。
+         * 而 so_path / base 在本函数开头已由 ncg_resolve_self 得到，
+         * 直接复用即可，语义完全相同（同一 so，同一基址）。 */
         uint8_t bk2[16];
-        char p2[512];
-        Dl_info di;
-        int ok2 = 0;
-        memset(&di, 0, sizeof(di));
-        if (dladdr((const void *)&ncg_head_unlock, &di) != 0
-            && di.dli_fbase && di.dli_fname) {
-            strncpy(p2, di.dli_fname, sizeof(p2) - 1);
-            p2[sizeof(p2) - 1] = 0;
-            if (ncg_boot_key(p2, (uintptr_t)di.dli_fbase, bk2) == 0) ok2 = 1;
+        if (ncg_boot_key(so_path, (uintptr_t)base, bk2) != 0) {
+            ncg_wipe(bk2, sizeof(bk2));
+            return -12;   /* fail-closed */
         }
-        if (!ok2) { ncg_wipe(bk2, sizeof(bk2)); return -12; }  /* fail-closed */
         {
             uint8_t dec[NC_SLOT_SIZE];
             ncg_rc4(bk2, 16, slotdata, dec, NC_SLOT_SIZE);
@@ -1781,7 +1781,11 @@ int ncguard_unlock(void) {
         }
         if (_ok) ncguard_stub_recover(_sp, _base);
     }
-    int rc = ncg_head_unlock();  /* 再调本体解 .ncx */
+    /* 2026-11-12：把自身地址传进去，替掉 .ncxh 内部那两处
+     * dladdr(&自身)。理由见 ncg_resolve_self 与 ncg_head_unlock 的注释：
+     * 函数内取自身地址会被 Amice 判 "non-call address uses" 而跳过 VMP。
+     * 本函数在 .text（不虚拟化），取地址在这里是安全的。 */
+    int rc = ncg_head_unlock((const void *)&ncguard_unlock);  /* 再调本体解 .ncx */
     if (rc == 0) {
         done = 1;
         /* 提交二（2026-10-30）：基线已由 ncg_head_unlock 采集完毕，
