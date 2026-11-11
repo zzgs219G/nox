@@ -49,6 +49,7 @@ import sys
 
 SECTION = '.ncx'
 ATTR = '__attribute__((section("%s"), used, retain))' % SECTION
+ANNOTATED_ATTR = ATTR   # 由 main() 在解析 --annotate 后覆盖
 
 
 class MarkError(Exception):
@@ -188,9 +189,24 @@ def _is_definition(lines, i):
     return False
 
 
+def _attr_for(annotate: bool) -> str:
+    """按是否需要 annotate 返回 attribute 文本（ATTR 由 main 里的参数拼好）。
+
+    annotate=True  → 用 ANNOTATED_ATTR（含 annotate(...)，且不带 used/retain）
+    annotate=False → 用 ATTR（纯段标记，带 used/retain）
+    """
+    return ANNOTATED_ATTR if annotate else ATTR
+
+
 def mark_text(text: str, pattern: re.Pattern, verbose: bool = False,
-              src: str = '<str>', skip_names=None):
-    """对一段源码注入标记。返回 (新文本, 命中数)。"""
+              src: str = '<str>', skip_names=None, annotate_pat=None):
+    """对一段源码注入标记。返回 (新文本, 命中数)。
+
+    annotate_pat（2026-11-11 新增）：只对这个正则也命中的函数追加 VMP annotate。
+    典型用法：--pattern 覆盖全部 6 个算法函数（都要进 .ncx），
+    --annotate-pattern 只覆盖其中 3 个密钥流函数（只有它们值得 VMP）。
+    一次调用完成，避免"先标段再补注解"被幂等判断挡住。
+    """
     lines = text.split('\n')
     out = []
     hits = 0
@@ -226,7 +242,8 @@ def mark_text(text: str, pattern: re.Pattern, verbose: bool = False,
                 and _is_definition(lines, i) \
                 and not _name_skipped(lines, i, skip_names):
             indent = re.match(r'^[ \t]*', line).group(0)
-            out.append('%s%s\n%s%s' % (indent, ATTR, indent, line.lstrip()))
+            _use_ann = bool(annotate_pat) and bool(annotate_pat.match(line))
+            out.append('%s%s\n%s%s' % (indent, _attr_for(_use_ann), indent, line.lstrip()))
             hits += 1
             if verbose:
                 print('  [mark] %s:%d  %s' % (src, i + 1, stripped[:70]))
@@ -306,6 +323,11 @@ def main(argv=None):
                          '典型：nc_guard_jni.c（它调 unlock，锁它=死锁）')
     ap.add_argument('--check', '--dry-run', action='store_true', dest='check',
                     help='只报告会改哪些行，不写文件')
+    ap.add_argument('--annotate-pattern', default='',
+                    help='只对同时命中该正则的函数追加 annotate（与 --pattern 分开）。'
+                         '典型用法：--pattern 覆盖全部要进 .ncx 的函数，'
+                         '--annotate-pattern 只覆盖其中值得 VMP 的少数几个。'
+                         '⚠️ 必须与 --annotate 一起用，否则无效。')
     ap.add_argument('--annotate', default='',
                     help='额外注入 annotate("...")（可多次，逗号分隔的表达式原样写入）。'
                          '典型用法：--annotate "+vm_virtualize" —— 让 Amice 的 VMP '
@@ -345,6 +367,32 @@ def main(argv=None):
         _attrs += ['used', 'retain']
     ATTR = '__attribute__((%s))' % ', '.join(_attrs)
 
+    # ── ANNOTATED_ATTR（2026-11-11）：给"要 VMP"的那几个函数用 ─────────
+    # 与 ATTR 的差别只有一处：加 annotate(...)，且【保留 used/retain】。
+    #
+    # 历史（同日踩两遍，别再改回去）：
+    #   ① 带 used/retain → 生成 @llvm.used → 上游 Amice 判 non-call
+    #      address use 并跳过 VMP
+    #   ② 为绕开它而删掉 used/retain → 函数被 --gc-sections 当死代码，
+    #      .ncx 里留下没人调用的副本，真正执行的是 .text 里另一份
+    #      → 现象「VMP 报成功但加密段毫无变化」
+    #   现在：amice fork 豁免 @llvm.used（它的语义是"别删"不是"取地址"），
+    #   所以 used/retain 和 annotate 可以共存。
+    _ann_attrs = ['noinline', 'section("%s")' % SECTION, 'used', 'retain']
+    if args.annotate:
+        for expr in args.annotate.split(','):
+            expr = expr.strip()
+            if expr:
+                _ann_attrs.append('annotate("%s")' % expr)
+    global ANNOTATED_ATTR
+    ANNOTATED_ATTR = '__attribute__((%s))' % ', '.join(_ann_attrs)
+    # ⚠️ 使用 --annotate-pattern 时，ATTR 必须退回【纯段标记】形态：
+    # 否则没被 annotate_pat 命中的函数会继承上面那份含 annotate 的 ATTR，
+    # 变成"全部函数都 VMP"（这正是 2026-11-11 实测踩到的：
+    # b64_decode/decrypt/utf8 三个不该 VMP 的反而带上了 annotate）。
+    if args.annotate_pattern:
+        ATTR = '__attribute__((section("%s"), used, retain))' % SECTION
+
     if not args.rule and not args.pattern:
         ap.error('必须指定 --rule 或 --pattern（不给规则 = 不知道要保护什么）')
 
@@ -359,6 +407,15 @@ def main(argv=None):
             pats.append(('custom', re.compile(args.pattern)))
         except re.error as e:
             ap.error('正则语法错误: %s' % e)
+
+    annotate_pat = None
+    if args.annotate_pattern:
+        if not args.annotate:
+            ap.error('--annotate-pattern 必须与 --annotate 一起用')
+        try:
+            annotate_pat = re.compile(args.annotate_pattern)
+        except re.error as e:
+            ap.error('--annotate-pattern 正则语法错误: %s' % e)
 
     total_files = 0
     total_hits = 0
@@ -375,7 +432,7 @@ def main(argv=None):
             file_hits = 0
             for name, pat in pats:
                 new_text, h = mark_text(new_text, pat, args.verbose, src,
-                                        args.exclude_func)
+                                        args.exclude_func, annotate_pat)
                 file_hits += h
             if file_hits:
                 total_files += 1
