@@ -1533,15 +1533,23 @@ int ncg_head_unlock(const void *self_addr) {
     /* has_nct：.nct 是【可选段】——没开第二套 VMP 的产物没有它。
      * 段序必须动态决定，不能写死（写死时若 .nct 不存在，segs[0] 会变成
      * .ncx，导致钥匙错配 → 解出乱码；test.sh 的 V6/V7 就是这样抓到的）。 */
-    int has_nct = 0;
-    {
-        ncg_shdr_t vmp2;
-        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
-            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
-            segs[nseg++] = vmp2;
-            has_nct = 1;
-        }
-    }
+    /* ⚠️⚠️ 2026-11-12 实测否决：.nct 不参与解密。
+     *
+     * 曾把 .nct（消费方 VMP 数据段）纳入锁箱，真机 dlopen 即 SIGILL
+     * （libnc.so+0x82ad8，.ncx 段内，call_constructors 阶段）。
+     * 两个段序都试过，崩溃地址完全一致；手工验证 k_nct 派生与解密
+     * 本身都正确（.nct 解出熵 2.79 的明文）。
+     *
+     * 真因在 Amice 侧：.nct 里放的是 5 类 global（字节码 / metadata /
+     * native_table / descriptor_table / ...），它们之间是构建期固定的
+     * 指针关系，解释器在 constructor 阶段就按固定偏移读取。整段加密后
+     * 那一刻读到的是密文 → 按垃圾值跳转 → SIGILL。
+     *
+     * 要让它成立须改 Amice（解释器改为按需解密字节码），工作量远超收益。
+     * 所以 here 保持 has_nct 恒为 0（段名与钥匙派生代码保留，便于将来重启），
+     * .nct 由 protect.sh 保持明文，仅作观测用。 */
+    const int has_nct = 0;
+    (void)has_nct;
     segs[nseg++] = sec;
     {
         ncg_shdr_t ro;
