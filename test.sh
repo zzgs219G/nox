@@ -149,9 +149,16 @@ guard_compile() {
         #    症状是 dlopen 报 `cannot locate symbol "ncg_report_build"`
         #    —— 而 boot.c 明明引用了它。编译不报错（分 TU 编译），
         #    只在链接后 dlopen 时才炸，定位成本很高。
-        #    通配符让"新增一个 .c"自动生效，不再依赖人记得改这里。
+        #
+        # ⚠️ 但要排除 nc_guard_jni.c：它 #include <jni.h>，那是 NDK 头，
+        #    宿主（Termux 有 / Ubuntu CI 没有）不一定存在。
+        #    JNI 绑定层不参与解锁链路，自测不需要它。
+        #    （2026-11-13 实测：改通配符后 CI 的 Ubuntu runner 上
+        #      `fatal error: 'jni.h' file not found` → verify job 红。）
+        _srcs=$(ls "$GUARD_DIR"/*.c | grep -v '/nc_guard_jni\.c$' | tr '\n' ' ')
+        # shellcheck disable=SC2086
         ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$W" \
-            "$GUARD_DIR"/*.c \
+            $_srcs \
             "$@" -o "$out" )
     else
         [ -n "$STATIC_LIB" ] || { echo "✗ 找不到静态库: $GUARD_DIR/lib" >&2; return 1; }
