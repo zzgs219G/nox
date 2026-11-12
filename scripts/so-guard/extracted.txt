@@ -1,0 +1,52 @@
+    uint8_t slotdata[NC_SLOT_SIZE];
+    memset(slotdata, 0, sizeof(slotdata));
+    int fd = open(so_path, O_RDONLY);
+    if (fd < 0) return -6;
+    ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.offset);
+    close(fd);
+    if (got < 32) return -7;
+
+    /* ── T4（2026-10-28）：.nck 已加密，先解密 ──────────────────────
+     * .nck 整段（96 字节）在锁箱时被 boot_key 加密（见 _encrypt_slots）。
+     * 这里 pread 拿到的是密文，必须先用同一把 boot_key 解开才能读字段。
+     *
+     * ⚠️ 2026-10-29 修正：这里原来【无条件】解密，但未锁箱（开发期）
+     *    .nck 本就是明文 —— 无条件解会解出乱码然后被误判成"未锁"。
+     *    改为先看 .ncks 的 magic 判断是否已锁，只有已锁才解 .nck。
+     * ⚠️ boot_key 不缓存（缓存＝又一处常驻明文）。这里重算一次，
+     *    代价是再跑一次 CRC+HKDF（实测微秒级），只在 constructor 一次。 */
+    int so_locked = 0;
+    {
+        /* 用 .ncks 的 magic 判"是否已锁"（.ncks[0:8) 永远明文） */
+        ncg_shdr_t nks;
+        if (ncg_find_section(so_path, NC_SEC_STUBSLOT, &nks) == 0
+            && nks.size >= NC_OFF_FRAGS_ENC) {
+            uint8_t probe[8];
+            int pfd = open(so_path, O_RDONLY);
+            if (pfd >= 0) {
+                if (pread(pfd, probe, 8, nks.offset) == 8
+                    && ncg_magic_ok(probe, NCG_MAGIC_SEED_STUB))
+                    so_locked = 1;
+                close(pfd);
+            }
+        }
+    }
+    if (so_locked && slot.size >= NC_SLOT_SIZE) {
+        /* 2026-11-12：原先这里再调一次 dladdr(&ncg_head_unlock) ——
+         * 那是本函数内的第二次「取自身地址」，会让 Amice 判定
+         * "non-call address uses" 并跳过 VMP。
+         * 而 so_path / base 在本函数开头已由 ncg_resolve_self 得到，
+         * 直接复用即可，语义完全相同（同一 so，同一基址）。 */
+        uint8_t bk2[16];
+        if (ncg_boot_key(so_path, (uintptr_t)base, bk2) != 0) {
+            ncg_wipe(bk2, sizeof(bk2));
+            return -12;   /* fail-closed */
+        }
+        {
+            uint8_t dec[NC_SLOT_SIZE];
+            ncg_rc4(bk2, 16, slotdata, dec, NC_SLOT_SIZE);
+            memcpy(slotdata, dec, NC_SLOT_SIZE);
+            ncg_wipe(dec, sizeof(dec));
+        }
+        ncg_wipe(bk2, sizeof(bk2));
+    }

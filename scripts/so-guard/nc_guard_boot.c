@@ -1016,6 +1016,208 @@ static int ncg_derive_kso_bound(const char *so_path,
     return 0;
 }
 
+/* ── 密文完整性校验（2026-11-12 从 ncg_head_unlock 拆出）──────────────
+ *
+ * 为什么拆：Amice 的 values 按 alloca 计，主函数超预算（VM 只有 32 个
+ * x 寄存器，实测 values=25）。这一段自带 k_mac[16]+got_mac[32]+hcbuf[256]
+ * 三个栈槽，抽出去能降峰值。
+ *
+ * ⚠️ 语义与时序完全不变：仍是「先验后解」，且在 mprotect/解密【之前】。
+ *    MAC 不符 → 一个字节都不解 → 段保持密文 → 调用即 SIGILL（fail-closed）。
+ *    不擦调用方的 key —— 由调用方统一处理（行为等价）。
+ *
+ * 返回 0 通过；-11 不通过；-12 密钥派生失败。 */
+NC_VMP_FUNC
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static int ncg_verify_seg_mac(const uint8_t master[32],
+                              const uint8_t *der, size_t der_len,
+                              const char *pkg,
+                              const ncg_shdr_t *segs, int nseg,
+                              const void *base,
+                              const uint8_t *slotdata) {
+    uint8_t k_mac[16], got_mac[32];
+    const uint8_t *want = slotdata + NC_OFF_EXPMAC;
+    uint8_t diff = 0;
+    int i;
+
+    if (ncg_derive_k_mac_from_der(master, der, der_len, pkg, k_mac) != 0)
+        return -12;
+
+    {
+        _Alignas(KHMAC_CTX_ALIGN) unsigned char hcbuf[KHMAC_CTX_SIZE];
+        khmac_ctx *hc = (khmac_ctx *)hcbuf;
+        khmac_init(hc, k_mac, 16);
+        for (i = 0; i < nseg; i++) {
+            const uint8_t *p = (const uint8_t *)base + segs[i].addr;
+            khmac_update(hc, p, segs[i].size);
+        }
+        khmac_final(hc, got_mac);
+        memset(hcbuf, 0, sizeof(hcbuf));
+    }
+    for (i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
+    ncg_wipe(k_mac, sizeof(k_mac));
+    ncg_wipe(got_mac, sizeof(got_mac));
+    return (diff != 0) ? -11 : 0;
+}
+
+/* ── 分段解密 + 段权限 + 完整性基线（2026-11-12 从 ncg_head_unlock 拆出）
+ *
+ * 为什么拆：Amice 的 values 按 alloca 计，主函数超预算。
+ * 这一段自带循环变量、segkey[16]、buf 等栈槽，抽出去降峰值。
+ *
+ * 语义与拆分前完全一致：逐段 mprotect(RW[+X]) → 派生段密钥 → RC4 解
+ * → 恢复最小权限 → 采集完整性基线（ncg_baseline_init）。
+ *
+ * ⚠️ 段序必须与 so-section-lock.py 的 _SEG_KEYS 一致（代码段在前）。
+ * ⚠️ 失败路径擦 k_out；成功时 k_out 保留（后续要用）。
+ * ⚠️ 返回码同原实现：-8/-9/-10/-12。
+ */
+NC_VMP_FUNC
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static int ncg_decrypt_segments(const char *so_path, const void *base,
+                                const uint8_t master[32],
+                                const uint8_t *der, size_t der_len,
+                                const char *pkg,
+                                const ncg_shdr_t *segs, int nseg,
+                                uint8_t k_out[16]) {
+    /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
+     * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
+     * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
+     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncx 与 .text 尾部
+     * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
+     * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
+     * 按页对齐，否则会失败。 */
+    uintptr_t ps = getpagesize();
+    for (int i = 0; i < nseg; i++) {
+        uint8_t *tgt = (uint8_t *)base + segs[i].addr;
+        size_t len = (size_t)segs[i].size;
+        /* 数据段不需要 EXEC；代码段需要 */
+        int is_code = (segs[i].flags & SHF_EXECINSTR) != 0;
+        uintptr_t s = (uintptr_t) tgt & ~(ps - 1);
+        uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
+        if (mprotect((void *) s, e - s,
+                     PROT_READ | PROT_WRITE | (is_code ? PROT_EXEC : 0)) != 0) {
+            ncg_wipe(k_out, 16);
+            return -8;
+        }
+        /* ── 段密钥（2026-10-28，逆向报告 §6.2）───────────────────────
+         * 第 0 段（.ncx 代码）用 k_so；第 1 段（.ncxr 常量表）用 k_so_r。
+         * 与锁箱侧 so-section-lock.py 的 _SEG_KEYS 顺序必须逐字节一致。
+         *
+         * 为什么必须分钥匙：RC4 是流密码，两段共用 k_so 且都从 keystream
+         * 偏移 0 起 = two-time-pad 误用。实测已知 .ncxr 明文
+         * （96 字节签名表，结构高度可猜）即可反推 .ncx 前 96 字节明文。
+         *
+         * 向后兼容：老产物（只有 .ncx、nseg==1）仍走 k_so，行为与历史一致。
+         * 老产物若有两段（升级前的锁箱产物），.ncxr 会被 k_so_r 解出乱码 →
+         * MAC 覆盖两段密文，验签在解密【之前】已经比对过密文，不受影响；
+         * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
+         * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
+        uint8_t segkey[16];
+        if (i == 0) {
+            memcpy(segkey, k_out, 16);
+        } else {
+            if (ncg_derive_k_so_r_from_der(master, der, der_len, pkg,
+                                           segkey) != 0) {
+                ncg_wipe(k_out, 16);
+                return -12;
+            }
+        }
+        uint8_t *buf = (uint8_t *)malloc(len);
+        if (!buf) { ncg_wipe(k_out, 16); return -9; }
+        ncg_rc4(segkey, 16, tgt, buf, len);
+        ncg_wipe(segkey, sizeof(segkey));
+        memcpy(tgt, buf, len);
+        free(buf);
+        if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
+        /* ⚠️⚠️ 2026-10-30 修 SIGSEGV（实测复现）：
+         *   原实现对数据段设 PROT_READ（只读）——前提是"该页只属于它"。
+         *   但实测布局里 .ncxr 与 .bss 同页：
+         *       .ncxr  addr=0xc54e size=17   ┐ 同属页 0xc000
+         *       .bss   addr=0xc560 size=9968 ┘
+         *   mprotect 粒度是页 → 把整页设成只读 → .bss 也变只读 →
+         *   之后任何 .bss 写入即 SIGSEGV（dlopen 阶段直接崩）。
+         *
+         *   这与 .ncxhr/master 段踩的是同一个坑（见 ncg_stub_recover 里
+         *   "恢复成 RW 而不是 R" 的注释）。当时的修法只覆盖了 master，
+         *   没覆盖这里 —— 因为主项目的 .ncxr（96 字节签名表）恰好与
+         *   .data 同页而非 .bss，没暴露出来。
+         *
+         *   修法：数据段若与"本来可写"的段同页，保持 RW。
+         *   密文段的安全性从来靠"内容是密文"，不靠页权限 ——
+         *   所以放宽成 RW 不降低防护（攻击者能读，本来就该能读；
+         *   能写也没用，MAC 会拒）。 */
+        {
+            int prot = PROT_READ;
+            if (is_code) {
+                prot |= PROT_EXEC;
+                /* ⚠️ 2026-11-11 实验开关：NC_CODE_SEG_RWX
+                 *
+                 * 背景：VMP（Amice）改写过的函数需要运行期写入自己的
+                 * dispatch/token 区域，而这里原本只给 RX。实测开 --vmp 后
+                 * 必现 SIGSEGV / SEGV_ACCERR，崩溃地址低 12 位恒在页尾
+                 * （0xff0/0xff8），是典型的"写只读页"特征。
+                 * 同一份代码不开 --vmp 则完全正常（进程存活、签名校验通过）。
+                 *
+                 * 代价（如实，别低估）：RWX 段是 Frida 脚本的第一眼目标，
+                 * 也更容易被内存 dump —— 这是用「防动态分析」换「VMP 可用」。
+                 *
+                 * 默认不开。要验证推断时加 -DNC_CODE_SEG_RWX 重编 nox；
+                 * 长期方案应该是让 VMP 的数据落在独立可写段（amice 侧改），
+                 * 而不是把整个代码段放宽。 */
+#if defined(NC_CODE_SEG_RWX)
+                prot |= PROT_WRITE;
+#endif
+            } else {
+                /* 数据段：同页若含 .data/.bss（原始权限可写），保持 RW，
+                 * 否则会误伤。判据：检查覆盖该段的整页范围内，
+                 * 是否有其它段要求 SHF_WRITE。 */
+                if (ncg_page_has_writable_neighbor(so_path, (uintptr_t)tgt,
+                                                   len, ps)) {
+                    prot |= PROT_WRITE;
+                }
+            }
+            if (mprotect((void *) s, e - s, prot) != 0) {
+                ncg_wipe(k_out, 16);
+                return -10;
+            }
+        }
+    }
+
+    /* ── 提交二（2026-10-30）：记录解密后 .ncx 明文的完整性基线 ─────────
+     * 动机：解锁成功后 .ncx 明文常驻文件映射页，此后【再无任何自检】。
+     *   Frida 的 Interceptor 默认走 inline hook —— 必然改写该页指令，
+     *   而当前实现对"代码被改"完全无感知、不报错、不处置。
+     * 这是整个方案目前最大的空白（环境探针只查外部环境，不查自身代码）。
+     *
+     * 为什么必须在【这里】采集基线（不能等到 watchdog 首轮）：
+     *   攻击者可以在 unlock 返回后、watchdog 首次轮询前挂 hook。
+     *   若基线在 hook 之后才采，就把"已被 hook 的版本"当成正确基线，
+     *   检测永久失效。基线必须紧贴解密完成的时刻。
+     *
+     * 为什么能这样比（前提已实测）：.ncx 段【零重定位】——
+     *   实测 365 个重定位全部落在 0x12310 之后，而 .ncx 结束于 0xded4。
+     *   故文件字节 == 内存字节，运行期内存 CRC 与构建期一致，可直接
+     *   以"解锁后内存快照"作基线自比（不依赖文件读取，零 I/O）。
+     *
+     * 只记基线不启动线程：本函数在 .ncxh（密文段）内，起线程会与
+     *   env_check.c 的 watchdog 重复。轮询统一由 .text 侧的
+     *   ncguard_code_check() 承担（见其定义）。
+     *
+     * ⚠️ 采集范围覆盖两段（.ncx 代码 + .ncxr 常量表）：签名表被改同样
+     *   要检出，否则攻击者改常量表绕过判定而不触发任何检测。 */
+    {
+        uint8_t *addrs[NC_CODE_SEG_MAX];
+        uint32_t sizes[NC_CODE_SEG_MAX];
+        for (int i = 0; i < nseg && i < NC_CODE_SEG_MAX; i++) {
+            addrs[i] = (uint8_t *)base + segs[i].addr;
+            sizes[i] = (uint32_t)segs[i].size;
+        }
+        ncg_baseline_init(addrs, sizes, nseg);
+    }
+    return 0;
+}
+
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 int ncg_head_unlock(const void *self_addr) {
@@ -1030,6 +1232,9 @@ int ncg_head_unlock(const void *self_addr) {
     if ((sec.flags & SHF_ALLOC) == 0) return -5;
 
     uint8_t slotdata[NC_SLOT_SIZE];
+    /* scrbuf：probe（8B）与 dec（96B）共用的暂存区，两者作用域不重叠。
+     * 合并后少一个 alloca（Amice 的 values 按 alloca 计）。 */
+    uint8_t scrbuf[NC_SLOT_SIZE];
     memset(slotdata, 0, sizeof(slotdata));
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -6;
@@ -1052,11 +1257,11 @@ int ncg_head_unlock(const void *self_addr) {
         ncg_shdr_t nks;
         if (ncg_find_section(so_path, NC_SEC_STUBSLOT, &nks) == 0
             && nks.size >= NC_OFF_FRAGS_ENC) {
-            uint8_t probe[8];
             int pfd = open(so_path, O_RDONLY);
             if (pfd >= 0) {
-                if (pread(pfd, probe, 8, nks.offset) == 8
-                    && ncg_magic_ok(probe, NCG_MAGIC_SEED_STUB))
+                memset(scrbuf, 0, sizeof(scrbuf));
+                if (pread(pfd, scrbuf, 8, nks.offset) == 8
+                    && ncg_magic_ok(scrbuf, NCG_MAGIC_SEED_STUB))
                     so_locked = 1;
                 close(pfd);
             }
@@ -1074,10 +1279,9 @@ int ncg_head_unlock(const void *self_addr) {
             return -12;   /* fail-closed */
         }
         {
-            uint8_t dec[NC_SLOT_SIZE];
-            ncg_rc4(bk2, 16, slotdata, dec, NC_SLOT_SIZE);
-            memcpy(slotdata, dec, NC_SLOT_SIZE);
-            ncg_wipe(dec, sizeof(dec));
+            ncg_rc4(bk2, 16, slotdata, scrbuf, NC_SLOT_SIZE);
+            memcpy(slotdata, scrbuf, NC_SLOT_SIZE);
+            ncg_wipe(scrbuf, sizeof(scrbuf));
         }
         ncg_wipe(bk2, sizeof(bk2));
     }
@@ -1215,191 +1419,26 @@ int ncg_head_unlock(const void *self_addr) {
 
     uint8_t *target = (uint8_t *)base + sec.addr;
 
-    /* 完整性校验：先验后解（位置在 mprotect/解密之前）
-     *
-     * ⚠️ 2026-10-19 P1-a：k_mac 不再从 slot 读，而是与 k_so 一样从证书
-     * 重新派生（label 用独立的 "nc-so-mac-v1"，与 so 域硬分隔）。
-     * 理由：slot 里的 wrapped_k_mac 等于把完整性密钥交给攻击者——
-     * 他能用它伪造 MAC，让被篡改的密文"验签通过"。
-     * 锁箱侧对应地把该字段写成诱饵值（见 so-section-lock.py 的 _decoy_mac）。
-     *
-     * ⚠️ 2026-10-28：去掉了原来的 `if (have_mac)` 开关，改为【无条件校验】。
-     * 槽完整性已在上方前置检查里 fail-closed，能走到这里说明槽一定完整。 */
+    /* 完整性校验：先验后解（位置在 mprotect/解密之前）。
+     * 2026-11-12：拆成独立函数（降 alloca）。⚠️ 时序不变。 */
     {
-        uint8_t k_mac[16], got_mac[32];
-        if (ncg_derive_k_mac_from_der(master, der_buf, der_len, pkg_buf,
-                                      k_mac) != 0) {
+        int mrc = ncg_verify_seg_mac(master, der_buf, der_len, pkg_buf,
+                                     segs, nseg, base, slotdata);
+        if (mrc != 0) {
             ncg_wipe(key, sizeof(key));
-            memset(slotdata, 0, sizeof(slotdata));
-            return -12;
-        }
-        /* MAC 覆盖【所有段密文的拼接】，顺序与锁箱侧一致（代码段在前）。
-         * 用增量 HMAC：两段不连续，一次性算需要额外拼缓冲（最多几十 KB，
-         * 不值得为它 malloc + memcpy）。增量式零额外内存、零拷贝。 */
-        {
-            /* 不透明类型不能直接开栈对象 → 用对齐的字节缓冲 + 尺寸宏。
-             * nc_guard_key.c 里有 static_assert 保证 sizeof <= KHMAC_CTX_SIZE，
-             * 所以这里开 KHMAC_CTX_SIZE 必定够用。 */
-            _Alignas(KHMAC_CTX_ALIGN) unsigned char hcbuf[KHMAC_CTX_SIZE];
-            khmac_ctx *hc = (khmac_ctx *)hcbuf;
-            khmac_init(hc, k_mac, 16);
-            for (int i = 0; i < nseg; i++) {
-                const uint8_t *p = (const uint8_t *)base + segs[i].addr;
-                khmac_update(hc, p, segs[i].size);
-            }
-            khmac_final(hc, got_mac);
-            memset(hcbuf, 0, sizeof(hcbuf));
-        }
-        const uint8_t *want = slotdata + NC_OFF_EXPMAC;
-        uint8_t diff = 0;
-        for (int i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
-        ncg_wipe(k_mac, sizeof(k_mac));
-        ncg_wipe(got_mac, sizeof(got_mac));
-        if (diff != 0) {
-            ncg_wipe(key, sizeof(key));
-            return -11;
+            if (mrc == -12) memset(slotdata, 0, sizeof(slotdata));
+            return mrc;
         }
     }
 
-    /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
-     * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
-     * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
-     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncx 与 .text 尾部
-     * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
-     * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
-     * 按页对齐，否则会失败。 */
-    uintptr_t ps = getpagesize();
-    for (int i = 0; i < nseg; i++) {
-        uint8_t *tgt = (uint8_t *)base + segs[i].addr;
-        size_t len = (size_t)segs[i].size;
-        /* 数据段不需要 EXEC；代码段需要 */
-        int is_code = (segs[i].flags & SHF_EXECINSTR) != 0;
-        uintptr_t s = (uintptr_t) tgt & ~(ps - 1);
-        uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
-        if (mprotect((void *) s, e - s,
-                     PROT_READ | PROT_WRITE | (is_code ? PROT_EXEC : 0)) != 0) {
-            ncg_wipe(key, sizeof(key));
-            return -8;
-        }
-        /* ── 段密钥（2026-10-28，逆向报告 §6.2）───────────────────────
-         * 第 0 段（.ncx 代码）用 k_so；第 1 段（.ncxr 常量表）用 k_so_r。
-         * 与锁箱侧 so-section-lock.py 的 _SEG_KEYS 顺序必须逐字节一致。
-         *
-         * 为什么必须分钥匙：RC4 是流密码，两段共用 k_so 且都从 keystream
-         * 偏移 0 起 = two-time-pad 误用。实测已知 .ncxr 明文
-         * （96 字节签名表，结构高度可猜）即可反推 .ncx 前 96 字节明文。
-         *
-         * 向后兼容：老产物（只有 .ncx、nseg==1）仍走 k_so，行为与历史一致。
-         * 老产物若有两段（升级前的锁箱产物），.ncxr 会被 k_so_r 解出乱码 →
-         * MAC 覆盖两段密文，验签在解密【之前】已经比对过密文，不受影响；
-         * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
-         * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
-        uint8_t segkey[16];
-        if (i == 0) {
-            memcpy(segkey, key, 16);
-        } else {
-            if (ncg_derive_k_so_r_from_der(master, der_buf, der_len, pkg_buf,
-                                           segkey) != 0) {
-                ncg_wipe(key, sizeof(key));
-                return -12;
-            }
-        }
-        uint8_t *buf = (uint8_t *)malloc(len);
-        if (!buf) { ncg_wipe(key, sizeof(key)); return -9; }
-        ncg_rc4(segkey, 16, tgt, buf, len);
-        ncg_wipe(segkey, sizeof(segkey));
-        memcpy(tgt, buf, len);
-        free(buf);
-        if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
-        /* ⚠️⚠️ 2026-10-30 修 SIGSEGV（实测复现）：
-         *   原实现对数据段设 PROT_READ（只读）——前提是"该页只属于它"。
-         *   但实测布局里 .ncxr 与 .bss 同页：
-         *       .ncxr  addr=0xc54e size=17   ┐ 同属页 0xc000
-         *       .bss   addr=0xc560 size=9968 ┘
-         *   mprotect 粒度是页 → 把整页设成只读 → .bss 也变只读 →
-         *   之后任何 .bss 写入即 SIGSEGV（dlopen 阶段直接崩）。
-         *
-         *   这与 .ncxhr/master 段踩的是同一个坑（见 ncg_stub_recover 里
-         *   "恢复成 RW 而不是 R" 的注释）。当时的修法只覆盖了 master，
-         *   没覆盖这里 —— 因为主项目的 .ncxr（96 字节签名表）恰好与
-         *   .data 同页而非 .bss，没暴露出来。
-         *
-         *   修法：数据段若与"本来可写"的段同页，保持 RW。
-         *   密文段的安全性从来靠"内容是密文"，不靠页权限 ——
-         *   所以放宽成 RW 不降低防护（攻击者能读，本来就该能读；
-         *   能写也没用，MAC 会拒）。 */
-        {
-            int prot = PROT_READ;
-            if (is_code) {
-                prot |= PROT_EXEC;
-                /* ⚠️ 2026-11-11 实验开关：NC_CODE_SEG_RWX
-                 *
-                 * 背景：VMP（Amice）改写过的函数需要运行期写入自己的
-                 * dispatch/token 区域，而这里原本只给 RX。实测开 --vmp 后
-                 * 必现 SIGSEGV / SEGV_ACCERR，崩溃地址低 12 位恒在页尾
-                 * （0xff0/0xff8），是典型的"写只读页"特征。
-                 * 同一份代码不开 --vmp 则完全正常（进程存活、签名校验通过）。
-                 *
-                 * 代价（如实，别低估）：RWX 段是 Frida 脚本的第一眼目标，
-                 * 也更容易被内存 dump —— 这是用「防动态分析」换「VMP 可用」。
-                 *
-                 * 默认不开。要验证推断时加 -DNC_CODE_SEG_RWX 重编 nox；
-                 * 长期方案应该是让 VMP 的数据落在独立可写段（amice 侧改），
-                 * 而不是把整个代码段放宽。 */
-#if defined(NC_CODE_SEG_RWX)
-                prot |= PROT_WRITE;
-#endif
-            } else {
-                /* 数据段：同页若含 .data/.bss（原始权限可写），保持 RW，
-                 * 否则会误伤。判据：检查覆盖该段的整页范围内，
-                 * 是否有其它段要求 SHF_WRITE。 */
-                if (ncg_page_has_writable_neighbor(so_path, (uintptr_t)tgt,
-                                                   len, ps)) {
-                    prot |= PROT_WRITE;
-                }
-            }
-            if (mprotect((void *) s, e - s, prot) != 0) {
-                ncg_wipe(key, sizeof(key));
-                return -10;
-            }
-        }
+    /* 2026-11-12：拆成独立函数（降 alloca）。逐段解密+权限+基线都在里面。 */
+    {
+        int drc = ncg_decrypt_segments(so_path, base, master, der_buf, der_len,
+                                       pkg_buf, segs, nseg, key);
+        if (drc != 0) return drc;
     }
-
-    ncg_wipe(key, sizeof(key));
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
     ncg_unlocked = 1;
-
-    /* ── 提交二（2026-10-30）：记录解密后 .ncx 明文的完整性基线 ─────────
-     * 动机：解锁成功后 .ncx 明文常驻文件映射页，此后【再无任何自检】。
-     *   Frida 的 Interceptor 默认走 inline hook —— 必然改写该页指令，
-     *   而当前实现对"代码被改"完全无感知、不报错、不处置。
-     * 这是整个方案目前最大的空白（环境探针只查外部环境，不查自身代码）。
-     *
-     * 为什么必须在【这里】采集基线（不能等到 watchdog 首轮）：
-     *   攻击者可以在 unlock 返回后、watchdog 首次轮询前挂 hook。
-     *   若基线在 hook 之后才采，就把"已被 hook 的版本"当成正确基线，
-     *   检测永久失效。基线必须紧贴解密完成的时刻。
-     *
-     * 为什么能这样比（前提已实测）：.ncx 段【零重定位】——
-     *   实测 365 个重定位全部落在 0x12310 之后，而 .ncx 结束于 0xded4。
-     *   故文件字节 == 内存字节，运行期内存 CRC 与构建期一致，可直接
-     *   以"解锁后内存快照"作基线自比（不依赖文件读取，零 I/O）。
-     *
-     * 只记基线不启动线程：本函数在 .ncxh（密文段）内，起线程会与
-     *   env_check.c 的 watchdog 重复。轮询统一由 .text 侧的
-     *   ncguard_code_check() 承担（见其定义）。
-     *
-     * ⚠️ 采集范围覆盖两段（.ncx 代码 + .ncxr 常量表）：签名表被改同样
-     *   要检出，否则攻击者改常量表绕过判定而不触发任何检测。 */
-    {
-        uint8_t *addrs[NC_CODE_SEG_MAX];
-        uint32_t sizes[NC_CODE_SEG_MAX];
-        for (int i = 0; i < nseg && i < NC_CODE_SEG_MAX; i++) {
-            addrs[i] = (uint8_t *)base + segs[i].addr;
-            sizes[i] = (uint32_t)segs[i].size;
-        }
-        ncg_baseline_init(addrs, sizes, nseg);
-    }
 
     /* 用后即毁已挪至 ncguard_unlock（.text 侧）——第一版放在这里
      * （ncg_head_unlock 尾部）是错的：PC 还在本段执行时把自己置零
