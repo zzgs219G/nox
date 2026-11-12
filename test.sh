@@ -144,10 +144,14 @@ guard_compile() {
     local out="$1"; shift
     if [ "$HAS_SRC" = "1" ]; then
         cp "$GUARD_DIR"/*.h "$W"/ 2>/dev/null
+        # ⚠️ 用通配符而不是硬编码清单（2026-11-13 改）：
+        #    此前是显式列出 6 个 .c，新增 nc_guard_report.c 时漏加，
+        #    症状是 dlopen 报 `cannot locate symbol "ncg_report_build"`
+        #    —— 而 boot.c 明明引用了它。编译不报错（分 TU 编译），
+        #    只在链接后 dlopen 时才炸，定位成本很高。
+        #    通配符让"新增一个 .c"自动生效，不再依赖人记得改这里。
         ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$W" \
-            "$GUARD_DIR"/nc_guard_boot.c "$GUARD_DIR"/nc_guard_probe.c \
-            "$GUARD_DIR"/nc_guard_key.c "$GUARD_DIR"/nc_guard_paths.c \
-            "$GUARD_DIR"/nc_guard_xor.c "$GUARD_DIR"/nc_guard_crypto.c \
+            "$GUARD_DIR"/*.c \
             "$@" -o "$out" )
     else
         [ -n "$STATIC_LIB" ] || { echo "✗ 找不到静态库: $GUARD_DIR/lib" >&2; return 1; }
@@ -733,6 +737,76 @@ PY
     fi
 else
     bad "V11 编译失败"; head -10 "$W/v11build.log"
+fi
+
+# ── V12 自检报告（2026-11-13 新增）──
+# 为什么单独一组：这份报告是排障的唯一抓手（"锁没锁上/位置对不对/
+# 有没有 VMP/几套"）。它错了比没有更糟 —— 会把人引向错误方向。
+# 本组钉住三件事：
+#   ① 报告能产出且格式完整
+#   ② 熵判据真的能区分"已解密/密文"（用同一份产物的内存 vs 文件对比）
+#   ③ VMP 套数判定的正确性（本测试构建无 VMP → 必须报 0）
+echo "── V12 自检报告 ──"
+if [ "$CAN_EXEC" = "0" ]; then
+    skip "V12 需要执行（静态库形态在宿主跑不了）"
+elif [ ! -f "$W/l2.so" ]; then
+    skip "V12 无解锁产物"
+else
+    mkdir -p "$W/fake/$PKG_FIX/lib/arm64-v8a"
+    cp "$W/l2.so" "$W/fake/$PKG_FIX/lib/arm64-v8a/libt.so"
+    RLOG="$W/ncguard_report.log"
+    rm -f "$RLOG"
+    ( cd "$W/fake/$PKG_FIX" && \
+      NCG_REPORT_PATH="$RLOG" bash -c \
+      "exec -a $PKG_FIX '$W/drv' ./lib/arm64-v8a/libt.so" ) >/dev/null 2>&1
+
+    if [ -s "$RLOG" ]; then
+        ok "V12a 报告已产出（$(wc -c <"$RLOG") 字节）"
+
+        # ② 熵判据：解锁成功的包里 .ncxh（3.7KB，样本够大）必须判"已解密"
+        #    ⚠️ 为什么不用 .ncx：测试产物里它只有 196 字节，
+        #       小样本熵不可靠（曾因此得到"✅已解密"的错误结论）。
+        #       报告对 <512B 的段会显示"样本不足"，不参与判定。
+        #    ⚠️ 这条曾是真 bug：第一版从【文件】读熵，而解锁后的明文在
+        #       【内存】里，导致解锁成功的包把已解密段报成"仍是密文"。
+        if grep -q '\.ncxh .*✅已解密' "$RLOG"; then
+            ok "V12b .ncxh 判定为已解密（熵判据读内存，正确）"
+        elif grep -q '\.ncxh .*❌仍是密文' "$RLOG"; then
+            bad "V12b .ncxh 被误报为密文 —— 报告读的是文件而非内存"
+            grep '\.ncxh ' "$RLOG" | head -2
+        else
+            bad "V12b .ncxh 判定缺失"
+            grep '\.ncxh ' "$RLOG" | head -2
+        fi
+
+        # ⑤ 小样本保护：.ncx 196B < 512B，必须显示"样本不足"而不是乱给判定
+        #    这条钉住的是"宁可不判，也不给错结论"。
+        if grep -q '\.ncx .*样本不足' "$RLOG"; then
+            ok "V12e 小样本不下结论（.ncx 196B → 样本不足）"
+        else
+            bad "V12e 小样本给了熵判定 —— 会误导（曾把密文报成已解密）"
+            grep '\.ncx ' "$RLOG" | head -2
+        fi
+
+        # ③ VMP 套数：本测试构建【没有】VMP，必须报 0 且不误报
+        if grep -q '套数: 0' "$RLOG"; then
+            ok "V12c VMP 套数判定正确（本构建无 VMP → 0）"
+        else
+            bad "V12c VMP 套数判定错误（本构建无 VMP，应为 0）"
+            grep -A2 '\[VMP\]' "$RLOG" | head -3
+        fi
+
+        # ④ 权限列：ELF64 的 flags 偏移曾读成 type（@4 而非 @8），
+        #    导致 .ncx 显示 '-w-'。这里钉死必须是 r-x。
+        if grep -q '\.ncx .* r-x' "$RLOG"; then
+            ok "V12d 段权限解析正确（.ncx = r-x）"
+        else
+            bad "V12d 段权限解析错误（.ncx 应为 r-x）—— ELF64 flags 偏移查一遍"
+            grep '\.ncx ' "$RLOG" | head -2
+        fi
+    else
+        bad "V12a 报告未产出（哨兵/路径/写权限？）"
+    fi
 fi
 
 echo ""

@@ -138,3 +138,24 @@ int ncg_scan_maps_for_base_apk(const char *maps_path, char *out, size_t cap);
 
 #endif /* _NC_GUARD_INTERNAL_H_ */
 
+
+/* ── 自检报告（2026-11-13，nc_guard_report.c）─────────────────────────
+ *
+ * ⚠️ 全部在 .text 明文：解锁完成后才调用，需要读段表算熵。
+ * ⚠️ 缓冲由调用方提供（栈上）—— 绝不能用全局数组，那会撑大 .bss，
+ *    改变 .ncxhr 与 .bss 的页面归属 → ncg_page_has_writable_neighbor
+ *    判定变化 → SIGILL（2026-11-13 实测，rc=132）。 */
+#define NCG_REPORT_CAP 1536
+
+/* 生成报告正文到 buf（NUL 结尾）。so_path = 自身路径。 */
+/* img_base = dladdr 得到的 dli_fbase（镜像基址）。
+ * ⚠️ 必须传：报告在解锁【之后】跑，段在内存里已解密而文件里仍是密文，
+ *    只读文件会把"已解密的段"误报成密文。img_base==0 时退回读文件。 */
+void ncg_report_build(char *buf, size_t cap, const char *so_path,
+                      uintptr_t img_base, int unlock_ok);
+
+/* 追加写入日志文件。哨兵不存在 / 任何 I/O 失败 → 返回 -1，调用方忽略。 */
+int ncg_report_flush(const char *buf, size_t len);
+
+/* 计算日志文件路径（哨兵 /storage/emulated/0/xixin_debug 存在才算开）。 */
+int ncg_debug_log_path(char *out, size_t cap);

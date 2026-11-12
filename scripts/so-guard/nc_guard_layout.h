@@ -81,8 +81,13 @@
  *    Amice 插件生成，这里只登记段名供解锁时查找。
  * ⚠️ .nct 与 .ncr 都是【可选段】：没开 VMP 的构建两者都没有。消费顺序
  *    必须动态决定（见 nc_guard_boot.c 的 has_nct），写死索引会让钥匙错配。 */
-#define NC_SEC_VMP       ".ncr"    /* 第一套解释器（明文，循环依赖）*/
-#define NC_SEC_VMP2      ".nct"    /* 第二套解释器（锁箱加密）*/
+#define NC_SEC_VMP       ".ncr"    /* 第一套解释器（明文，循环依赖，AX）*/
+#define NC_SEC_VMP2      ".nct"    /* 第二套解释器（锁箱加密，AX）*/
+/* 2026-11-13：VMP 数据段。与解释器段分开是 clang 硬约束 ——
+ * 同名段里既有函数又有 const 数据会报
+ *   `error: 'f' causes a section type conflict with 'tbl'`（实测确认）。 */
+#define NC_SEC_VMPBC     ".ncq"    /* VM 字节码（纯数据，可加密）*/
+#define NC_SEC_VMPTBL    ".ncs"    /* descriptor/native 表（含重定位，必须明文）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节

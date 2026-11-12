@@ -183,10 +183,26 @@ for abi in arm64-v8a armeabi-v7a; do
                     echo "  如需回退：AMICE_VMP_PROFILE=simple" >&2
                     exit 1
                 }
+                # ── 段归属（2026-11-13，用户架构）──────────────────
+                #   .ncr  第一套 VMP 的【解释器】   ← 本行配置，明文，必须 AX
+                #   .ncq  字节码（纯数据）          ← 可整体加密
+                #   .ncs  descriptor / native 表    ← 含重定位，必须明文
+                #
+                # ⚠️ 解释器与数据必须不同段：clang 拒绝同段既有函数又有 const
+                #    数据（error: causes a section type conflict）。
+                # ⚠️ .ncr 必须可执行（AX）：里面是 ARM64 代码，放进只读数据段
+                #    执行即 SIGSEGV。amice 生成函数时自动带 EXECINSTR。
+                # ⚠️ 第一套解释器【不能加密】：解 .ncx 的钥匙（k_so）要执行
+                #    .ncr 里的代码（ncg_boot_key 被 VMP），加密即自锁。
                 AMICE_VM_VIRTUALIZE=true AMICE_VM_PROFILE_PATH="$_profdir" \
+                    AMICE_VM_INSN_SECTION=".ncr" \
+                    AMICE_VM_DATA_SECTION=".ncq,.ncs" \
                     "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
             else
-                AMICE_VM_VIRTUALIZE=true "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
+                AMICE_VM_VIRTUALIZE=true \
+                    AMICE_VM_INSN_SECTION=".ncr" \
+                    AMICE_VM_DATA_SECTION=".ncq,.ncs" \
+                    "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"
             fi
         else
             "$CC" -c $CFLAGS "$GUARD/$f.c" -o "$_out/$f.o"

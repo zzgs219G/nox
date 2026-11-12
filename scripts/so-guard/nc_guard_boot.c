@@ -40,6 +40,13 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
+/* 自检报告开关（2026-11-13）。
+ * 默认 1（生产开着 —— 排障价值远大于 1KB 体积）。
+ * 设 0 可完全排除该路径用于二分定位。 */
+#ifndef NCG_REPORT_ENABLE
+#  define NCG_REPORT_ENABLE 1
+#endif
+
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -1953,6 +1960,42 @@ int ncguard_unlock(void) {
      * 函数内取自身地址会被 Amice 判 "non-call address uses" 而跳过 VMP。
      * 本函数在 .text（不虚拟化），取地址在这里是安全的。 */
     int rc = ncg_head_unlock((const void *)&ncguard_unlock);  /* 再调本体解 .ncx */
+
+#if NCG_REPORT_ENABLE
+    /* ── 自检报告（2026-11-13）─────────────────────────────────────────
+     *
+     * 排障核心需求："不知道锁没锁上、位置对不对、VMP 有没有生效、几套"。
+     * 这里在解锁【之后】采集一次段状态 —— 与解锁前的熵对比就能证明
+     * "确实解密了"，不用反汇编、不用重构建。
+     *
+     * ⚠️ 必须在 .text（本函数）里做：ncg_head_unlock 在 .ncxh 密文段，
+     *    那里不能做文件 I/O（也用不到还没解开的段信息）。
+     * ⚠️ 失败静默：ncg_report_flush 内部吞掉所有 I/O 错误，绝不影响解锁。
+     * ⚠️ 失败时也要打 —— 失败时的段状态恰恰最需要看。 */
+    {
+        char _rp[512];
+        uintptr_t _rbase = 0;
+        Dl_info _rdi;
+        memset(&_rdi, 0, sizeof(_rdi));
+        if (dladdr((const void *)&ncguard_unlock, &_rdi) != 0
+            && _rdi.dli_fname) {
+            strncpy(_rp, _rdi.dli_fname, sizeof(_rp) - 1);
+            _rp[sizeof(_rp) - 1] = 0;
+            _rbase = (uintptr_t)_rdi.dli_fbase;
+        } else {
+            _rp[0] = 0;
+        }
+        if (_rp[0]) {
+            /* ⚠️ 报告缓冲必须在【栈上】：全局数组会撑大 .bss，
+             *    改变 .ncxhr 与 .bss 的页面归属 → ncg_page_has_writable_neighbor
+             *    判定变化 → SIGILL（2026-11-13 实测踩过，rc=132）。 */
+            char rbuf[NCG_REPORT_CAP];
+            ncg_report_build(rbuf, sizeof(rbuf), _rp, _rbase, rc == 0);
+            (void)ncg_report_flush(rbuf, strlen(rbuf));
+        }
+    }
+#endif
+
     if (rc == 0) {
         done = 1;
         /* 提交二（2026-10-30）：基线已由 ncg_head_unlock 采集完毕，
