@@ -1148,12 +1148,22 @@ static int ncg_decrypt_one_seg(const void *base,
          * MAC 覆盖两段密文，验签在解密【之前】已经比对过密文，不受影响；
          * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
          * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
+        /* 段密钥按序分派，顺序必须与 so-section-lock.py 的 _SEG_KEYS 一致。
+         *   0 → k_so（.ncx 代码）
+         *   1 → k_so_r（.ncxr 常量表）
+         *   2 → k_nct（.nct 消费方 VMP 数据） */
         uint8_t segkey[16];
         if (seg_ord == 0) {
             memcpy(segkey, k_out, 16);
-        } else {
+        } else if (seg_ord == 1) {
             if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
                                            segkey) != 0) {
+                ncg_wipe(k_out, 16);
+                return -12;
+            }
+        } else {
+            if (ncg_derive_k_nct_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
+                                          segkey) != 0) {
                 ncg_wipe(k_out, 16);
                 return -12;
             }
@@ -1467,7 +1477,19 @@ int ncg_head_unlock(const void *self_addr) {
      *
      * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
-    ncg_shdr_t segs[2];
+    /* 2026-11-12：从 2 段扩到 3 段，新增 .nct（消费方 VMP 数据）。
+     *
+     * 为什么 .nct 可以加密而 .ncr（第一套 VMP 数据）不行：
+     *   .ncr 里的字节码属于 nox 自己的解密链 —— 解它的钥匙派生要执行
+     *   它里面的函数，加密即自锁（要解 .ncr 得先跑 .ncr 里的代码）。
+     *   而 .nct 装的是消费方的 VMP（sig_check 等），那些函数在
+     *   constructor(65535) 才运行，那时本函数（constructor(50)）早已解完，
+     *   没有循环依赖。
+     *
+     * ⚠️ .nct 可能不存在（没开第二套 VMP 的构建），所以走 optional 分支。
+     * ⚠️ 段序必须与 so-section-lock.py 的 _SEG_KEYS 严格一致：
+     *    .ncx → k_so, .ncxr → k_so_r, .nct → k_nct。 */
+    ncg_shdr_t segs[3];
     int nseg = 0;
     segs[nseg++] = sec;
     {
@@ -1475,6 +1497,13 @@ int ncg_head_unlock(const void *self_addr) {
         if (ncg_find_section(so_path, NC_SEC_CONST, &ro) == 0
             && ro.size > 0 && (ro.flags & SHF_ALLOC)) {
             segs[nseg++] = ro;
+        }
+    }
+    {
+        ncg_shdr_t vmp2;
+        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
+            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
+            segs[nseg++] = vmp2;
         }
     }
 

@@ -383,6 +383,9 @@ def derive_app_keys(master: bytes, cert_sha256: bytes, package: str) -> dict:
     （96 字节签名表，结构高度可猜）就能反推 .ncx 前 96 字节明文。
     现在 .ncxr 用独立的 so_r 域，两段的 keystream 互相不可推导。
     """
+    # 2026-11-12：'insn' 域正式启用 —— 给 .ncr（VMP 数据段）用。
+    # 此前该 label 只占位未使用。.ncr 装的是 Amice 生成的 VM 字节码 /
+    # descriptor 表，此前无段属性、混在 .rodata 里明文可读。
     out = {}
     for label, dom in (('nc-dex-v1', 'dex'), ('nc-insn-v1', 'insn'),
                        ('nc-so-v1', 'so'), ('nc-warm-v1', 'warm'),
@@ -876,7 +879,18 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     #   明文即可反推 .ncx 同位置明文（报告已做交叉验证，前 96 字节完全一致）。
     #   现在按段序分配独立域密钥：第 0 段 k_so，第 1 段 k_so_r，再多段则
     #   用 HKDF 继续派生（当前只用两段，超出时显式报错而非静默复用）。
-    _SEG_KEYS = (k_so, k_so_r)
+    # 2026-11-12：加第 3 把钥匙给 .nct（消费方 VMP 数据段）。
+    #
+    # ⚠️ 为什么 .nct 能加密而 .ncr 不能：
+    #    .ncr 装的是 nox 解密链自己的 VMP 字节码 —— 解它的钥匙派生要执行
+    #    它里面的函数，加密即自锁（要解 .ncr 得先跑 .ncr 里的代码）。
+    #    .nct 装的是消费方的 VMP（sig_check 等），那些函数在
+    #    constructor(65535) 才运行，那时解锁早已完成，没有循环依赖。
+    #
+    # ⚠️ key 顺序必须与 C 侧 ncg_decrypt_one_seg 的分派严格一致：
+    #    .ncx → k_so, .ncxr → k_so_r, .nct → k_nct。
+    k_nct = keys['insn']          # label = "nc-insn-v1" + 包名
+    _SEG_KEYS = (k_so, k_so_r, k_nct)
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
         sc = elf.find(nm)

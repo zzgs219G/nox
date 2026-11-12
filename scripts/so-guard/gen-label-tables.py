@@ -51,6 +51,11 @@ LABELS = [
     ("mac",  b"nc-so-mac-v1",   "ncg_label_enc_mac",  "NCGL_MAC"),
     ("so_r", b"nc-so-r-v1",     "ncg_label_enc_so_r", "NCGL_SO_R"),
     ("boot", b"nc-boot-v1",     "ncg_label_enc_boot", "NCGL_BOOT"),
+    # 2026-11-12：第 5 张表，给 .nct（消费方 VMP 数据段）用。
+    # label "nc-insn-v1" 在 derive_app_keys 里早就占位，此前未用。
+    # 基值复用 lk[0]（与 so 域同基值不同 label → HKDF 输出仍不同，
+    # 因为 info 里带着完整 label 字符串）。
+    ("insn", b"nc-insn-v1",     "ncg_label_enc_insn", "NCGL_INSN"),
 ]
 
 
@@ -77,7 +82,12 @@ def gen_c():
     lines = []
     lines.append("/* 基值: " + " / ".join("0x%02X" % k for k in keys) + " */")
     for kidx, (dom, plain, cname, lenmacro) in enumerate(LABELS):
-        enc = encode(plain, keys[kidx], kidx)
+        # 2026-11-12：第 5 张表（insn）复用基值 0 号。
+        # 基值只影响"存储形态"，真正的域分隔由 HKDF 的 info（完整 label
+        # 字符串）保证 —— 不同 label 即使基值相同，派生结果也完全不同。
+        # 现有 4 个基值一一对应 4 张旧表，不动它们（改了就与历史产物不兼容）。
+        bk = keys[kidx] if kidx < len(keys) else keys[0]
+        enc = encode(plain, bk, kidx)
         lines.append("static const uint8_t %s[%s * 2] = {" % (cname, lenmacro))
         for i in range(0, len(enc), 8):
             chunk = enc[i:i + 8]

@@ -108,3 +108,11 @@ int ncg_derive_k_so_r(const uint8_t master[32], const uint8_t cert_sha256[32],
 int ncg_derive_k_so_r_from_der(const uint8_t master[32],
                                const uint8_t *cert_der, size_t der_len,
                                const char *pkg, uint8_t out[16]);
+
+/* 2026-11-12：.nct 段（消费方 VMP 数据）专用密钥。
+ * label = "nc-insn-v1" + 包名；与 so/so_r/mac 三个域必须互不相同。 */
+int ncg_derive_k_nct(const uint8_t master[32], const uint8_t cert_sha256[32],
+                     const char *pkg, uint8_t out[16]);
+int ncg_derive_k_nct_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der, size_t der_len,
+                              const char *pkg, uint8_t out[16]);

@@ -78,6 +78,7 @@
 #define NCGL_SO       8    /* "nc-so-v1" */
 #define NCGL_MAC     12    /* "nc-so-mac-v1" */
 #define NCGL_SO_R    10    /* "nc-so-r-v1" */
+#define NCGL_INSN    11    /* "nc-insn-v1"（2026-11-12：.nct 段专用）*/
 #define NCGL_BOOT    10    /* "nc-boot-v1" */
 
 /* ── 2026-11-08：四张表各自独立基值（不再统一 0x5A）────────────────
@@ -145,6 +146,14 @@ static const uint8_t ncg_label_enc_so_r[NCGL_SO_R * 2] = {
     0x52, 0x0f, 0x5f, 0x86, 0x11, 0xf0, 0x4f, 0xda,
     0x53, 0x78, 0x11, 0x5a, 0x4e, 0xe4, 0x11, 0xc2,
     0x4a, 0xa7, 0x0d, 0xb5,
+};
+/* 2026-11-12：insn 域的表，给 .nct（消费方 VMP 数据段）用。
+ * 复用基值 0x5A（与 so 域相同）—— 真正的域分隔靠 HKDF 的 info
+ * 里那条完整 label 字符串，不靠基值。 */
+static const uint8_t ncg_label_enc_insn[NCGL_INSN * 2] = {
+    0x34, 0x31, 0x39, 0xfd, 0x77, 0x0f, 0x33, 0x86,
+    0x34, 0xf0, 0x29, 0xda, 0x34, 0x78, 0x77, 0x5a,
+    0x2c, 0xe4, 0x6b, 0xc2,
 };
 static const uint8_t ncg_label_enc_boot[NCGL_BOOT * 2] = {
     0x8f, 0xc2, 0x82, 0xa7, 0xcc, 0xb5, 0x83, 0x9d,
@@ -661,6 +670,46 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
     ksha_update(&ctx,cert_der,der_len);
     ksha_final(&ctx,sha);
     int rc=ncg_derive_k_so_r(master,sha,pkg,out);
+    memset(sha,0,sizeof sha);
+    return rc;
+}
+
+/* ── 派生 K_nct（2026-11-12）：.nct 段专用 ────────────────────────────
+ *
+ * k_nct = HKDF-SHA256(ikm=master, salt=SHA256(certDER),
+ *                      info="nc-insn-v1"+pkg, 16)
+ *
+ * 为什么单独一把：.nct 装的是消费方 VMP 的字节码，与 .ncx/.ncxr 内容
+ * 完全无关。共用 k_so 会重现 two-time-pad 误用（本项目在 .ncxr 上踩过）——
+ * RC4 是流密码，两段共用同一把钥匙且都从 keystream 偏移 0 起，
+ * 已知一段明文即可反推另一段。
+ *
+ * ⚠️ label 必须与 so-section-lock.py 的 derive_app_keys() 里 'insn'
+ *    域逐字节一致（那边是明文 label，这边走密文表还原）。
+ *    test-so-lock.sh 的 T20 跨语言对拍会抓不一致。 */
+int ncg_derive_k_nct(const uint8_t master[32],const uint8_t cert_sha256[32],
+                     const char *pkg,uint8_t out[16]){
+    if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
+    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_insn, NCGL_INSN, lk[0], info);
+    n=NCGL_INSN;
+    { size_t l=strlen(pkg); if(l>sizeof info-12) l=sizeof info-12; memcpy(info+n,pkg,l); n+=l; }
+    khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
+    return 0;
+}
+
+/* 便捷版：吃 certDER，内部 SHA256 再派生（理由同 k_so_r 那版）。 */
+int ncg_derive_k_nct_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der,size_t der_len,
+                              const char *pkg,uint8_t out[16]){
+    if(!master||!cert_der||!der_len||!pkg||!pkg[0]||!out) return -1;
+    uint8_t sha[32];
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx,cert_der,der_len);
+    ksha_final(&ctx,sha);
+    int rc=ncg_derive_k_nct(master,sha,pkg,out);
     memset(sha,0,sizeof sha);
     return rc;
 }
