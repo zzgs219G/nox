@@ -50,7 +50,7 @@
  * ⚠️ 该段由 Amice 插件（编译期）生成，不是本仓库的 C 代码标记的 —— 所以
  *    C 侧不定义任何 __attribute__((section(NC_SEC_VMP)))，只在这里登记段名
  *    供解锁时查找。 */
-#define NC_SEC_VMP       ".ncr"    /* VMP 数据段（AWR，明文，循环依赖不可加密）*/
+#define NC_SEC_VMP       ".rodata.ncr"    /* VMP 数据段（AWR，明文，循环依赖不可加密）*/
 
 /* 2026-11-12：第二个 VMP 数据段，专门给"解锁之后才运行"的 VMP 数据。
  *
@@ -63,7 +63,7 @@
  *
  * ⚠️ 由 Amice 的 AMICE_VM_DATA_SECTION 环境变量指定（nox 打 .a 时用默认
  *    .ncr，消费方编译时设成 .nct），不是本仓库的 C 代码标记的。 */
-#define NC_SEC_VMP2      ".nct"    /* 消费方 VMP 数据段（AWR，锁箱加密）*/
+#define NC_SEC_VMP2      ".rodata.nct"    /* 消费方 VMP 数据段（AWR，锁箱加密）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节
