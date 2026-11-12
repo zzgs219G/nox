@@ -893,9 +893,11 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     _KEY_BY_NAME = {
         _LAYOUT['NC_SEC_CODE']: k_so,
         _LAYOUT['NC_SEC_CONST']: k_so_r,
-        # k_nct = HKDF 的 'nc-insn-v1' 域（derive_app_keys 已派生，
-        # 此前无人使用 —— 正是给 VMP 字节码预留的）。
+        # k_nct = HKDF 的 'nc-insn-v1' 域 → .nct（第二套解释器）
         _LAYOUT['NC_SEC_VMP2']: keys['insn'],
+        # k_bc  = HKDF 的 'nc-warm-v1' 域 → .ncq（VM 字节码）
+        # ⚠️ 不能用 k_nct：RC4 流密码两段共用 keystream = two-time-pad 误用。
+        _LAYOUT['NC_SEC_VMPBC']: keys['warm'],
     }
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
@@ -1013,7 +1015,8 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     for nm, sc, pl, ci in segs:
         _kd = ('k_so' if nm == _LAYOUT['NC_SEC_CODE'] else
                'k_so_r' if nm == _LAYOUT['NC_SEC_CONST'] else
-               'k_nct' if nm == _LAYOUT['NC_SEC_VMP2'] else '?')
+               'k_nct' if nm == _LAYOUT['NC_SEC_VMP2'] else
+               'k_bc'  if nm == _LAYOUT['NC_SEC_VMPBC'] else '?')
         print('   段 %s: %d 字节已加密（size-preserving，域密钥 %s）'
               % (nm, len(pl), _kd))
     print('   密钥槽 %s: %d 字节' % (SLOT_NAME, len(blob)))

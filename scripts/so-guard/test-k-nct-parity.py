@@ -38,14 +38,14 @@ KEY_C = HERE / "nc_guard_key.c"
 LOCK_PY = HERE / "so-section-lock.py"
 
 
-def py_side(master: bytes, cert_der: bytes, pkg: str) -> bytes:
+def py_side(master: bytes, cert_der: bytes, pkg: str, dom: str = "insn") -> bytes:
     """直接复用锁箱器的实现，避免"两处各写一份"——那正是本次的教训。"""
     import importlib.util
     spec = importlib.util.spec_from_file_location("slock", LOCK_PY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     cert_sha = hashlib.sha256(cert_der).digest()
-    return mod.derive_app_keys(master, cert_sha, pkg)["insn"]
+    return mod.derive_app_keys(master, cert_sha, pkg)[dom]
 
 
 def c_side(master: bytes, cert_der: bytes, pkg: str, cc: str) -> bytes:
@@ -67,7 +67,13 @@ int main(int argc, char **argv) {
     if (!f) return 4;
     size_t n = fread(der, 1, sizeof der, f);
     fclose(f);
+    /* 一次输出两把钥匙（空格分隔）：
+     *   k_nct = .nct 第二套解释器段用（label "nc-insn-v1"）
+     *   k_bc  = .ncq VM 字节码段用（label "nc-warm-v1"） */
     if (ncg_derive_k_nct_from_der(master, der, n, argv[3], out) != 0) return 5;
+    for (int i = 0; i < 16; i++) printf("%02x", out[i]);
+    printf(" ");
+    if (ncg_derive_k_bc_from_der(master, der, n, argv[3], out) != 0) return 5;
     for (int i = 0; i < 16; i++) printf("%02x", out[i]);
     printf("\n");
     return 0;
@@ -92,7 +98,8 @@ int main(int argc, char **argv) {
         if r.returncode != 0:
             print("✗ C 侧调用失败 rc=%d\n%s" % (r.returncode, r.stderr[:1000]))
             sys.exit(1)
-        return bytes.fromhex(r.stdout.strip())
+        parts = r.stdout.split()
+        return bytes.fromhex(parts[0]), bytes.fromhex(parts[1])
 
 
 def main() -> int:
@@ -113,14 +120,22 @@ def main() -> int:
     ]
     bad = 0
     for pkg, why in cases:
-        p = py_side(master, cert_der, pkg)
-        c = c_side(master, cert_der, pkg, cc)
-        if p == c:
-            print("✓ k_nct(%s) = %s   [%s]" % (pkg, p.hex(), why))
+        p_nct = py_side(master, cert_der, pkg, "insn")
+        p_bc  = py_side(master, cert_der, pkg, "warm")
+        c_nct, c_bc = c_side(master, cert_der, pkg, cc)
+        if p_nct == c_nct:
+            print("✓ k_nct(%s) = %s   [%s]" % (pkg, p_nct.hex(), why))
         else:
             print("✗ k_nct(%s) 两侧不一致   [%s]" % (pkg, why))
-            print("    Python: %s" % p.hex())
-            print("    C     : %s" % c.hex())
+            print("    Python: %s" % p_nct.hex())
+            print("    C     : %s" % c_nct.hex())
+            bad += 1
+        if p_bc == c_bc:
+            print("✓ k_bc (%s) = %s" % (pkg, p_bc.hex()))
+        else:
+            print("✗ k_bc (%s) 两侧不一致" % pkg)
+            print("    Python: %s" % p_bc.hex())
+            print("    C     : %s" % c_bc.hex())
             bad += 1
 
     # 反向验证：k_nct 必须与其它四个域都不同（label 复用 = 两条链互相印证）

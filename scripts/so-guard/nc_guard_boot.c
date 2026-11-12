@@ -1108,7 +1108,9 @@ struct ncg_seg_ctx {
     const char *pkg;
     size_t seg_ord;          /* 段号：决定用哪把钥匙，见 ncg_decrypt_one_seg */
     const char *so_path;     /* ncg_page_has_writable_neighbor 要用 */
-    /* 2026-11-13：本产物是否有 .nct（第二套 VMP 数据段）。
+    /* 2026-11-13：本产物是否有 .ncq（VM 字节码段）。 */
+    int has_ncq;
+    /* 2026-11-13：本产物是否有 .nct（第二套 VMP 解释器段）。
      * .nct 是【可选段】—— 没开第二套 VMP 的构建没有它。
      * 段序必须动态决定，写死索引会让钥匙错配：
      *   有 .nct： 0=.nct(k_nct)  1=.ncx(k_so)  2=.ncxr(k_so_r)
@@ -1178,11 +1180,34 @@ static int ncg_decrypt_one_seg(const void *base,
          *   而 k_nct 只需 master（来自 .ncxhr，二级锁箱已解），与 .ncx
          *   无依赖，所以"先解 .nct"不构成循环依赖。 */
         {
-            const size_t kso_idx  = cx->has_nct ? (size_t)1 : (size_t)0;
-            const size_t ksor_idx = cx->has_nct ? (size_t)2 : (size_t)1;
-            if (cx->has_nct && seg_ord == 0) {
+            /* ── 四段分派（2026-11-13）────────────────────────────────
+             * 段序（与 protect.sh 的 --section 严格一致）：
+             *   0  .nct   第二套解释器   k_nct  (nc-insn-v1)
+             *   1  .ncq   VM 字节码      k_bc   (nc-warm-v1)
+             *   2  .ncx   业务代码+壳     k_so   (nc-so-v1)
+             *   3  .ncxr  签名表          k_so_r (nc-so-r-v1)
+             *
+             * ⚠️ 可选段：没开 VMP 的构建没有 .nct/.ncq，索引要动态算。
+             *    写死索引会让钥匙错配（本项目 2026-11-12 踩过：
+             *    无 .nct 时把 k_nct 用在 .ncx 上 → 解出乱码 → V6 红）。
+             * ⚠️ .ncq 用独立钥匙 k_bc，不复用 k_nct：RC4 流密码共用
+             *    keystream = two-time-pad 误用。 */
+            const size_t ord_nct  = cx->has_nct ? (size_t)0 : (size_t)-1;
+            const size_t ord_ncq  = cx->has_ncq
+                                    ? (size_t)(cx->has_nct ? 1 : 0)
+                                    : (size_t)-1;
+            const size_t kso_idx  = (size_t)(cx->has_nct ? 1 : 0)
+                                    + (size_t)(cx->has_ncq ? 1 : 0);
+            const size_t ksor_idx = kso_idx + 1;
+            if (seg_ord == ord_nct) {
                 if (ncg_derive_k_nct_from_der(cx->master, cx->der, cx->der_len,
                                               cx->pkg, segkey) != 0) {
+                    ncg_wipe(k_out, 16);
+                    return -12;
+                }
+            } else if (seg_ord == ord_ncq) {
+                if (ncg_derive_k_bc_from_der(cx->master, cx->der, cx->der_len,
+                                             cx->pkg, segkey) != 0) {
                     ncg_wipe(k_out, 16);
                     return -12;
                 }
@@ -1271,7 +1296,7 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
                                 const uint8_t *der, size_t der_len,
                                 const char *pkg,
                                 const ncg_shdr_t *segs, int nseg,
-                                int has_nct,
+                                int has_nct, int has_ncq,
                                 uint8_t k_out[16]) {
     /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
      * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
@@ -1286,6 +1311,7 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
         cx.master = master; cx.der = der; cx.der_len = der_len;
         cx.pkg = pkg; cx.so_path = so_path;
         cx.has_nct = has_nct;   /* 2026-11-13：段序动态分派的关键 */
+        cx.has_ncq = has_ncq;
         cx.seg_ord = (size_t)i;
         int src = ncg_decrypt_one_seg(base, &cx, (uint64_t)i, &segs[i], k_out);
         if (src != 0) return src;
@@ -1513,7 +1539,7 @@ int ncg_head_unlock(const void *self_addr) {
      *
      * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
-    ncg_shdr_t segs[3];
+    ncg_shdr_t segs[4];      /* .nct / .ncq / .ncx / .ncxr（后两个可选） */
     int nseg = 0;
     /* 2026-11-13：段序 —— .nct 必须排在最前。
      *
@@ -1529,12 +1555,27 @@ int ncg_head_unlock(const void *self_addr) {
      *    kso_idx / so-section-lock.py 的 _KEY_BY_NAME（后者按名映射，
      *    与位置无关，但 MAC 覆盖顺序仍要与这里一致）。 */
     int has_nct = 0;
+    int has_ncq = 0;
     {
         ncg_shdr_t vmp2;
         if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
             && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
             segs[nseg++] = vmp2;
             has_nct = 1;
+        }
+    }
+    /* 2026-11-13：VM 字节码段。排在 .nct 之后、.ncx 之前 ——
+     * 它由解释器在运行期读取，晚于解释器解密即可。
+     * ⚠️ 加密它的意义远大于解释器：字节码是【每包独有的业务逻辑】，
+     *    解释器只是通用 VM 规则（逆一次通吃所有包）。
+     *    此前它在 .rodata 明文段，只靠 Amice 的 bytecode.key
+     *    （那个 key 由编译期常量 seed 派生，写在解释器代码里）。 */
+    {
+        ncg_shdr_t vmpq;
+        if (ncg_find_section(so_path, NC_SEC_VMPBC, &vmpq) == 0
+            && vmpq.size > 0 && (vmpq.flags & SHF_ALLOC)) {
+            segs[nseg++] = vmpq;
+            has_ncq = 1;
         }
     }
     segs[nseg++] = sec;
@@ -1563,7 +1604,8 @@ int ncg_head_unlock(const void *self_addr) {
     /* 2026-11-12：拆成独立函数（降 alloca）。逐段解密+权限+基线都在里面。 */
     {
         int drc = ncg_decrypt_segments(so_path, base, master, der_buf, der_len,
-                                       pkg_buf, segs, nseg, has_nct, key);
+                                       pkg_buf, segs, nseg, has_nct, has_ncq,
+                                       key);
         if (drc != 0) return drc;
     }
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */

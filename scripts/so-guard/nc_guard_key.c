@@ -84,6 +84,12 @@
  *    字节（读到噪声位）→ 还原出 "nc-insn-v1\x??" → HKDF info 错 →
  *    k_nct 错 → 解出乱码 → 真机 SIGILL。已加 _Static_assert 钉死。 */
 #define NCGL_INSN    10    /* "nc-insn-v1" */
+/* 2026-11-13：第六张表，.ncq（VM 字节码段）用。
+ * label 明文 "nc-warm-v1"，与 so-section-lock.py 的 derive_app_keys
+ * 里 ('nc-warm-v1','warm') 逐字节一致。
+ * 为什么不复用 k_nct：RC4 是流密码，两段共用同一 keystream =
+ * two-time-pad 误用（本项目 2026-10-28 踩过 .ncx/.ncxr 同款坑）。 */
+#define NCGL_BC      10    /* "nc-warm-v1" */
 /* 运行时把 label 明文长度与实际字符串对拍（编译期即失败）。 */
 _Static_assert(sizeof("nc-insn-v1") - 1 == NCGL_INSN,
                "NCGL_INSN 与 label 明文长度不一致 —— C 侧会多读/少读噪声位");
@@ -91,6 +97,7 @@ _Static_assert(sizeof("nc-so-v1") - 1 == NCGL_SO, "NCGL_SO 长度不符");
 _Static_assert(sizeof("nc-so-mac-v1") - 1 == NCGL_MAC, "NCGL_MAC 长度不符");
 _Static_assert(sizeof("nc-so-r-v1") - 1 == NCGL_SO_R, "NCGL_SO_R 长度不符");
 _Static_assert(sizeof("nc-boot-v1") - 1 == NCGL_BOOT, "NCGL_BOOT 长度不符");
+_Static_assert(sizeof("nc-warm-v1") - 1 == NCGL_BC, "NCGL_BC 长度不符");
 
 /* ── 2026-11-08：四张表各自独立基值（不再统一 0x5A）────────────────
  *
@@ -165,6 +172,12 @@ static const uint8_t ncg_label_enc_boot[NCGL_BOOT * 2] = {
 };
 /* 2026-11-13：第五张表（label "nc-insn-v1"），.nct 段密钥用。
  * 由 gen-label-tables.py 生成，勿手改；`--check` 会对拍。 */
+/* 2026-11-13：.ncq（VM 字节码）段密钥用，label "nc-warm-v1"。 */
+static const uint8_t ncg_label_enc_bc[NCGL_BC * 2] = {
+    0x7e, 0x5a, 0x73, 0xe4, 0x3d, 0xc2, 0x67, 0xa7,
+    0x71, 0xb5, 0x62, 0x9d, 0x7d, 0xec, 0x3d, 0x81,
+    0x66, 0x46, 0x21, 0x31,
+};
 static const uint8_t ncg_label_enc_insn[NCGL_INSN * 2] = {
     0x0a, 0x31, 0x07, 0xfd, 0x49, 0x0f, 0x0d, 0x86,
     0x0a, 0xf0, 0x17, 0xda, 0x0a, 0x78, 0x49, 0x5a,
@@ -190,7 +203,7 @@ static void ncg_label_decode(const uint8_t *enc, size_t n, uint8_t key,
  *    恰好产出上述五个基值。改 SALT 或改这里任一字节都会导致 label 错
  *    → k_so 错 → .ncx 解出乱码 → 全链崩（fail-closed，不会静默）。 */
 __attribute__((noinline))
-static void ncg_label_key(uint8_t out[5]) {
+static void ncg_label_key(uint8_t out[6]) {
     static const uint8_t salt[16] = NC_BOOT_SALT_INIT;
     /* SALT 索引：0 / 4 / 8 / 12 / 2（前四个每 4 字节取一个，避开相邻字节；
      * 第五个取 2 —— 前四个已用掉 0/4/8/12，取中间下标与它们都不同）
@@ -207,6 +220,7 @@ static void ncg_label_key(uint8_t out[5]) {
     v[2] = (uint8_t)(salt[8]  ^ 0x3F);
     v[3] = (uint8_t)(salt[12] ^ 0x4E);
     v[4] = (uint8_t)(salt[2]  ^ 0x7B);
+    v[5] = (uint8_t)(salt[6]  ^ 0x81);
 }
 
 
@@ -586,7 +600,7 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
 int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
                     const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[5];
+    uint8_t info[128]; size_t n=0; uint8_t lk[6];
     /* label 从密文表还原（2026-11-06 P0：消除 .rodata 明文锚点，见文件头）
      * 2026-11-08：基值不再统一 0x5A，从 SALT 派生（见 ncg_label_key） */
     ncg_label_key(lk);
@@ -639,7 +653,7 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
 int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[5];
+    uint8_t info[128]; size_t n=0; uint8_t lk[6];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_mac, NCGL_MAC, lk[1], info);
     n=NCGL_MAC;
@@ -661,7 +675,7 @@ int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
 int ncg_derive_k_so_r(const uint8_t master[32],const uint8_t cert_sha256[32],
                       const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[5];
+    uint8_t info[128]; size_t n=0; uint8_t lk[6];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_so_r, NCGL_SO_R, lk[2], info);
     n=NCGL_SO_R;
@@ -712,13 +726,47 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
 int ncg_derive_k_nct(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[5];
+    uint8_t info[128]; size_t n=0; uint8_t lk[6];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_insn, NCGL_INSN, lk[4], info);
     n=NCGL_INSN;
     { size_t l=strlen(pkg); if(l>sizeof info-11) l=sizeof info-11; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
+}
+
+/* ── 派生 k_bc（.ncq VM 字节码段，2026-11-13）──────────────────────────
+ * k_bc = HKDF-SHA256(ikm=master, salt=SHA256(certDER),
+ *                    info="nc-warm-v1"+pkg, 16)
+ *
+ * 与 so-section-lock.py 的 derive_app_keys()['warm'] 逐字节一致。
+ * ⚠️ 为什么不复用 k_nct：RC4 是流密码，两段共用 keystream = two-time-pad
+ *    误用（本项目 2026-10-28 在 .ncx/.ncxr 上踩过：C_a[i]^C_b[i] == P_a[i]^P_b[i]）。
+ */
+int ncg_derive_k_bc(const uint8_t master[32],const uint8_t cert_sha256[32],
+                    const char *pkg,uint8_t out[16]){
+    if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
+    uint8_t info[128]; size_t n=0; uint8_t lk[6];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_bc, NCGL_BC, lk[5], info);
+    n=NCGL_BC;
+    { size_t l=strlen(pkg); if(l>sizeof info-11) l=sizeof info-11; memcpy(info+n,pkg,l); n+=l; }
+    khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
+    return 0;
+}
+
+int ncg_derive_k_bc_from_der(const uint8_t master[32],
+                             const uint8_t *cert_der,size_t der_len,
+                             const char *pkg,uint8_t out[16]){
+    if(!master||!cert_der||!der_len||!pkg||!pkg[0]||!out) return -1;
+    uint8_t sha[32];
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx,cert_der,der_len);
+    ksha_final(&ctx,sha);
+    int rc=ncg_derive_k_bc(master,sha,pkg,out);
+    memset(sha,0,sizeof sha);
+    return rc;
 }
 
 /* 便捷版：吃 certDER。存在的理由与 ncg_derive_k_so_r_from_der 相同。 */
@@ -755,7 +803,7 @@ int ncg_derive_k_nct_from_der(const uint8_t master[32],
  * ⚠️ 调用方用完应擦除缓冲（含密钥材料的派生输入）。 */
 size_t ncg_label_boot(uint8_t *out, size_t cap) {
     if (!out || cap < NCGL_BOOT) return 0;
-    uint8_t lk[5];
+    uint8_t lk[6];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, lk[3], out);
     /* 基值用完即擦。不用 ncg_wipe：它定义在 nc_guard_boot.c，而本文件

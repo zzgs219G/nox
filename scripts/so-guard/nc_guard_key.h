@@ -132,3 +132,17 @@ int ncg_derive_k_nct(const uint8_t master[32], const uint8_t cert_sha256[32],
 int ncg_derive_k_nct_from_der(const uint8_t master[32],
                               const uint8_t *cert_der, size_t der_len,
                               const char *pkg, uint8_t out[16]);
+
+/* ── k_bc（.ncq VM 字节码段，2026-11-13）──────────────────────────
+ *
+ * k_bc = HKDF-SHA256(..., info="nc-warm-v1"+pkg, 16)
+ *
+ * 与 so-section-lock.py 的 derive_app_keys()['warm'] 逐字节一致。
+ * ⚠️ 不复用 k_nct：RC4 流密码共用 keystream = two-time-pad 误用。
+ *    本项目 2026-10-28 在 .ncx/.ncxr 上踩过这个坑。 */
+int ncg_derive_k_bc(const uint8_t master[32], const uint8_t cert_sha256[32],
+                    const char *pkg, uint8_t out[16]);
+
+int ncg_derive_k_bc_from_der(const uint8_t master[32],
+                             const uint8_t *cert_der, size_t der_len,
+                             const char *pkg, uint8_t out[16]);

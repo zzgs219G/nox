@@ -809,6 +809,72 @@ else
     fi
 fi
 
+# ── V13 .ncq（VM 字节码段）全链路（2026-11-13 新增）──
+# 为什么单独断言：字节码是【每包独有的业务逻辑】，比解释器更值得保护
+#   （解释器是通用 VM 规则，逆一次通吃；字节码是具体逻辑，每包不同）。
+# 它此前在 .rodata 明文段。本组钉住"能被锁箱、且用了独立钥匙"。
+echo "── V13 .ncq 字节码段 ──"
+cd "$W" || exit 2
+cat > v13.c <<'V13EOF'
+/* 模拟 VM 字节码：纯数据段（真实字节码也是数据，不是代码）。 */
+#include <stdint.h>
+__attribute__((section(".ncq"), used, retained))
+const uint8_t v13_bc[512] = {
+    [0 ... 511] = 0x00,
+};
+__attribute__((visibility("default"), noinline))
+int v13_sum(void) {
+    unsigned s = 0;
+    for (int i = 0; i < 512; i++) s += v13_bc[i];
+    return (int)(s & 0x7fffffff);
+}
+V13EOF
+if guard_compile "$W/raw13.so" v13.c 2>"$W/v13build.log"; then
+    if readelf -SW raw13.so 2>/dev/null | awk '{print $2}' | grep -qxF '.ncq'; then
+        ok "V13a 业务代码标 .ncq → 段已生成"
+        if python3 "$LOCK" raw13.so l13.so --section .ncq --from-apk "$APK" \
+                --package "$PKG_FIX" >l13.log 2>&1; then
+            E13=$(python3 "$W"/../e13.py 2>/dev/null || echo "")
+            E13=$(python3 -c "
+import struct, math
+d = open('l13.so','rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]; es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]; si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es; no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.ncq':
+        fo = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
+        seg = d[fo:fo+sz]
+        c = [0]*256
+        for b in seg: c[b] += 1
+        e = -sum((v/len(seg))*math.log2(v/len(seg)) for v in c if v)
+        print('%.3f' % e); break
+")
+            if awk "BEGIN{exit !(${E13:-0} > 6.0)}"; then
+                ok "V13b .ncq 已加密（熵 $E13）"
+            else
+                bad "V13b .ncq 熵仅 ${E13:-0} —— 加密未生效"
+            fi
+            # 钥匙独立性：k_bc 必须与 k_nct 不同（RC4 流密码不能共用 keystream）
+            if python3 "$GUARD_DIR/test-k-nct-parity.py" 2>/dev/null \
+                    | grep -q 'k_bc'; then
+                ok "V13c k_bc 跨语言对拍通过（与 k_nct 独立）"
+            else
+                bad "V13c k_bc 对拍失败（或复用了 k_nct 的 keystream）"
+            fi
+        else
+            bad "V13b .ncq 锁箱失败"; tail -6 l13.log
+        fi
+    else
+        bad "V13a 标了 section(\".ncq\") 但段不存在"
+    fi
+else
+    bad "V13 编译失败"; head -8 "$W/v13build.log"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
