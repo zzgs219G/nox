@@ -97,6 +97,12 @@ int main(int argc, char **argv) {
 
 def main() -> int:
     cc = os.environ.get("CC", "cc")
+    # 静态库形态（分发包）里没有 C 源码 —— 明确跳过而不是抛异常。
+    # 调用方（test.sh 的 V11a）也会按 HAS_SRC 跳过，这里是第二道保险：
+    # 有人手工跑这个脚本时不应看到 traceback。
+    if not KEY_C.is_file():
+        print("skip: 本形态无 %s（静态库分发包不含 C 源码）" % KEY_C.name)
+        return 0
     # 固定输入（不随机）——失败时能逐字节复现
     master = bytes(range(32))
     cert_der = bytes((i * 7 + 3) & 0xFF for i in range(512))

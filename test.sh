@@ -601,15 +601,22 @@ fi
 echo "── V11 .nct 段全链路 ──"
 
 # V11-a：跨语言密钥对拍（C 侧 ncg_derive_k_nct ↔ Python 侧 insn 域）
-if [ -f "$GUARD_DIR/test-k-nct-parity.py" ]; then
-    if python3 "$GUARD_DIR/test-k-nct-parity.py" >"$W/knct.log" 2>&1; then
-        ok "V11a k_nct 跨语言对拍一致（C ↔ Python）"
-    else
-        bad "V11a k_nct 跨语言不一致 —— 解出必是乱码（真机 SIGILL）"
-        tail -12 "$W/knct.log"
-    fi
-else
+#
+# ⚠️ 静态库形态（分发包）里【没有 nc_guard_key.c】—— 那是 C 实现，
+#    按契约不外泄。所以本项必须按 HAS_SRC 跳过，不能当失败。
+#    2026-11-13 实测踩过：promote 到 release workflow 时没加这个判断，
+#    build job 在"冒烟测试"步骤红掉，报
+#      "C 侧编译失败：... nc_guard_key.c: No such file or directory"
+#    —— 而那次源码本身是好的，纯属测试脚本假设了错误的分发形态。
+if [ "$HAS_SRC" != "1" ]; then
+    skip "V11a k_nct 跨语言对拍（静态库形态无 .c 源码，无法编 C 侧）"
+elif [ ! -f "$GUARD_DIR/test-k-nct-parity.py" ]; then
     skip "V11a 无 test-k-nct-parity.py（旧分发包）"
+elif python3 "$GUARD_DIR/test-k-nct-parity.py" >"$W/knct.log" 2>&1; then
+    ok "V11a k_nct 跨语言对拍一致（C ↔ Python）"
+else
+    bad "V11a k_nct 跨语言不一致 —— 解出必是乱码（真机 SIGILL）"
+    tail -12 "$W/knct.log"
 fi
 
 # V11-b/V11-c：带 .nct 的产物【能解锁且数据正确】
