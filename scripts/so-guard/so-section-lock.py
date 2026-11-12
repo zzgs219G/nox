@@ -100,7 +100,10 @@ def _load_layout_contract():
 
     out = {}
     # ① 段名：#define NC_SEC_XXX  ".yyy"
-    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z_]+)\s+"([^"]+)"', text):
+    # ⚠️ 字符类必须含数字：NC_SEC_VMP2 带 '2'，用 [A-Z_]+ 匹配不到 →
+    #    _LAYOUT 缺键 → lock() 里按名取钥匙抛 KeyError → 一级锁箱整体失败。
+    #    2026-11-12 实测踩过（.nct 那轮）。
+    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z0-9_]+)\s+"([^"]+)"', text):
         out[m.group(1)] = m.group(2)
     # ② 尺寸/偏移：#define NC_XXX_YYY  104  或  0x1000
     # 2026-10-28 T4：加入 BOOT_（NC_BOOT_BACK / NC_BOOT_FWD）与 INFO（字符串另处理）
@@ -876,7 +879,24 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     #   明文即可反推 .ncx 同位置明文（报告已做交叉验证，前 96 字节完全一致）。
     #   现在按段序分配独立域密钥：第 0 段 k_so，第 1 段 k_so_r，再多段则
     #   用 HKDF 继续派生（当前只用两段，超出时显式报错而非静默复用）。
-    _SEG_KEYS = (k_so, k_so_r)
+    #
+    # ⚠️ 2026-11-13：改成【按段名】映射钥匙，不再按位置下标。
+    #   .nct（VMP 数据段）是可选段 —— 没开第二套 VMP 的构建没有它。
+    #   曾写死 (k_nct, k_so, k_so_r)，对没有 .nct 的老产物
+    #   （--section .ncx,.ncxr）会把 k_nct 用在 .ncx 上 → 解出乱码 →
+    #   test.sh 的 V6 报"正常包也会挂"。按名映射与位置无关，无此问题。
+    #
+    #   ⚠️ 三处必须一致（改任何一处都要同步另外两处）：
+    #      so-section-lock.py 的 _KEY_BY_NAME     ← 本处
+    #      nc_guard_boot.c 的 segs[] 顺序 + has_nct 分派
+    #      protect.sh 的 --section 参数顺序
+    _KEY_BY_NAME = {
+        _LAYOUT['NC_SEC_CODE']: k_so,
+        _LAYOUT['NC_SEC_CONST']: k_so_r,
+        # k_nct = HKDF 的 'nc-insn-v1' 域（derive_app_keys 已派生，
+        # 此前无人使用 —— 正是给 VMP 字节码预留的）。
+        _LAYOUT['NC_SEC_VMP2']: keys['insn'],
+    }
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
         sc = elf.find(nm)
@@ -890,13 +910,13 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         if sc['size'] == 0:
             print('❌ 段 %s 长度为 0，没有内容可锁' % nm, file=sys.stderr)
             return 1
-        if _idx >= len(_SEG_KEYS):
-            print('❌ 段数 %d 超过已定义域密钥数 %d —— 新增段必须先在 '
-                  'derive_app_keys() 里加对应 label，不许静默复用钥匙'
-                  % (len(sec_names), len(_SEG_KEYS)), file=sys.stderr)
+        if nm not in _KEY_BY_NAME:
+            print('❌ 段 %s 没有定义域密钥 —— 新增可锁段必须先在 '
+                  'derive_app_keys() 里加对应 label 并在 _KEY_BY_NAME 登记，'
+                  '不许静默复用钥匙' % nm, file=sys.stderr)
             return 1
         pl = bytes(elf.data[sc['offset']: sc['offset'] + sc['size']])
-        segs.append((nm, sc, pl, rc4(_SEG_KEYS[_idx], pl)))
+        segs.append((nm, sc, pl, rc4(_KEY_BY_NAME[nm], pl)))
 
     plain = segs[0][2]             # 兼容下方 dry-run 打印与旧日志
     cipher = segs[0][3]
@@ -991,7 +1011,11 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
 
     print('✅ 已锁: %s → %s' % (so_path, out_path))
     for nm, sc, pl, ci in segs:
-        print('   段 %s: %d 字节已加密（size-preserving，共用 k_so）' % (nm, len(pl)))
+        _kd = ('k_so' if nm == _LAYOUT['NC_SEC_CODE'] else
+               'k_so_r' if nm == _LAYOUT['NC_SEC_CONST'] else
+               'k_nct' if nm == _LAYOUT['NC_SEC_VMP2'] else '?')
+        print('   段 %s: %d 字节已加密（size-preserving，域密钥 %s）'
+              % (nm, len(pl), _kd))
     print('   密钥槽 %s: %d 字节' % (SLOT_NAME, len(blob)))
     print('   ⚠️ 运行期需配套"开箱"代码解密；没有它，这段代码不可执行')
     return 0

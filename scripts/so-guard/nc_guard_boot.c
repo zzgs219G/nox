@@ -1099,8 +1099,16 @@ struct ncg_seg_ctx {
     const uint8_t *der;
     size_t der_len;
     const char *pkg;
-    size_t seg_ord;          /* 段号：0 用 k_so，>0 用 k_so_r */
+    size_t seg_ord;          /* 段号：决定用哪把钥匙，见 ncg_decrypt_one_seg */
     const char *so_path;     /* ncg_page_has_writable_neighbor 要用 */
+    /* 2026-11-13：本产物是否有 .nct（第二套 VMP 数据段）。
+     * .nct 是【可选段】—— 没开第二套 VMP 的构建没有它。
+     * 段序必须动态决定，写死索引会让钥匙错配：
+     *   有 .nct： 0=.nct(k_nct)  1=.ncx(k_so)  2=.ncxr(k_so_r)
+     *   无 .nct： 0=.ncx(k_so)   1=.ncxr(k_so_r)
+     * 曾写死成 "0→k_nct / 1→k_so / 2→k_so_r"，无 .nct 时把 k_nct 用在
+     * .ncx 上 → 解出乱码 → test.sh 的 V6 报"正常包也会挂"。 */
+    int has_nct;
 };
 
 NC_VMP_FUNC
@@ -1149,11 +1157,39 @@ static int ncg_decrypt_one_seg(const void *base,
          * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
          * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
         uint8_t segkey[16];
-        if (seg_ord == 0) {
-            memcpy(segkey, k_out, 16);
-        } else {
-            if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
-                                           segkey) != 0) {
+        /* 2026-11-13：段序【动态】决定，与 so-section-lock.py 的
+         * _KEY_BY_NAME 按段名映射保持一致。
+         *
+         *   有 .nct： 0=.nct→k_nct   1=.ncx→k_so   2=.ncxr→k_so_r
+         *   无 .nct： 0=.ncx→k_so    1=.ncxr→k_so_r
+         *
+         * ⚠️ 为什么 .nct 必须排在 .ncx 之前解密：
+         *   .ncx 里的函数带 VMP wrapper，wrapper 第一条就 bl 到解释器、
+         *   读 .nct 里的字节码。若 .nct 还是密文 → 解释器把密文当 opcode
+         *   → 跳到无效地址 → 真机 SIGILL（2026-11-12 实测，崩溃点
+         *   constant at libnc.so+0x82598，.ncx 段内）。
+         *   而 k_nct 只需 master（来自 .ncxhr，二级锁箱已解），与 .ncx
+         *   无依赖，所以"先解 .nct"不构成循环依赖。 */
+        {
+            const size_t kso_idx  = cx->has_nct ? (size_t)1 : (size_t)0;
+            const size_t ksor_idx = cx->has_nct ? (size_t)2 : (size_t)1;
+            if (cx->has_nct && seg_ord == 0) {
+                if (ncg_derive_k_nct_from_der(cx->master, cx->der, cx->der_len,
+                                              cx->pkg, segkey) != 0) {
+                    ncg_wipe(k_out, 16);
+                    return -12;
+                }
+            } else if (seg_ord == kso_idx) {
+                memcpy(segkey, k_out, 16);
+            } else if (seg_ord == ksor_idx) {
+                if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len,
+                                               cx->pkg, segkey) != 0) {
+                    ncg_wipe(k_out, 16);
+                    return -12;
+                }
+            } else {
+                /* 段数超过契约（_KEY_BY_NAME 只有 3 项）—— 说明锁箱侧
+                 * 与运行期的段序契约漂移，fail-closed 而不是猜。 */
                 ncg_wipe(k_out, 16);
                 return -12;
             }
@@ -1228,6 +1264,7 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
                                 const uint8_t *der, size_t der_len,
                                 const char *pkg,
                                 const ncg_shdr_t *segs, int nseg,
+                                int has_nct,
                                 uint8_t k_out[16]) {
     /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
      * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
@@ -1241,6 +1278,8 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
         struct ncg_seg_ctx cx;
         cx.master = master; cx.der = der; cx.der_len = der_len;
         cx.pkg = pkg; cx.so_path = so_path;
+        cx.has_nct = has_nct;   /* 2026-11-13：段序动态分派的关键 */
+        cx.seg_ord = (size_t)i;
         int src = ncg_decrypt_one_seg(base, &cx, (uint64_t)i, &segs[i], k_out);
         if (src != 0) return src;
     }
@@ -1467,8 +1506,30 @@ int ncg_head_unlock(const void *self_addr) {
      *
      * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
-    ncg_shdr_t segs[2];
+    ncg_shdr_t segs[3];
     int nseg = 0;
+    /* 2026-11-13：段序 —— .nct 必须排在最前。
+     *
+     * 为什么不是 .ncx 打头：.ncx 里的函数带 VMP wrapper，wrapper 第一条
+     * 就 bl 到解释器、读 .nct 里的字节码。若 .nct 仍为密文 → 解释器把
+     * 密文当 opcode → 跳无效地址 → 真机 SIGILL（2026-11-12 实测，崩溃点
+     * constant at libnc.so+0x82598，落在 .ncx 段内）。
+     * 而 k_nct 只需 master（.ncxhr 已解），与 .ncx 无依赖 → 先解不循环。
+     *
+     * ⚠️ .nct 是可选段（没开第二套 VMP 的构建没有它），所以 has_nct
+     *    要传给 ncg_decrypt_one_seg 做动态钥匙分派。
+     * ⚠️ 三处段序必须一致：本函数的 segs[] / ncg_decrypt_one_seg 的
+     *    kso_idx / so-section-lock.py 的 _KEY_BY_NAME（后者按名映射，
+     *    与位置无关，但 MAC 覆盖顺序仍要与这里一致）。 */
+    int has_nct = 0;
+    {
+        ncg_shdr_t vmp2;
+        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
+            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
+            segs[nseg++] = vmp2;
+            has_nct = 1;
+        }
+    }
     segs[nseg++] = sec;
     {
         ncg_shdr_t ro;
@@ -1495,7 +1556,7 @@ int ncg_head_unlock(const void *self_addr) {
     /* 2026-11-12：拆成独立函数（降 alloca）。逐段解密+权限+基线都在里面。 */
     {
         int drc = ncg_decrypt_segments(so_path, base, master, der_buf, der_len,
-                                       pkg_buf, segs, nseg, key);
+                                       pkg_buf, segs, nseg, has_nct, key);
         if (drc != 0) return drc;
     }
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */

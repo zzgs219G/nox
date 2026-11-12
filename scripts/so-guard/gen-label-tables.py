@@ -42,8 +42,8 @@ import pathlib
 # ── 契约（改这里必须同步 nc_guard_key.c 的 ncg_label_key）──
 SALT = [0x6e, 0x63, 0x1f, 0x2b, 0x7a, 0x44, 0x91, 0xd8,
         0x03, 0x5c, 0xe6, 0x18, 0xaf, 0x72, 0x39, 0xc4]
-PERTURB = [0x34, 0xDD, 0x3F, 0x4E]
-SALT_IDX = [0, 4, 8, 12]
+PERTURB = [0x34, 0xDD, 0x3F, 0x4E, 0x7B]
+SALT_IDX = [0, 4, 8, 12, 2]
 NOISE_XOR = 0x9E
 
 LABELS = [
@@ -51,6 +51,11 @@ LABELS = [
     ("mac",  b"nc-so-mac-v1",   "ncg_label_enc_mac",  "NCGL_MAC"),
     ("so_r", b"nc-so-r-v1",     "ncg_label_enc_so_r", "NCGL_SO_R"),
     ("boot", b"nc-boot-v1",     "ncg_label_enc_boot", "NCGL_BOOT"),
+    # 2026-11-13：第 5 张表，给 .nct（消费方 VMP 数据段）用。
+    # label 明文 "nc-insn-v1" 与 so-section-lock.py 的 derive_app_keys
+    # 里 'nc-insn-v1' → 'insn' 域【必须逐字节一致】。
+    # 基值 0x64（= SALT[2] 0x1f ^ 0x7B）刻意与前四个都不同。
+    ("insn", b"nc-insn-v1",     "ncg_label_enc_insn", "NCGL_INSN"),
 ]
 
 

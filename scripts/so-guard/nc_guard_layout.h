@@ -18,11 +18,14 @@
 #ifndef _NC_GUARD_LAYOUT_H_
 #define _NC_GUARD_LAYOUT_H_
 
-/* ═══ 一、段名（6 个）═══════════════════════════════════════════════
+/* ═══ 一、段名（6 + 3 个）═══════════════════════════════════════════
  * 2026-10-19 中性化改名（旧名自解释，readelf -S 即可列举加固结构）：
  *   .ncguard     → .ncx     .ncguard_ro      → .ncxr
  *   .ncguard_head→ .ncxh    .ncguard_head_ro → .ncxhr
  *   .nckey       → .nck     .nckey_stub      → .ncks
+ *
+ * 2026-11-13 新增 3 个 VMP 段（.ncr/.nct/.ncd，见下方注释）。
+ * 它们是【可选段】——不开 VMP 的构建没有，所以不影响历史产物的契约。
  *
  * ⚠️ 段名是 so 的指纹特征。改名会让所有历史产物的锁箱/开箱契约失效，
  *    故 2026-10-19 之后不再变动。要加新段，先在 T21 登记。
@@ -38,6 +41,47 @@
 #define NC_SEC_HEADRO    ".ncxhr"  /* master 数据段（AWR，32B）*/
 #define NC_SEC_SLOT      ".nck"    /* 一级密钥槽*/
 #define NC_SEC_STUBSLOT  ".ncks"   /* 二级 stub 密钥槽*/
+
+/* ── VMP 数据段（2026-11-13 重新引入，amice ≥ v0.1.6-nox14）──────────
+ *
+ * Amice（编译期 LLVM pass）把被 VMP 的函数体换成「字节码 + bl 解释器」，
+ * 字节码/descriptor 表/native 表这些 global 此前不定段，链接器按约定丢进
+ * .rodata 或 .relro_padding —— 既无法从产物判断 VMP 是否生效、占多大，
+ * 也无法对它单独上锁箱。
+ *
+ * amice v0.1.6-nox14 起按「是否含指针」把 5 类 global 拆成两类段，
+ * 段名可由环境变量指定（构建期，不是本仓库的 C 代码标记的）：
+ *
+ *   AMICE_VM_DATA_SECTION  纯数据（字节码/const_pool/metadata）→ .ncr
+ *   AMICE_VM_PTR_SECTION   指针表（descriptor_table/native_call_table）→ .ncd
+ *   AMICE_VM_DATA_SECTION 被消费方编译时覆盖成 .nct → 只有第二套数据进 .nct
+ *
+ * 关键划分（2026-11-12 实测 .ncr 内 83 个 R_AARCH64_RELATIVE 得出）：
+ *
+ *   .ncr  第一套（nox 解密链自己的 VMP）纯数据 → 【必须明文】
+ *         循环依赖：解 .ncr 要 k_ncr ← master ← .ncxhr ← k_stub ← .ncks
+ *         ← boot_key ← ncg_boot_key，而 ncg_boot_key 自己被 VMP，
+ *         字节码就在 .ncr 里。要解 .ncr 得先跑 .ncr 里的代码，无解。
+ *
+ *   .nct  第二套（消费方 sig_check 等）纯数据 → 【加密】
+ *         那些函数在 constructor(65535) 才跑，那时解锁（constructor(50)）
+ *         早已完成，无循环依赖。
+ *
+ *   .ncd  两套的指针表 → 【必须明文】
+ *         这些位置在文件里是占位符，dlopen 时由动态链接器填真值。
+ *         加密它们 = 解锁时写回会覆盖掉链接器填好的指针 → 垃圾指针
+ *         → 解释器跳错地址 → 真机 SIGILL（2026-11-12 实测过）。
+ *
+ * ⚠️ 段名刻意不带 vm/vmp/amice 字样：段名留在 .shstrtab 里（strip 删不掉），
+ *    自解释的名字等于直接告诉逆向者"这里是 VM"。.ncr/.nct/.ncd 与
+ *    .ncx/.ncxh/.ncxr 同族，看起来只是又一个数据段。
+ * ⚠️ 本仓库不定义任何 __attribute__((section(NC_SEC_VMP*))) —— 这些段由
+ *    Amice 插件生成，这里只登记段名供解锁时查找。
+ * ⚠️ .nct 与 .ncr 都是【可选段】：没开 VMP 的构建两者都没有。消费顺序
+ *    必须动态决定（见 nc_guard_boot.c 的 has_nct），写死索引会让钥匙错配。 */
+#define NC_SEC_VMP       ".ncr"    /* 第一套 VMP 纯数据（明文，循环依赖）*/
+#define NC_SEC_VMP2      ".nct"    /* 第二套 VMP 纯数据（锁箱加密）*/
+#define NC_SEC_VMPPTR    ".ncd"    /* VMP 指针表（明文，含重定位）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节

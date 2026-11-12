@@ -79,6 +79,18 @@
 #define NCGL_MAC     12    /* "nc-so-mac-v1" */
 #define NCGL_SO_R    10    /* "nc-so-r-v1" */
 #define NCGL_BOOT    10    /* "nc-boot-v1" */
+/* 2026-11-13：第五张表，给 .nct（消费方 VMP 数据段）用。
+ * ⚠️ 长度必须等于 strlen("nc-insn-v1") = 10。曾写成 11 —— C 侧多读一个
+ *    字节（读到噪声位）→ 还原出 "nc-insn-v1\x??" → HKDF info 错 →
+ *    k_nct 错 → 解出乱码 → 真机 SIGILL。已加 _Static_assert 钉死。 */
+#define NCGL_INSN    10    /* "nc-insn-v1" */
+/* 运行时把 label 明文长度与实际字符串对拍（编译期即失败）。 */
+_Static_assert(sizeof("nc-insn-v1") - 1 == NCGL_INSN,
+               "NCGL_INSN 与 label 明文长度不一致 —— C 侧会多读/少读噪声位");
+_Static_assert(sizeof("nc-so-v1") - 1 == NCGL_SO, "NCGL_SO 长度不符");
+_Static_assert(sizeof("nc-so-mac-v1") - 1 == NCGL_MAC, "NCGL_MAC 长度不符");
+_Static_assert(sizeof("nc-so-r-v1") - 1 == NCGL_SO_R, "NCGL_SO_R 长度不符");
+_Static_assert(sizeof("nc-boot-v1") - 1 == NCGL_BOOT, "NCGL_BOOT 长度不符");
 
 /* ── 2026-11-08：四张表各自独立基值（不再统一 0x5A）────────────────
  *
@@ -151,6 +163,13 @@ static const uint8_t ncg_label_enc_boot[NCGL_BOOT * 2] = {
     0x8e, 0xec, 0x8e, 0x81, 0x95, 0x46, 0xcc, 0x31,
     0x97, 0xfd, 0xd0, 0x0f,
 };
+/* 2026-11-13：第五张表（label "nc-insn-v1"），.nct 段密钥用。
+ * 由 gen-label-tables.py 生成，勿手改；`--check` 会对拍。 */
+static const uint8_t ncg_label_enc_insn[NCGL_INSN * 2] = {
+    0x0a, 0x31, 0x07, 0xfd, 0x49, 0x0f, 0x0d, 0x86,
+    0x0a, 0xf0, 0x17, 0xda, 0x0a, 0x78, 0x49, 0x5a,
+    0x12, 0xe4, 0x55, 0xc2,
+};
 
 /* 把密文表还原进调用方缓冲（不写 NUL —— 调用方按长度用 memcpy 拼包名）。
  * ⚠️ 用 volatile 写：防止编译器把"解码后立刻使用"优化成常量折叠，
@@ -165,26 +184,29 @@ static void ncg_label_decode(const uint8_t *enc, size_t n, uint8_t key,
     for (size_t i = 0; i < n; i++) v[i] = (uint8_t)(enc[i * 2] ^ key);
 }
 
-/* 从 SALT 派生四个基值。返回值与上面四张表的 ^ 值逐一对应：
- *   0x5A / 0xA7 / 0x3C / 0xE1
- * ⚠️ 私有扰动量（0x34/0xDD/0x3F/0x4E）与 SALT 的对应字节异或后
- *    恰好产出上述四个基值。改 SALT 或改这里任一字节都会导致 label 错
+/* 从 SALT 派生五个基值。返回值与上面五张表的 ^ 值逐一对应：
+ *   0x5A / 0xA7 / 0x3C / 0xE1 / 0x64
+ * ⚠️ 私有扰动量（0x34/0xDD/0x3F/0x4E/0x7B）与 SALT 的对应字节异或后
+ *    恰好产出上述五个基值。改 SALT 或改这里任一字节都会导致 label 错
  *    → k_so 错 → .ncx 解出乱码 → 全链崩（fail-closed，不会静默）。 */
 __attribute__((noinline))
-static void ncg_label_key(uint8_t out[4]) {
+static void ncg_label_key(uint8_t out[5]) {
     static const uint8_t salt[16] = NC_BOOT_SALT_INIT;
-    /* SALT 索引：0 / 4 / 8 / 12（每 4 字节取一个，避开相邻字节）
-     * 私有扰动：0x34 / 0xDD / 0x3F / 0x4E （本文件私有，无外部契约）
+    /* SALT 索引：0 / 4 / 8 / 12 / 2（前四个每 4 字节取一个，避开相邻字节；
+     * 第五个取 2 —— 前四个已用掉 0/4/8/12，取中间下标与它们都不同）
+     * 私有扰动：0x34 / 0xDD / 0x3F / 0x4E / 0x7B （本文件私有，无外部契约）
      * 逐项校验：
      *   salt[0]=0x6e ^ 0x34 = 0x5A   ✓
      *   salt[4]=0x7a ^ 0xDD = 0xA7   ✓
      *   salt[8]=0x03 ^ 0x3F = 0x3C   ✓
-     *   salt[12]=0xaf ^ 0x4E = 0xE1  ✓ */
+     *   salt[12]=0xaf ^ 0x4E = 0xE1  ✓
+     *   salt[2]=0x1f ^ 0x7B = 0x64   ✓（与前四个都不同） */
     volatile uint8_t *v = (volatile uint8_t *)out;
     v[0] = (uint8_t)(salt[0]  ^ 0x34);
     v[1] = (uint8_t)(salt[4]  ^ 0xDD);
     v[2] = (uint8_t)(salt[8]  ^ 0x3F);
     v[3] = (uint8_t)(salt[12] ^ 0x4E);
+    v[4] = (uint8_t)(salt[2]  ^ 0x7B);
 }
 
 
@@ -564,7 +586,7 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
 int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
                     const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    uint8_t info[128]; size_t n=0; uint8_t lk[5];
     /* label 从密文表还原（2026-11-06 P0：消除 .rodata 明文锚点，见文件头）
      * 2026-11-08：基值不再统一 0x5A，从 SALT 派生（见 ncg_label_key） */
     ncg_label_key(lk);
@@ -617,7 +639,7 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
 int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    uint8_t info[128]; size_t n=0; uint8_t lk[5];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_mac, NCGL_MAC, lk[1], info);
     n=NCGL_MAC;
@@ -639,7 +661,7 @@ int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
 int ncg_derive_k_so_r(const uint8_t master[32],const uint8_t cert_sha256[32],
                       const char *pkg,uint8_t out[16]){
     if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
-    uint8_t info[128]; size_t n=0; uint8_t lk[4];
+    uint8_t info[128]; size_t n=0; uint8_t lk[5];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_so_r, NCGL_SO_R, lk[2], info);
     n=NCGL_SO_R;
@@ -665,6 +687,55 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
     return rc;
 }
 
+/* ── 派生 k_nct（与 so-section-lock.py 的 derive_app_keys['insn'] 一致）──
+ * k_nct = HKDF-SHA256(ikm=master, salt=SHA256(certDER),
+ *                     info="nc-insn-v1"+pkg, 16)
+ *
+ * 2026-11-13：.nct 段专用 —— 消费方（第二套）VMP 的字节码 / const_pool。
+ *
+ * 为什么这一段可以加密，而 .ncr（第一套）不行：
+ *   .ncr 里的字节码属于本仓库自己的解密链。解它的钥匙要由 master 派生，
+ *   而 master 要 k_stub，k_stub 要 boot_key，boot_key 由 ncg_boot_key 算
+ *   —— 那个函数自己就被 VMP，字节码就在 .ncr 里。要解 .ncr 得先跑
+ *   .ncr 里的代码，结构上无法同时满足。
+ *   而 .nct 装的是消费方的 VMP（sig_check 等），那些函数在
+ *   constructor(65535) 才第一次执行，那时本文件所在的解锁流程
+ *   （constructor(50)）早已跑完，不存在循环依赖。
+ *
+ * ⚠️ 加密的只是【纯数据】：指针表（descriptor_table / native_call_table）
+ *    由 amice 分到 .ncd，**不能加密** —— 那些位置是 R_AARCH64_RELATIVE
+ *    重定位槽，dlopen 时由动态链接器填真值，解锁时写回会覆盖掉它们
+ *    → 垃圾指针 → 解释器跳错地址 → 真机 SIGILL（2026-11-12 实测）。
+ *
+ * ⚠️ label 必须与 so-section-lock.py 的 derive_app_keys() 的
+ *    ('nc-insn-v1', 'insn') 逐字节一致。 */
+int ncg_derive_k_nct(const uint8_t master[32],const uint8_t cert_sha256[32],
+                     const char *pkg,uint8_t out[16]){
+    if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
+    uint8_t info[128]; size_t n=0; uint8_t lk[5];
+    ncg_label_key(lk);
+    ncg_label_decode(ncg_label_enc_insn, NCGL_INSN, lk[4], info);
+    n=NCGL_INSN;
+    { size_t l=strlen(pkg); if(l>sizeof info-11) l=sizeof info-11; memcpy(info+n,pkg,l); n+=l; }
+    khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
+    return 0;
+}
+
+/* 便捷版：吃 certDER。存在的理由与 ncg_derive_k_so_r_from_der 相同。 */
+int ncg_derive_k_nct_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der,size_t der_len,
+                              const char *pkg,uint8_t out[16]){
+    if(!master||!cert_der||!der_len||!pkg||!pkg[0]||!out) return -1;
+    uint8_t sha[32];
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx,cert_der,der_len);
+    ksha_final(&ctx,sha);
+    int rc=ncg_derive_k_nct(master,sha,pkg,out);
+    memset(sha,0,sizeof sha);
+    return rc;
+}
+
 /* ── 还原 HKDF 的 boot label（2026-11-06 P0）────────────────────────
  * 给 ncg_boot_key 用（它在 nc_guard_crypto.c，为本文件的外部调用方）。
  *
@@ -684,7 +755,7 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
  * ⚠️ 调用方用完应擦除缓冲（含密钥材料的派生输入）。 */
 size_t ncg_label_boot(uint8_t *out, size_t cap) {
     if (!out || cap < NCGL_BOOT) return 0;
-    uint8_t lk[4];
+    uint8_t lk[5];
     ncg_label_key(lk);
     ncg_label_decode(ncg_label_enc_boot, NCGL_BOOT, lk[3], out);
     /* 基值用完即擦。不用 ncg_wipe：它定义在 nc_guard_boot.c，而本文件

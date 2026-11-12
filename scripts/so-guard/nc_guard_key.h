@@ -108,3 +108,27 @@ int ncg_derive_k_so_r(const uint8_t master[32], const uint8_t cert_sha256[32],
 int ncg_derive_k_so_r_from_der(const uint8_t master[32],
                                const uint8_t *cert_der, size_t der_len,
                                const char *pkg, uint8_t out[16]);
+
+/* k_nct = HKDF-SHA256(..., info="nc-insn-v1"+pkg, 16)  【2026-11-13 新增】
+ *
+ * .nct 段专用 —— 消费方（第二套）VMP 的字节码 / const_pool / metadata。
+ *
+ * 为什么与 .ncr（第一套）区别对待：
+ *   .ncr 里的字节码属于本仓库自己的解密链，解它的钥匙要由 master 派生，
+ *   而 master 要 k_stub，k_stub 要 boot_key，boot_key 由 ncg_boot_key 算
+ *   —— 那个函数自己就被 VMP、字节码就在 .ncr 里。要解 .ncr 得先执行
+ *   .ncr 里的代码，结构上无解，只能明文。
+ *   .nct 装的是消费方 VMP（sig_check 等），那些函数在 constructor(65535)
+ *   才第一次执行，远在本解锁流程（constructor(50)）之后，可加密。
+ *
+ * ⚠️ 只加密纯数据。指针表（descriptor_table / native_call_table）由 amice
+ *    分到 .ncd，**必须明文** —— 那些位置是 R_AARCH64_RELATIVE 重定位槽，
+ *    dlopen 时由动态链接器填真值，解锁写回会覆盖它们 → 真机 SIGILL。
+ * ⚠️ label 必须与 so-section-lock.py 的 derive_app_keys() 逐字节一致。 */
+int ncg_derive_k_nct(const uint8_t master[32], const uint8_t cert_sha256[32],
+                     const char *pkg, uint8_t out[16]);
+
+/* 便捷版：吃 certDER。与 ncg_derive_k_so_r_from_der 同构。 */
+int ncg_derive_k_nct_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der, size_t der_len,
+                              const char *pkg, uint8_t out[16]);

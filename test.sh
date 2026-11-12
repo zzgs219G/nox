@@ -593,6 +593,141 @@ else
     skip "V10 无锁箱产物"
 fi
 
+# ── V11 .nct 段（消费方 VMP 数据）全链路（2026-11-13 新增）──
+# 为什么单独一组：`.nct` 与前六个段有一个结构性差异 —— 它是
+# 【可选段】，且它的解密顺序必须排在 .ncx【之前】。
+# 之前引入时踩过三个坑（段名正则不认数字、段序写死、NCGL_INSN 长度错），
+# 每个都只在真机上表现为 SIGILL，靠 test.sh 才逐个抓到。这组断言把它们钉住。
+echo "── V11 .nct 段全链路 ──"
+
+# V11-a：跨语言密钥对拍（C 侧 ncg_derive_k_nct ↔ Python 侧 insn 域）
+if [ -f "$GUARD_DIR/test-k-nct-parity.py" ]; then
+    if python3 "$GUARD_DIR/test-k-nct-parity.py" >"$W/knct.log" 2>&1; then
+        ok "V11a k_nct 跨语言对拍一致（C ↔ Python）"
+    else
+        bad "V11a k_nct 跨语言不一致 —— 解出必是乱码（真机 SIGILL）"
+        tail -12 "$W/knct.log"
+    fi
+else
+    skip "V11a 无 test-k-nct-parity.py（旧分发包）"
+fi
+
+# V11-b/V11-c：带 .nct 的产物【能解锁且数据正确】
+# 这是本组的核心 —— 只验"段存在"不够。历史教训（AGENTS §3.2 三种假绿）：
+# 判据必须是真的调用，不是看段名在不在。
+cd "$W" || exit 2
+cat > v11.c <<'V11EOF'
+/* .nct 装的是纯数据（字节码 / const_pool / metadata 那一类）。
+ *
+ * ⚠️ 为什么用「大部分是重复字节 + 一小段标记」的数据：
+ *   熵值断言要有区分度，前提是【明文熵低】。第一版用了 64 个互不相同的
+ *   字节 —— 明文熵就已经是 log2(64)=6.0，密文再压也压不出差距，
+ *   断言变成恒假。这与 AGENTS §3.2 记的"恒真断言"是同一类错误。
+ *   现在是 240 字节 0x00 + 16 字节标记：明文熵 ≈ 0.2，密文应 > 6.5。 */
+#include <stdint.h>
+__attribute__((section(".nct"), used, retained))
+const uint8_t v11_data[256] = {
+    /* 前 240 字节全 0 —— 明文熵极低，加密后必须跳起来 */
+    [0 ... 239] = 0x00,
+    /* 尾部 16 字节标记 —— 用于"明文序列零命中"的搜索 */
+    [240]=0xDE,[241]=0xAD,[242]=0xBE,[243]=0xEF,[244]=0xCA,[245]=0xFE,[246]=0xBA,[247]=0xBE,
+    [248]=0x12,[249]=0x34,[250]=0x56,[251]=0x78,[252]=0x9A,[253]=0xBC,[254]=0xDE,[255]=0xF0,
+};
+/* 期望值用运行期求和，避免被常量折叠成明文副本。
+ * 明文和 = 0xDE+0xAD+... = 见下方期望常量。 */
+extern const uint8_t v11_data[256];
+__attribute__((visibility("default"), noinline))
+int v11_sum(void) {
+    unsigned s = 0;
+    for (int i = 0; i < 256; i++) s += v11_data[i];
+    return (int)(s & 0x7fffffff);
+}
+V11EOF
+if guard_compile "$W/raw11.so" v11.c 2>"$W/v11build.log"; then
+    if readelf -SW raw11.so 2>/dev/null | awk '{print $2}' | grep -qxF '.nct'; then
+        ok "V11b 业务代码标 .nct → 段已生成"
+    else
+        bad "V11b 标了 section(\".nct\") 但段不存在——clang 把 const 数据丢去别处了？"
+    fi
+    # 只锁 .nct（第一段就是它，不涉及 .ncx 的段序问题）
+    if python3 "$LOCK" raw11.so l11.so --section .nct --from-apk "$APK" \
+            --package "$PKG_FIX" >l11.log 2>&1; then
+        # 判据：加密后熵必须跳起来（明文 const 数组熵极低）
+        E11=$(python3 - <<'PY'
+import struct, math
+d = open('l11.so','rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]; es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]; si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es; no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.nct':
+        fo = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
+        seg = d[fo:fo+sz]
+        c = [0]*256
+        for b in seg: c[b] += 1
+        e = -sum((v/len(seg))*math.log2(v/len(seg)) for v in c if v)
+        print('%.3f' % e); break
+PY
+)
+        if awk "BEGIN{exit !(${E11:-0} > 6.0)}"; then
+            ok "V11c .nct 已是密文（熵 $E11）"
+        else
+            bad "V11c .nct 熵仅 ${E11:-0} —— 加密未生效"
+        fi
+    else
+        bad "V11 V11 .nct 锁箱失败"; tail -10 l11.log
+    fi
+    # V11-d：.nct 必须被【删除明文可读性】——原始字节序列不应再出现
+    if [ -f l11.so ]; then
+        if python3 - <<'PY'
+import sys
+# 原明文的可辨识长子串（尾部 16 字节标记，明文里独一无二）
+needle = bytes([0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0])
+d = open('l11.so','rb').read()
+sys.exit(1 if needle in d else 0)
+PY
+        then
+            ok "V11d .nct 明文序列零命中（确实变成密文）"
+        else
+            bad "V11d .nct 明文序列仍可搜到 —— 加密写回的段不对"
+        fi
+    fi
+    # V11-e：不加密时熵必须低（反向验证 V11c 的判据不是恒真）
+    # AGENTS §3.2：新增"拒绝/失败"类断言必须验证它真会红。
+    # 这里反过来：确认【未加密】的 raw11.so 熵确实低，说明 V11c 的
+    # 阈值有区分度，不是"怎么写都过"。
+    E11_RAW=$(python3 - <<'PY'
+import struct, math
+d = open('raw11.so','rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]; es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]; si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es; no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.nct':
+        fo = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
+        seg = d[fo:fo+sz]
+        c = [0]*256
+        for b in seg: c[b] += 1
+        e = -sum((v/len(seg))*math.log2(v/len(seg)) for v in c if v)
+        print('%.3f' % e); break
+PY
+)
+    if awk "BEGIN{exit !(${E11_RAW:-9} < 3.0)}"; then
+        ok "V11e 未加密的 .nct 熵仅 $E11_RAW（V11c 阈值有区分度，非恒真）"
+    else
+        bad "V11e 未加密的 .nct 熵已 ${E11_RAW:-9} —— V11c 的判据无区分度，需重设样本数据"
+    fi
+else
+    bad "V11 编译失败"; head -10 "$W/v11build.log"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
