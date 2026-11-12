@@ -866,7 +866,10 @@ for i in range(en):
                 bad "V13b .ncq 熵仅 ${E13:-0} —— 加密未生效"
             fi
             # 钥匙独立性：k_bc 必须与 k_nct 不同（RC4 流密码不能共用 keystream）
-            if python3 "$GUARD_DIR/test-k-nct-parity.py" 2>/dev/null \
+            # ⚠️ 静态库形态没有 .c 源码，无法编 C 侧对拍 → 跳过（不是失败）
+            if [ "$HAS_SRC" != "1" ]; then
+                skip "V13c k_bc 对拍（静态库形态无 .c 源码）"
+            elif python3 "$GUARD_DIR/test-k-nct-parity.py" 2>/dev/null \
                     | grep -q 'k_bc'; then
                 ok "V13c k_bc 跨语言对拍通过（与 k_nct 独立）"
             else
@@ -894,6 +897,10 @@ fi
 echo "── V14 源文件清单一致性 ──"
 cd "$ROOT" || exit 2
 _MISSING=""
+# ⚠️ 静态库形态没有 .c（分发契约），通配符会展开成字面量 '*' → 误报。
+if [ "$HAS_SRC" != "1" ]; then
+    skip "V14a 清单检查（静态库形态无 .c 源码）"
+else
 for f in "$GUARD_DIR"/*.c; do
     b=$(basename "$f" .c)
     # ② 生产清单必须包含每一个（jni 也要，NDK 有 jni.h）
@@ -906,6 +913,7 @@ if [ -z "$_MISSING" ]; then
 else
     bad "V14a 有 .c 未进 make-zip-lib.sh 的 LIB_SRCS:$_MISSING"
     echo "     → 生产产物会报 undefined symbol（分 TU 编译查不出来）" >&2
+fi
 fi
 # ① 自测清单是通配符，只需确认它确实用通配符（防有人改回硬编码）
 if grep -q '"$GUARD_DIR"/\*\.c' test.sh 2>/dev/null; then
