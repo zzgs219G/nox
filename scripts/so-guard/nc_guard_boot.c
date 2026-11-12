@@ -1082,13 +1082,25 @@ static int ncg_verify_seg_mac(const uint8_t master[32],
  *    （2026-10-30 修 SIGSEGV 的实证结论，不要简化）。
  * ⚠️ 返回码同原实现：-8 (mprotect RW) / -9 (malloc) / -10 (mprotect 恢复) / -12 (派生)。
  */
+/* ── ncg_decrypt_one_seg 的上下文（2026-11-12）────────────────────────
+ *
+ * 为什么打包：Amice 报 "only up to 8 flattened scalar ... arguments"。
+ * 原参数表 9 个（so_path/base/master/der/der_len/pkg/sg/i/ps/k_out），
+ * 其中 master[32] / k_out[16] 是数组，扁平化后占位更多。
+ * 把「派生密钥需要的四个值」打包成一个指针，参数降到 6 个。
+ */
+struct ncg_seg_ctx {
+    const uint8_t *master;   /* 32 字节 */
+    const uint8_t *der;
+    size_t der_len;
+    const char *pkg;
+};
+
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_decrypt_one_seg(const char *so_path, const void *base,
-                               const uint8_t master[32],
-                               const uint8_t *der, size_t der_len,
-                               const char *pkg,
-                               const ncg_shdr_t *sg, uintptr_t i,
+                               const struct ncg_seg_ctx *cx,
+                               const ncg_shdr_t *sg, uintptr_t seg_ord,
                                uint8_t k_out[16]) {
     /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
      * 少传一个参数（Amice 只支持 8 个扁平参数）。
@@ -1096,7 +1108,6 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
     const uintptr_t ps = (uintptr_t)getpagesize();
     /* sg 已指向 &segs[原 i]，所以循环体里一律用 segs[0]；
      * 而「哪一段」这个信息用 seg_ord 单独带（决定用 k_so 还是 k_so_r）。 */
-    const uintptr_t seg_ord = i;
     const ncg_shdr_t *segs = sg;
     {
         uint8_t *tgt = (uint8_t *)base + segs[0].addr;
@@ -1127,7 +1138,7 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
         if (seg_ord == 0) {
             memcpy(segkey, k_out, 16);
         } else {
-            if (ncg_derive_k_so_r_from_der(master, der, der_len, pkg,
+            if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
                                            segkey) != 0) {
                 ncg_wipe(k_out, 16);
                 return -12;
@@ -1213,8 +1224,9 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
      * 按页对齐，否则会失败。 */
     uintptr_t ps = getpagesize();
     for (int i = 0; i < nseg; i++) {
-        int src = ncg_decrypt_one_seg(so_path, base, master, der, der_len, pkg,
-                                      &segs[i], i, k_out);
+        struct ncg_seg_ctx cx;
+        cx.master = master; cx.der = der; cx.der_len = der_len; cx.pkg = pkg;
+        int src = ncg_decrypt_one_seg(so_path, base, &cx, &segs[i], i, k_out);
         if (src != 0) return src;
     }
 
