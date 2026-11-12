@@ -1101,7 +1101,6 @@ struct ncg_seg_ctx {
     const char *pkg;
     size_t seg_ord;          /* 段号：0 用 k_so，>0 用 k_so_r */
     const char *so_path;     /* ncg_page_has_writable_neighbor 要用 */
-    int has_nct;             /* 本产物是否有 .nct（决定段序与钥匙对应） */
 };
 
 NC_VMP_FUNC
@@ -1149,43 +1148,14 @@ static int ncg_decrypt_one_seg(const void *base,
          * MAC 覆盖两段密文，验签在解密【之前】已经比对过密文，不受影响；
          * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
          * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
-        /* 段密钥按序分派，顺序必须与 so-section-lock.py 的 _SEG_KEYS 一致。
-         *   0 → k_so（.ncx 代码）
-         *   1 → k_so_r（.ncxr 常量表）
-         *   2 → k_nct（.nct 消费方 VMP 数据） */
-        /* 段序已改为 .nct → .ncx → .ncxr（见 segs[] 的注释：.nct 必须
-         * 最早解密，否则 .ncx 里的 VMP wrapper 会读到密文字节码）。
-         * 因此三把钥匙的对应关系也随之调整：
-         *   0 → k_nct（.nct）
-         *   1 → k_so （.ncx）  ← 由调用方传入的 k_out
-         *   2 → k_so_r（.ncxr）*/
-        /* 段序【动态】决定 —— .nct 是可选段（没开第二套 VMP 的产物没有它，
-         * 本仓库 test.sh 的 V6/V7 就是这种）。写死索引会导致钥匙错配：
-         *   有 .nct： 0=.nct(k_nct)  1=.ncx(k_so)   2=.ncxr(k_so_r)
-         *   无 .nct： 0=.ncx(k_so)   1=.ncxr(k_so_r)
-         * 曾经写死成 "0→k_nct / 1→k_so / 2→k_so_r"，无 .nct 时把 k_nct
-         * 用在 .ncx 上 → 解出乱码 → V6"正常包也会挂"。 */
         uint8_t segkey[16];
-        {
-            const size_t kso_idx  = cx->has_nct ? (size_t)1 : (size_t)0;
-            const size_t ksor_idx = cx->has_nct ? (size_t)2 : (size_t)1;
-            if (cx->has_nct && seg_ord == 0) {
-                if (ncg_derive_k_nct_from_der(cx->master, cx->der, cx->der_len,
-                                              cx->pkg, segkey) != 0) {
-                    ncg_wipe(k_out, 16);
-                    return -12;
-                }
-            } else if (seg_ord == kso_idx) {
-                memcpy(segkey, k_out, 16);
-            } else if (seg_ord == ksor_idx) {
-                if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len,
-                                               cx->pkg, segkey) != 0) {
-                    ncg_wipe(k_out, 16);
-                    return -12;
-                }
-            } else {
+        if (seg_ord == 0) {
+            memcpy(segkey, k_out, 16);
+        } else {
+            if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
+                                           segkey) != 0) {
                 ncg_wipe(k_out, 16);
-                return -12;   /* 段序异常：fail-closed */
+                return -12;
             }
         }
         uint8_t *buf = (uint8_t *)malloc(len);
@@ -1258,7 +1228,6 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
                                 const uint8_t *der, size_t der_len,
                                 const char *pkg,
                                 const ncg_shdr_t *segs, int nseg,
-                                int has_nct,
                                 uint8_t k_out[16]) {
     /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
      * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
@@ -1272,7 +1241,6 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
         struct ncg_seg_ctx cx;
         cx.master = master; cx.der = der; cx.der_len = der_len;
         cx.pkg = pkg; cx.so_path = so_path;
-        cx.has_nct = has_nct;
         int src = ncg_decrypt_one_seg(base, &cx, (uint64_t)i, &segs[i], k_out);
         if (src != 0) return src;
     }
@@ -1499,65 +1467,8 @@ int ncg_head_unlock(const void *self_addr) {
      *
      * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
-    /* 2026-11-12：从 2 段扩到 3 段，新增 .nct（消费方 VMP 数据）。
-     *
-     * 为什么 .nct 可以加密而 .ncr（第一套 VMP 数据）不行：
-     *   .ncr 里的字节码属于 nox 自己的解密链 —— 解它的钥匙派生要执行
-     *   它里面的函数，加密即自锁（要解 .ncr 得先跑 .ncr 里的代码）。
-     *   而 .nct 装的是消费方的 VMP（sig_check 等），那些函数在
-     *   constructor(65535) 才运行，那时本函数（constructor(50)）早已解完，
-     *   没有循环依赖。
-     *
-     * ⚠️ .nct 可能不存在（没开第二套 VMP 的构建），所以走 optional 分支。
-     * ⚠️ 段序必须与 so-section-lock.py 的 _SEG_KEYS 严格一致：
-     *    .ncx → k_so, .ncxr → k_so_r, .nct → k_nct。 */
-    /* ⚠️⚠️ 2026-11-12 真机实测（SIGILL）：.nct 必须排在【最前】。
-     *
-     * 第一版把它放在 .ncx/.ncxr 之后，真机 dlopen 即崩：
-     *   Fatal signal 4 (SIGILL) at libnc.so+0x82598（.ncx 段内）
-     *   backtrace: call_constructors → constructor(50) → .ncx 里的代码
-     *
-     * 原因是 .ncx 里的函数带有 VMP wrapper，wrapper 第一条指令就
-     * bl 到解释器、读 .nct 里的字节码。若 .nct 尚未解密，读到的是
-     * 密文 → 解释器把密文当 opcode → 跳到无效地址 → SIGILL。
-     *
-     * 而 .nct 的钥匙 k_nct 只需 master（来自 .ncxhr），与 .ncx 无关，
-     * 所以「先解 .nct」没有循环依赖。
-     *
-     * 段序（必须与 so-section-lock.py 的 _SEG_KEYS 严格一致）：
-     *   .nct → k_nct   （最先，供其它段的 VMP wrapper 使用）
-     *   .ncx → k_so
-     *   .ncxr → k_so_r */
-    ncg_shdr_t segs[3];
+    ncg_shdr_t segs[2];
     int nseg = 0;
-    /* has_nct：.nct 是【可选段】——没开第二套 VMP 的产物没有它。
-     * 段序必须动态决定，不能写死（写死时若 .nct 不存在，segs[0] 会变成
-     * .ncx，导致钥匙错配 → 解出乱码；test.sh 的 V6/V7 就是这样抓到的）。 */
-    /* .nct 参与解密（2026-11-12，第一版曾因 NCGL_INSN 写错 11 而 SIGILL，
-     * 修正为 10 后真机通过）。
-     *
-     * 曾把 .nct（消费方 VMP 数据段）纳入锁箱，真机 dlopen 即 SIGILL
-     * （libnc.so+0x82ad8，.ncx 段内，call_constructors 阶段）。
-     * 两个段序都试过，崩溃地址完全一致；手工验证 k_nct 派生与解密
-     * 本身都正确（.nct 解出熵 2.79 的明文）。
-     *
-     * 真因在 Amice 侧：.nct 里放的是 5 类 global（字节码 / metadata /
-     * native_table / descriptor_table / ...），它们之间是构建期固定的
-     * 指针关系，解释器在 constructor 阶段就按固定偏移读取。整段加密后
-     * 那一刻读到的是密文 → 按垃圾值跳转 → SIGILL。
-     *
-     * 要让它成立须改 Amice（解释器改为按需解密字节码），工作量远超收益。
-     * 所以 here 保持 has_nct 恒为 0（段名与钥匙派生代码保留，便于将来重启），
-     * .nct 由 protect.sh 保持明文，仅作观测用。 */
-    int has_nct = 0;
-    {
-        ncg_shdr_t vmp2;
-        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
-            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
-            segs[nseg++] = vmp2;
-            has_nct = 1;
-        }
-    }
     segs[nseg++] = sec;
     {
         ncg_shdr_t ro;
@@ -1584,7 +1495,7 @@ int ncg_head_unlock(const void *self_addr) {
     /* 2026-11-12：拆成独立函数（降 alloca）。逐段解密+权限+基线都在里面。 */
     {
         int drc = ncg_decrypt_segments(so_path, base, master, der_buf, der_len,
-                                       pkg_buf, segs, nseg, has_nct, key);
+                                       pkg_buf, segs, nseg, key);
         if (drc != 0) return drc;
     }
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */

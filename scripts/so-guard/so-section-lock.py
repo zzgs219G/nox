@@ -100,10 +100,7 @@ def _load_layout_contract():
 
     out = {}
     # ① 段名：#define NC_SEC_XXX  ".yyy"
-    # ⚠️ 2026-11-12：类名里要允许数字 —— NC_SEC_VMP2 带 '2'。
-    #    原先 [A-Z_]+ 匹配不到它，导致 _LAYOUT 缺这个键 →
-    #    lock() 里 _KEY_BY_NAME 抛 KeyError → 一级锁箱整体失败。
-    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z0-9_]+)\s+"([^"]+)"', text):
+    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z_]+)\s+"([^"]+)"', text):
         out[m.group(1)] = m.group(2)
     # ② 尺寸/偏移：#define NC_XXX_YYY  104  或  0x1000
     # 2026-10-28 T4：加入 BOOT_（NC_BOOT_BACK / NC_BOOT_FWD）与 INFO（字符串另处理）
@@ -386,9 +383,6 @@ def derive_app_keys(master: bytes, cert_sha256: bytes, package: str) -> dict:
     （96 字节签名表，结构高度可猜）就能反推 .ncx 前 96 字节明文。
     现在 .ncxr 用独立的 so_r 域，两段的 keystream 互相不可推导。
     """
-    # 2026-11-12：'insn' 域正式启用 —— 给 .ncr（VMP 数据段）用。
-    # 此前该 label 只占位未使用。.ncr 装的是 Amice 生成的 VM 字节码 /
-    # descriptor 表，此前无段属性、混在 .rodata 里明文可读。
     out = {}
     for label, dom in (('nc-dex-v1', 'dex'), ('nc-insn-v1', 'insn'),
                        ('nc-so-v1', 'so'), ('nc-warm-v1', 'warm'),
@@ -882,32 +876,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     #   明文即可反推 .ncx 同位置明文（报告已做交叉验证，前 96 字节完全一致）。
     #   现在按段序分配独立域密钥：第 0 段 k_so，第 1 段 k_so_r，再多段则
     #   用 HKDF 继续派生（当前只用两段，超出时显式报错而非静默复用）。
-    # 2026-11-12：加第 3 把钥匙给 .nct（消费方 VMP 数据段）。
-    #
-    # ⚠️ 为什么 .nct 能加密而 .ncr 不能：
-    #    .ncr 装的是 nox 解密链自己的 VMP 字节码 —— 解它的钥匙派生要执行
-    #    它里面的函数，加密即自锁（要解 .ncr 得先跑 .ncr 里的代码）。
-    #    .nct 装的是消费方的 VMP（sig_check 等），那些函数在
-    #    constructor(65535) 才运行，那时解锁早已完成，没有循环依赖。
-    #
-    # ⚠️ key 顺序必须与 C 侧 ncg_decrypt_one_seg 的分派严格一致：
-    #    .ncx → k_so, .ncxr → k_so_r, .nct → k_nct。
-    k_nct = keys['insn']          # label = "nc-insn-v1" + 包名
-    #
-    # ⚠️ 钥匙顺序必须与 C 侧 nc_guard_boot.c 的 segs[] 严格一致，
-    # 而且**必须跟着 --section 的实际顺序走** —— 不能写死。
-    #
-    # 2026-11-12 踩过的坑：写死 _SEG_KEYS = (k_nct, k_so, k_so_r) 后，
-    # 对没有 .nct 的老产物（--section .ncx,.ncxr）会把 k_nct 用在 .ncx 上
-    # → 解出乱码 → test.sh 的 V6/V7 当场变红（"正常包也会挂"）。
-    #
-    # 规则：按 sec_names 里出现的段名逐个映射到对应钥匙。
-    _KEY_BY_NAME = {
-        _LAYOUT['NC_SEC_CODE']:  k_so,     # .ncx
-        _LAYOUT['NC_SEC_CONST']: k_so_r,   # .ncxr
-        _LAYOUT['NC_SEC_VMP2']:  k_nct,    # .nct（消费方 VMP 数据）
-    }
-    _SEG_KEYS = tuple(_KEY_BY_NAME[nm] for nm in sec_names)
+    _SEG_KEYS = (k_so, k_so_r)
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
         sc = elf.find(nm)

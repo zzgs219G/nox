@@ -38,32 +38,6 @@
 #define NC_SEC_HEADRO    ".ncxhr"  /* master 数据段（AWR，32B）*/
 #define NC_SEC_SLOT      ".nck"    /* 一级密钥槽*/
 #define NC_SEC_STUBSLOT  ".ncks"   /* 二级 stub 密钥槽*/
-/* 2026-11-12：VMP 数据段（Amice 生成的字节码 / descriptor 表 / native 表）。
- *
- * 为什么需要独立段：此前这些数据没指定段，链接器按约定全落进 .rodata，
- * 与 dex2c 的 opcode 表、字符串常量混在一起 —— 既无法从产物判断"VMP 到底
- * 生效没有、占多大"，也无法对它单独加锁箱。
- *
- * ⚠️ 段名刻意不带 vm/vmp/amice 字样：段名留在 .shstrtab 里（strip 删不掉），
- *    自解释的名字等于直接告诉逆向者"这里是 VM"。`.ncr` 与 .ncx/.ncxh/.ncxr
- *    同族，看起来只是又一个只读数据段。
- * ⚠️ 该段由 Amice 插件（编译期）生成，不是本仓库的 C 代码标记的 —— 所以
- *    C 侧不定义任何 __attribute__((section(NC_SEC_VMP)))，只在这里登记段名
- *    供解锁时查找。 */
-#define NC_SEC_VMP       ".rodata.ncr"    /* VMP 数据段（AWR，明文，循环依赖不可加密）*/
-
-/* 2026-11-12：第二个 VMP 数据段，专门给"解锁之后才运行"的 VMP 数据。
- *
- * 为什么需要与 .ncr 分开：
- *   .ncr 装的是 nox 解密链自己的 VMP 字节码 —— 解它的钥匙派生要执行它里面
- *   的函数，加密即自锁，所以只能明文。
- *   而消费方的 VMP（sig_check 等）在 constructor(65535) 才跑，那时解锁早已
- *   完成，没有循环依赖，**可以加密**。
- *   两套数据混在同一个段里，就只能整段明文或整段加密，没有中间地带。
- *
- * ⚠️ 由 Amice 的 AMICE_VM_DATA_SECTION 环境变量指定（nox 打 .a 时用默认
- *    .ncr，消费方编译时设成 .nct），不是本仓库的 C 代码标记的。 */
-#define NC_SEC_VMP2      ".rodata.nct"    /* 消费方 VMP 数据段（AWR，锁箱加密）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节
