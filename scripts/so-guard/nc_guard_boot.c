@@ -1104,9 +1104,15 @@ static int ncg_decrypt_one_seg(const void *base,
                                const uint8_t *master,
                                const uint8_t *der, size_t der_len,
                                const char *pkg, size_t seg_ord,
-                               const char *so_path,
-                               const ncg_shdr_t *sg,
+                               const char *so_path_in,
+                               const ncg_shdr_t *sg_in,
                                uint8_t k_out[16]) {
+    /* 2026-11-12：入参用非 const 局部别名接一下 ——
+     * const 指针参数在 -Oz 下会被 LLVM 标 captures(none)，
+     * 而 Amice 的 native call 宽度推断对该属性处理有误
+     * （报 "argument 1 width mismatch: value is 64, callee expects 32"）。 */
+    const char *so_path = so_path_in;
+    const ncg_shdr_t *sg = sg_in;
     /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
      * 少传一个参数（Amice 只支持 8 个扁平参数）。
      * getpagesize() 是常量，重取代价可忽略。 */
