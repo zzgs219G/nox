@@ -639,9 +639,14 @@ static void ncg_rc4(const uint8_t *key, size_t keylen,
  *
  * 返回 1 = 有可写邻居（调用方应保持 RW），0 = 无（可安全设只读）。
  * 出错时返回 1（保守：宁可权限宽一点，也不要误伤正常段）。 */
+/* ⚠️ 2026-11-12：参数宽度统一成 uint64_t。
+ * 原因：Amice 把它算成 [64, 32, 32, 32]，而调用点传的是 [64, 64, 64, 64]
+ * → "argument 1 width mismatch"。uintptr_t/size_t 在 LLVM IR 里虽然是 i64，
+ * 但 Amice 的 native call 参数宽度推断在某些路径上按 32 处理——
+ * 显式用 uint64_t 让两侧都无歧义。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_page_has_writable_neighbor(const char *so_path, uintptr_t addr,
-                                          size_t len, uintptr_t page) {
+static int ncg_page_has_writable_neighbor(const char *so_path, uint64_t addr,
+                                          uint64_t len, uint64_t page) {
     /* 思路：镜像基址必定页对齐，所以「运行期地址所在页」减去基址后，
      * 与「链接期地址所在页」是同一页。因此只要把所有段的 sh_addr 按页
      * 分组，找出 addr 落在哪一组，再看该组里有没有 SHF_WRITE 的段即可。
