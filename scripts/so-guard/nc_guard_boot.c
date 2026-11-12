@@ -1072,23 +1072,27 @@ static int ncg_verify_seg_mac(const uint8_t master[32],
  * ⚠️ 失败路径擦 k_out；成功时 k_out 保留（后续要用）。
  * ⚠️ 返回码同原实现：-8/-9/-10/-12。
  */
+/* ── 解一个段（2026-11-12 从 ncg_decrypt_segments 的循环体抽出）───────
+ *
+ * 为什么拆：ncg_decrypt_segments 报 values=28/29（预算 32）。
+ * 循环体自带 tgt/len/is_code/s/e/segkey/buf/prot 等 8 个局部量，
+ * 每次迭代都在峰值上。抽成独立函数后主函数只剩循环变量。
+ *
+ * ⚠️ 语义逐字保留，特别是「数据段若与可写段同页则保持 RW」那段
+ *    （2026-10-30 修 SIGSEGV 的实证结论，不要简化）。
+ * ⚠️ 返回码同原实现：-8 (mprotect RW) / -9 (malloc) / -10 (mprotect 恢复) / -12 (派生)。
+ */
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_decrypt_segments(const char *so_path, const void *base,
-                                const uint8_t master[32],
-                                const uint8_t *der, size_t der_len,
-                                const char *pkg,
-                                const ncg_shdr_t *segs, int nseg,
-                                uint8_t k_out[16]) {
-    /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
-     * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
-     * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
-     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncx 与 .text 尾部
-     * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
-     * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
-     * 按页对齐，否则会失败。 */
-    uintptr_t ps = getpagesize();
-    for (int i = 0; i < nseg; i++) {
+static int ncg_decrypt_one_seg(const char *so_path, const void *base,
+                               const uint8_t master[32],
+                               const uint8_t *der, size_t der_len,
+                               const char *pkg,
+                               const ncg_shdr_t *segs, int i,
+                               uintptr_t ps, uint8_t k_out[16]) {
+    const ncg_shdr_t *sg = (const ncg_shdr_t *)segs + i;
+    (void)so_path;
+    {
         uint8_t *tgt = (uint8_t *)base + segs[i].addr;
         size_t len = (size_t)segs[i].size;
         /* 数据段不需要 EXEC；代码段需要 */
@@ -1182,6 +1186,30 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
                 return -10;
             }
         }
+    }
+    return 0;
+}
+
+NC_VMP_FUNC
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
+static int ncg_decrypt_segments(const char *so_path, const void *base,
+                                const uint8_t master[32],
+                                const uint8_t *der, size_t der_len,
+                                const char *pkg,
+                                const ncg_shdr_t *segs, int nseg,
+                                uint8_t k_out[16]) {
+    /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
+     * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
+     * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
+     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncx 与 .text 尾部
+     * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
+     * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
+     * 按页对齐，否则会失败。 */
+    uintptr_t ps = getpagesize();
+    for (int i = 0; i < nseg; i++) {
+        int src = ncg_decrypt_one_seg(so_path, base, master, der, der_len, pkg,
+                                      segs, i, ps, k_out);
+        if (src != 0) return src;
     }
 
     /* ── 提交二（2026-10-30）：记录解密后 .ncx 明文的完整性基线 ─────────
