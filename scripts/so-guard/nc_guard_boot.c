@@ -1088,10 +1088,10 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
                                const uint8_t master[32],
                                const uint8_t *der, size_t der_len,
                                const char *pkg,
-                               const ncg_shdr_t *segs, int i,
+                               const ncg_shdr_t *sg,
                                uintptr_t ps, uint8_t k_out[16]) {
-    const ncg_shdr_t *sg = (const ncg_shdr_t *)segs + i;
-    (void)so_path;
+    const ncg_shdr_t *segs = sg;   /* 循环体里用的是 segs[i]，这里 i 固定 0 */
+    const int i = 0;
     {
         uint8_t *tgt = (uint8_t *)base + segs[i].addr;
         size_t len = (size_t)segs[i].size;
@@ -1208,7 +1208,7 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
     uintptr_t ps = getpagesize();
     for (int i = 0; i < nseg; i++) {
         int src = ncg_decrypt_one_seg(so_path, base, master, der, der_len, pkg,
-                                      segs, i, ps, k_out);
+                                      &segs[i], ps, k_out);
         if (src != 0) return src;
     }
 
