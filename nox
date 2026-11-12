@@ -67,18 +67,44 @@ def _static_lib_for(abi):
     return p if os.path.isfile(p) else None
 
 
-def _guard_has_sources():
-    return all(os.path.isfile(os.path.join(GUARD, s)) for s in GUARD_SRCS)
+# ── 加密设施的源文件清单（2026-11-13 改为动态扫描）────────────────────
+#
+# ⚠️⚠️ 这里原本是硬编码列表。新增 nc_guard_report.c 时漏加，
+#    症状是产物里 boot.c 引用的 ncg_report_build 变成未定义符号 ——
+#    分 TU 编译不报错（各 .c 各自编 .o 都成功），只在链接后 dlopen 才炸，
+#    报错是 `undefined symbol: ncg_report_flush`，完全不指向清单本身。
+#    同一天在 test.sh / make-zip-lib.sh / 本文件踩了三次。
+#
+#    现在改为【扫描 GUARD 目录下所有 nc_guard_*.c】，新增文件自动生效。
+#    例外：nc_guard_jni.c 需要 <jni.h>（NDK 头），宿主编译时未必存在，
+#    此处的用途是宿主编译（nolib 形态），故排除它 —— 生产产物由
+#    make-zip-lib.sh 用 NDK 编译，那条路包含 jni。
+_GUARD_EXCLUDE = {'nc_guard_jni.c'}
 
-# 加密设施必须一起编译的源文件（顺序无关，但一个都不能少）
-GUARD_SRCS = [
-    'nc_guard_boot.c',     # 自解谜引导
-    'nc_guard_probe.c',    # .ncx/.nck 段唯一定义处
-    'nc_guard_key.c',      # SHA256/HMAC/HKDF
-    'nc_guard_paths.c',    # 路径密文表
-    'nc_guard_xor.c',      # XOR_KEY 重组（2026-11-06 从 boot.c 拆出）
-    'nc_guard_crypto.c',   # boot_key 派生（2026-11-06 从 boot.c 拆出，为 VMP）
-]
+
+def _guard_sources():
+    """扫描 GUARD 目录，返回要编译的 .c 绝对路径列表。"""
+    try:
+        names = sorted(os.listdir(GUARD))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if not n.endswith('.c'):
+            continue
+        if not n.startswith('nc_guard_'):
+            continue
+        if n in _GUARD_EXCLUDE:
+            continue
+        out.append(os.path.join(GUARD, n))
+    return out
+
+
+GUARD_SRCS = _guard_sources()
+
+
+def _guard_has_sources():
+    return len(GUARD_SRCS) > 0
 
 # 预编译静态库。按目标 ABI 分目录存放 —— .a 是机器码，与 CPU 架构绑死，
 # 一个 x86-64 的 .a 在 aarch64 上链接会直接报
@@ -239,7 +265,7 @@ def do_build(args, workdir):
     #    否则 libc 等也会被全量拉入，so 体积爆炸。
     if _guard_has_sources():
         cmd += ['-I', GUARD]
-        cmd += [os.path.join(GUARD, s) for s in GUARD_SRCS]
+        cmd += GUARD_SRCS
         where = '源码 %d 个 .c' % len(GUARD_SRCS)
         _static = None
     else:
@@ -250,7 +276,8 @@ def do_build(args, workdir):
                 '  期望其一：%s/%s\n'
                 '             %s/lib/%s/libnox.a\n'
                 '  静态库形态必须用 --abi 指定目标架构（%s）。'
-                % (GUARD, GUARD_SRCS[0], GUARD, _abi_hint, _abi_hint))
+                % (GUARD, os.path.basename(GUARD_SRCS[0]) if GUARD_SRCS
+                   else 'nc_guard_boot.c', GUARD, _abi_hint, _abi_hint))
         cmd += ['-I', GUARD]
         where = '静态库 %s' % os.path.basename(_static)
 

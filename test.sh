@@ -913,6 +913,13 @@ if grep -q '"$GUARD_DIR"/\*\.c' test.sh 2>/dev/null; then
 else
     bad "V14b guard_compile 改回硬编码清单了 —— 新增 .c 会静默漏掉"
 fi
+# ③ nox CLI 也必须动态扫描（它原先也是硬编码 GUARD_SRCS）
+if grep -q '_guard_sources()' nox 2>/dev/null && \
+   grep -q 'GUARD_SRCS = _guard_sources()' nox 2>/dev/null; then
+    ok "V14c nox CLI 动态扫描 so-guard/*.c"
+else
+    bad "V14c nox CLI 改回硬编码 GUARD_SRCS 了 —— 新增 .c 会静默漏掉"
+fi
 
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
