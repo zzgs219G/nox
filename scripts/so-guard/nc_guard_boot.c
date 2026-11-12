@@ -1094,14 +1094,17 @@ struct ncg_seg_ctx {
     const uint8_t *der;
     size_t der_len;
     const char *pkg;
+    size_t seg_ord;          /* 段号：0 用 k_so，>0 用 k_so_r */
+    const char *so_path;     /* ncg_page_has_writable_neighbor 要用 */
 };
 
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_decrypt_one_seg(const char *so_path, const void *base,
+static int ncg_decrypt_one_seg(const void *base,
                                const struct ncg_seg_ctx *cx,
-                               const ncg_shdr_t *sg, uintptr_t seg_ord,
+                               const ncg_shdr_t *sg,
                                uint8_t k_out[16]) {
+    const size_t seg_ord = cx->seg_ord;
     /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
      * 少传一个参数（Amice 只支持 8 个扁平参数）。
      * getpagesize() 是常量，重取代价可忽略。 */
@@ -1193,7 +1196,7 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
                 /* 数据段：同页若含 .data/.bss（原始权限可写），保持 RW，
                  * 否则会误伤。判据：检查覆盖该段的整页范围内，
                  * 是否有其它段要求 SHF_WRITE。 */
-                if (ncg_page_has_writable_neighbor(so_path, (uintptr_t)tgt,
+                if (ncg_page_has_writable_neighbor(cx->so_path, (uintptr_t)tgt,
                                                    len, ps)) {
                     prot |= PROT_WRITE;
                 }
@@ -1226,7 +1229,8 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
     for (int i = 0; i < nseg; i++) {
         struct ncg_seg_ctx cx;
         cx.master = master; cx.der = der; cx.der_len = der_len; cx.pkg = pkg;
-        int src = ncg_decrypt_one_seg(so_path, base, &cx, &segs[i], i, k_out);
+        cx.seg_ord = (size_t)i;
+        int src = ncg_decrypt_one_seg(base, &cx, &segs[i], k_out);
         if (src != 0) return src;
     }
 
