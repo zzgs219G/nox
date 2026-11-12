@@ -78,7 +78,13 @@
 #define NCGL_SO       8    /* "nc-so-v1" */
 #define NCGL_MAC     12    /* "nc-so-mac-v1" */
 #define NCGL_SO_R    10    /* "nc-so-r-v1" */
-#define NCGL_INSN    11    /* "nc-insn-v1"（2026-11-12：.nct 段专用）*/
+#define NCGL_INSN    10    /* "nc-insn-v1"（2026-11-12：.nct 段专用）*/
+/* ⚠️ 长度必须与 "nc-insn-v1" 逐字节相等（10）。写成 11 时 C 侧还原出的
+ *    label 会多一个字节 → HKDF 的 info 错 → k_nct 错 → .nct 解出乱码
+ *    → 解释器把乱码当 opcode → 真机 SIGILL（本仓库踩过，查了半天）。
+ *    下面这条断言把它钉死。 */
+_Static_assert(sizeof("nc-insn-v1") - 1 == NCGL_INSN,
+               "NCGL_INSN 与 label 字面量长度不一致");
 #define NCGL_BOOT    10    /* "nc-boot-v1" */
 
 /* ── 2026-11-08：四张表各自独立基值（不再统一 0x5A）────────────────

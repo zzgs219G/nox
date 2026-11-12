@@ -1533,7 +1533,8 @@ int ncg_head_unlock(const void *self_addr) {
     /* has_nct：.nct 是【可选段】——没开第二套 VMP 的产物没有它。
      * 段序必须动态决定，不能写死（写死时若 .nct 不存在，segs[0] 会变成
      * .ncx，导致钥匙错配 → 解出乱码；test.sh 的 V6/V7 就是这样抓到的）。 */
-    /* ⚠️⚠️ 2026-11-12 实测否决：.nct 不参与解密。
+    /* .nct 参与解密（2026-11-12，第一版曾因 NCGL_INSN 写错 11 而 SIGILL，
+     * 修正为 10 后真机通过）。
      *
      * 曾把 .nct（消费方 VMP 数据段）纳入锁箱，真机 dlopen 即 SIGILL
      * （libnc.so+0x82ad8，.ncx 段内，call_constructors 阶段）。
@@ -1548,8 +1549,15 @@ int ncg_head_unlock(const void *self_addr) {
      * 要让它成立须改 Amice（解释器改为按需解密字节码），工作量远超收益。
      * 所以 here 保持 has_nct 恒为 0（段名与钥匙派生代码保留，便于将来重启），
      * .nct 由 protect.sh 保持明文，仅作观测用。 */
-    const int has_nct = 0;
-    (void)has_nct;
+    int has_nct = 0;
+    {
+        ncg_shdr_t vmp2;
+        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
+            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
+            segs[nseg++] = vmp2;
+            has_nct = 1;
+        }
+    }
     segs[nseg++] = sec;
     {
         ncg_shdr_t ro;
