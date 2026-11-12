@@ -1088,7 +1088,7 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
                                const uint8_t master[32],
                                const uint8_t *der, size_t der_len,
                                const char *pkg,
-                               const ncg_shdr_t *sg, int i,
+                               const ncg_shdr_t *sg, uintptr_t i,
                                uint8_t k_out[16]) {
     /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
      * 少传一个参数（Amice 只支持 8 个扁平参数）。
@@ -1096,7 +1096,7 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
     const uintptr_t ps = (uintptr_t)getpagesize();
     /* sg 已指向 &segs[原 i]，所以循环体里一律用 segs[0]；
      * 而「哪一段」这个信息用 seg_ord 单独带（决定用 k_so 还是 k_so_r）。 */
-    const int seg_ord = i;
+    const uintptr_t seg_ord = i;
     const ncg_shdr_t *segs = sg;
     {
         uint8_t *tgt = (uint8_t *)base + segs[0].addr;
