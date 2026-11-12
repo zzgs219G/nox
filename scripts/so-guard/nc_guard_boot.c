@@ -1088,15 +1088,21 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
                                const uint8_t master[32],
                                const uint8_t *der, size_t der_len,
                                const char *pkg,
-                               const ncg_shdr_t *sg,
-                               uintptr_t ps, uint8_t k_out[16]) {
-    const ncg_shdr_t *segs = sg;   /* 循环体里用的是 segs[i]，这里 i 固定 0 */
-    const int i = 0;
+                               const ncg_shdr_t *sg, int i,
+                               uint8_t k_out[16]) {
+    /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
+     * 少传一个参数（Amice 只支持 8 个扁平参数）。
+     * getpagesize() 是常量，重取代价可忽略。 */
+    const uintptr_t ps = (uintptr_t)getpagesize();
+    /* sg 已指向 &segs[原 i]，所以循环体里一律用 segs[0]；
+     * 而「哪一段」这个信息用 seg_ord 单独带（决定用 k_so 还是 k_so_r）。 */
+    const int seg_ord = i;
+    const ncg_shdr_t *segs = sg;
     {
-        uint8_t *tgt = (uint8_t *)base + segs[i].addr;
-        size_t len = (size_t)segs[i].size;
+        uint8_t *tgt = (uint8_t *)base + segs[0].addr;
+        size_t len = (size_t)segs[0].size;
         /* 数据段不需要 EXEC；代码段需要 */
-        int is_code = (segs[i].flags & SHF_EXECINSTR) != 0;
+        int is_code = (segs[0].flags & SHF_EXECINSTR) != 0;
         uintptr_t s = (uintptr_t) tgt & ~(ps - 1);
         uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
         if (mprotect((void *) s, e - s,
@@ -1118,7 +1124,7 @@ static int ncg_decrypt_one_seg(const char *so_path, const void *base,
          * 但解出的表是乱码 → 判定必然失败（fail-closed，不会静默放行）。
          * 这不是兼容性 bug，是刻意的格式版本边界：老包必须用老 so。 */
         uint8_t segkey[16];
-        if (i == 0) {
+        if (seg_ord == 0) {
             memcpy(segkey, k_out, 16);
         } else {
             if (ncg_derive_k_so_r_from_der(master, der, der_len, pkg,
@@ -1208,7 +1214,7 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
     uintptr_t ps = getpagesize();
     for (int i = 0; i < nseg; i++) {
         int src = ncg_decrypt_one_seg(so_path, base, master, der, der_len, pkg,
-                                      &segs[i], ps, k_out);
+                                      &segs[i], i, k_out);
         if (src != 0) return src;
     }
 
