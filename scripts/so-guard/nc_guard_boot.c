@@ -1106,17 +1106,15 @@ struct ncg_seg_ctx {
 NC_VMP_FUNC
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_decrypt_one_seg(const void *base,
-                               const uint8_t *master,
-                               const uint8_t *der, size_t der_len,
-                               const char *pkg, size_t seg_ord,
-                               const char *so_path_in,
+                               const struct ncg_seg_ctx *cx,
+                               uint64_t seg_ord,
                                const ncg_shdr_t *sg_in,
                                uint8_t k_out[16]) {
     /* 2026-11-12：入参用非 const 局部别名接一下 ——
      * const 指针参数在 -Oz 下会被 LLVM 标 captures(none)，
      * 而 Amice 的 native call 宽度推断对该属性处理有误
      * （报 "argument 1 width mismatch: value is 64, callee expects 32"）。 */
-    const char *so_path = so_path_in;
+    const char *so_path = cx->so_path;
     const ncg_shdr_t *sg = sg_in;
     /* ⚠️ 2026-11-12：ps（页大小）在循环外已算好，这里重取一次——
      * 少传一个参数（Amice 只支持 8 个扁平参数）。
@@ -1154,7 +1152,7 @@ static int ncg_decrypt_one_seg(const void *base,
         if (seg_ord == 0) {
             memcpy(segkey, k_out, 16);
         } else {
-            if (ncg_derive_k_so_r_from_der(master, der, der_len, pkg,
+            if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len, cx->pkg,
                                            segkey) != 0) {
                 ncg_wipe(k_out, 16);
                 return -12;
@@ -1240,8 +1238,10 @@ static int ncg_decrypt_segments(const char *so_path, const void *base,
      * 按页对齐，否则会失败。 */
     uintptr_t ps = getpagesize();
     for (int i = 0; i < nseg; i++) {
-        int src = ncg_decrypt_one_seg(base, master, der, der_len, pkg,
-                                      (size_t)i, so_path, &segs[i], k_out);
+        struct ncg_seg_ctx cx;
+        cx.master = master; cx.der = der; cx.der_len = der_len;
+        cx.pkg = pkg; cx.so_path = so_path;
+        int src = ncg_decrypt_one_seg(base, &cx, (uint64_t)i, &segs[i], k_out);
         if (src != 0) return src;
     }
 
