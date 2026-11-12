@@ -81,7 +81,14 @@ fi
 #      No implementation found for NcLink.selftest）。
 #    这不是可选项 —— 漏了它整包起不来。
 # nc_guard_xor（2026-11-06）：XOR_KEY 重组，从 boot.c 拆出以便单独 VMP
-LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni nc_guard_xor nc_guard_crypto"
+# ⚠️ 这里是【生产静态库】的编译清单，必须包含全部 .c。
+#    新增源文件时同步这里 —— 2026-11-13 实测踩过：加了 nc_guard_report.c
+#    但漏加进本清单，产物里 boot.c 引用的 ncg_report_build 变成未定义符号，
+#    症状是消费方 dlopen 报 `cannot locate symbol`（分 TU 编译不报错）。
+#
+#    与 test.sh 的 guard_compile 不同：那边要【排除】nc_guard_jni.c
+#    （宿主未必有 jni.h），这边是 NDK 交叉编译，jni.h 必在，所以要包含。
+LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni nc_guard_xor nc_guard_crypto nc_guard_report"
 
 : "${ANDROID_NDK_HOME:?双 ABI 交叉编译需要 ANDROID_NDK_HOME（指向 NDK 根目录）}"
 _prebuilt="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"

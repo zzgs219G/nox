@@ -882,6 +882,38 @@ else
     bad "V13 编译失败"; head -8 "$W/v13build.log"
 fi
 
+# ── V14 源文件清单一致性（2026-11-13 新增）──
+# 为什么需要：本项目有三处独立维护的 .c 清单 ——
+#   ① test.sh 的 guard_compile（自测用，排除 jni）
+#   ② make-zip-lib.sh 的 LIB_SRCS（生产静态库，含 jni）
+#   ③ 各 CI workflow
+# 新增一个 .c 时漏改任一处，症状都是"分 TU 编译不报错、链接后 dlopen
+# 才炸"，且报错只说 'undefined symbol: xxx'，不指向清单本身。
+# 2026-11-13 一天之内踩了两次（nc_guard_report.c 漏在两处）。
+# 这条断言把"记得改清单"变成机器检查。
+echo "── V14 源文件清单一致性 ──"
+cd "$ROOT" || exit 2
+_MISSING=""
+for f in "$GUARD_DIR"/*.c; do
+    b=$(basename "$f" .c)
+    # ② 生产清单必须包含每一个（jni 也要，NDK 有 jni.h）
+    if ! grep -q "LIB_SRCS=.*\b$b\b" scripts/make-zip-lib.sh 2>/dev/null; then
+        _MISSING="$_MISSING make-zip-lib.sh:$b"
+    fi
+done
+if [ -z "$_MISSING" ]; then
+    ok "V14a make-zip-lib.sh 的 LIB_SRCS 覆盖全部 .c"
+else
+    bad "V14a 有 .c 未进 make-zip-lib.sh 的 LIB_SRCS:$_MISSING"
+    echo "     → 生产产物会报 undefined symbol（分 TU 编译查不出来）" >&2
+fi
+# ① 自测清单是通配符，只需确认它确实用通配符（防有人改回硬编码）
+if grep -q '"$GUARD_DIR"/\*\.c' test.sh 2>/dev/null; then
+    ok "V14b guard_compile 用通配符（新增 .c 自动生效）"
+else
+    bad "V14b guard_compile 改回硬编码清单了 —— 新增 .c 会静默漏掉"
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
