@@ -100,7 +100,10 @@ def _load_layout_contract():
 
     out = {}
     # ① 段名：#define NC_SEC_XXX  ".yyy"
-    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z_]+)\s+"([^"]+)"', text):
+    # ⚠️ 2026-11-12：类名里要允许数字 —— NC_SEC_VMP2 带 '2'。
+    #    原先 [A-Z_]+ 匹配不到它，导致 _LAYOUT 缺这个键 →
+    #    lock() 里 _KEY_BY_NAME 抛 KeyError → 一级锁箱整体失败。
+    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z0-9_]+)\s+"([^"]+)"', text):
         out[m.group(1)] = m.group(2)
     # ② 尺寸/偏移：#define NC_XXX_YYY  104  或  0x1000
     # 2026-10-28 T4：加入 BOOT_（NC_BOOT_BACK / NC_BOOT_FWD）与 INFO（字符串另处理）
@@ -890,7 +893,21 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     # ⚠️ key 顺序必须与 C 侧 ncg_decrypt_one_seg 的分派严格一致：
     #    .ncx → k_so, .ncxr → k_so_r, .nct → k_nct。
     k_nct = keys['insn']          # label = "nc-insn-v1" + 包名
-    _SEG_KEYS = (k_so, k_so_r, k_nct)
+    #
+    # ⚠️ 钥匙顺序必须与 C 侧 nc_guard_boot.c 的 segs[] 严格一致，
+    # 而且**必须跟着 --section 的实际顺序走** —— 不能写死。
+    #
+    # 2026-11-12 踩过的坑：写死 _SEG_KEYS = (k_nct, k_so, k_so_r) 后，
+    # 对没有 .nct 的老产物（--section .ncx,.ncxr）会把 k_nct 用在 .ncx 上
+    # → 解出乱码 → test.sh 的 V6/V7 当场变红（"正常包也会挂"）。
+    #
+    # 规则：按 sec_names 里出现的段名逐个映射到对应钥匙。
+    _KEY_BY_NAME = {
+        _LAYOUT['NC_SEC_CODE']:  k_so,     # .ncx
+        _LAYOUT['NC_SEC_CONST']: k_so_r,   # .ncxr
+        _LAYOUT['NC_SEC_VMP2']:  k_nct,    # .nct（消费方 VMP 数据）
+    }
+    _SEG_KEYS = tuple(_KEY_BY_NAME[nm] for nm in sec_names)
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
         sc = elf.find(nm)
