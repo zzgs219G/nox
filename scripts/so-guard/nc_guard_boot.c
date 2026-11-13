@@ -115,33 +115,24 @@
 #  define NC_OBF
 #endif
 
-/* ── NC_VMP_FUNC（2026-11-12）：给 .ncxh 里的解锁器逐函数上 VMP ────────
+/* ── NC_VMP_FUNC：给 .ncxh 里的解锁器逐函数上 VMP（2026-11-12）
  *
- * 背景：nc_guard_boot.c 不能整文件开 VMP（25+ 个无关函数含重型 I/O，
- * 体积会暴涨，见 make-zip-lib.sh 的清单注释）。但 .ncxh 里这 5 个函数
- * 是攻击者解开 .ncxh 之后直接读到的**全部内容**：
+ * 为什么不开整文件 VMP：本文件 25+ 个函数含重型 I/O，整文件开体积会暴涨
+ * （见 make-zip-lib.sh 清单注释）。但 .ncxh 里这 5 个是攻击者解开 .ncxh
+ * 后直接读到的**全部内容**：
+ *   ncg_head_unlock / ncg_rc4 / ncg_resolve_self / ncg_find_section /
+ *   ncg_apk_path_fault
  *
- *   ncg_head_unlock      解 .ncx 的主流程
- *   ncg_rc4              RC4
- *   ncg_resolve_self     dladdr 取基址
- *   ncg_find_section     ELF 段查找
- *   ncg_apk_path_fault   APK 路径污染
+ * 实测依据（零信息逆向）：它能走到 .ncx 门口，靠的正是读这些函数的明文
+ * 反汇编 —— 把 ncg_stub_descramble 的 16 次 XOR 循环误当成 .ncx 解密，
+ * 算法判断错后停手。VMP 这一层它连误判的机会都没有。
  *
- * 实测依据（本轮零信息逆向）：它能走到 .ncx 门口，靠的正是读这些函数的
- * 明文反汇编 —— 具体是把 ncg_stub_descramble 的 16 次 XOR 循环误当成
- * .ncx 解密，算法判断错后停手。**VMP 这一层，它连误判的机会都没有。**
- *
- * ⚠️ 依赖本 fork 的 @llvm.used 豁免补丁（amice 040ce6c）。
- *    .ncxh 的函数带 used/retain，上游 Amice 会判 "non-call address use"
- *    并跳过。换回上游 bundle 时这 5 个会被**静默跳过**（构建仍绿），
- *    所以换 bundle 后必须跑 check-obf.sh 确认 VM 子段数。
- *
- * ⚠️ 与 NC_OBF 互斥使用：同一函数不能既 annotate "+flatten" 又
- *    "+vm_virtualize"（实测两者叠加会让 vm_virtualize 跳过该函数）。
- *    本宏只含 vm_virtualize，不要和其它 annotate 宏叠加。
- *
- * ⚠️ 不开时（无 NC_AMICE_ANNOTATE）宏为空 —— 与 NC_OBF 同款，
- *    保证不用 Amice 的构建路径行为不变。 */
+ * ⚠️ 依赖本 fork 的 @llvm.used 豁免补丁（amice 040ce6c）：.ncxh 的函数带
+ *    used/retain，上游 Amice 会判 "non-call address use" 并**静默跳过**
+ *    （构建仍绿）。换回上游 bundle 必须跑 check-obf.sh 确认 VM 子段数。
+ * ⚠️ 与 NC_OBF 互斥：同一函数不能既 "+flatten" 又 "+vm_virtualize"
+ *    （实测叠加会让 vm_virtualize 跳过该函数）。
+ * ⚠️ 不开时宏为空，保证不用 Amice 的构建路径行为不变。 */
 #if defined(NC_AMICE_ANNOTATE)
 #  define NC_VMP_FUNC \
      __attribute__((noinline, annotate("+vm_virtualize")))
@@ -221,50 +212,33 @@ static void ncg_baseline_init(uint8_t *const *addrs, const uint32_t *sizes,
  *  它构成了第二份布局描述，与 nc_guard_layout.h 形成双权威。） */
 
 
-/* ── XOR_KEY 碎片化（与 so-section-lock.py 的 XOR_KEY 逐字节对应）────────
+/* ── XOR_KEY 碎片化（与 so-section-lock.py 的 XOR_KEY 逐字节对应）
  *
- * 完整 8 字节密钥从不在 .rodata 里连续出现。原实现是一整串常量，
- * HEX 搜索直接命中（实测 7e31a50dc8924bf6 在 so 里明文出现 2 次）。
+ * 8 字节密钥从不在 .rodata 连续出现（旧实现整串常量，HEX 搜索直接命中）。
+ *   · 真碎片：slot 碎片区 NC_OFF_FRAGS[104:112)，构建期随机生成；
+ *   · 本文件的 ncg_frag_a/b/c/d 是【诱饵】：随机初值 + 假运算 + 防 gc，
+ *     攻击者对 .data 拼出的是随机值。兼作 diff 掩护（看起来仍像老机制）；
+ *   · NCG_XOR_FRAG 查表在 .rodata 无妨 —— 没有真碎片，表只是排列规则。
  *
- * 现行机制（2026-10-21 起）：
- *   · 真碎片在【slot 碎片区】NC_OFF_FRAGS([104:112))，锁箱器每次构建随机生成；
- *   · 本文件的 ncg_frag_a/b/c/d 是【诱饵】——随机初值、参与假运算、
- *     防 gc-sections 回收；攻击者读 .data 拼出的是随机值，与真 XOR_KEY 无关。
- *     保留它们还兼作 diff 掩护（每次构建都在，看起来仍像老机制）。
- *   · NCG_XOR_FRAG 查表仍在 .rodata（编译期常量）。表本身不构成独立泄露：
- *     没有 slot 里的真碎片，表只是排列规则。
+ * 两条已验证的教训（别退回旧做法）：
+ *   ① 用 noinline static 函数藏碎片【无效】：LLVM 做跨函数常量传播，
+ *      会把完整密钥折回 .rodata（实测命中 0x5b0/0x5b8）。只有 volatile
+ *      这类标准级屏障才真阻止折叠。
+ *   ② 碎片放 .data 常量【无效】：破解复盘实测 objdump 读 .data +
+ *      反汇编 5 分钟重组出 XOR_KEY。真碎片必须来自构建期随机。
  *
- * 演进教训（别退回旧做法）：
- *   ① 4 个 uint16 各放一个 noinline static 函数 —— 不管用。LLVM 做函数间
- *      常量传播，把完整 8 字节密钥写回 .rodata（实测 boot.o 0x5b0/0x5b8）。
- *      只有 volatile 这类标准级屏障才真阻止折叠。
- *   ② 碎片放 .data 常量也不行 —— 破解复盘实测"objdump 读 .data + 反汇编
- *      5 分钟重组出 XOR_KEY"。真碎片必须来自构建期随机（即 slot 碎片区）。
+ * ⚠️ 2026-10-22 删掉过一条【从未成立】的"反向纪律"：原文宣称
+ *    "key16 经栈槽 [sp+0x40] 隐式传递、IDA 追不到源"。核实后：
+ *    ① 归因错 —— [sp+0x40] 是 pread() 的 offset 参数，Elf64_Shdr 跨函数
+ *       传递的正常产物，不是刻意设计的混淆；
+ *    ② 现象已不存在 —— 当前 -Oz 产物里 ncg_xor_key 是孤立函数，无跨帧传参。
+ *    不恢复的理由：它依赖编译器栈分配决策，升级就可能变；而注释一旦
+ *    宣称"我们有这层防御"，后续所有加固判断都会建立在错误前提上。
  *
- * ⚠️ 2026-10-22 删除一条【从未成立】的"反向纪律"（原第 128-132 行）。
- *   原文宣称："key16 中间值经栈偏移 [sp+0x40] 在函数间隐式传递，IDA/r2
- *   追不到源，这层白捡的防御是 -Oz 栈分配的副产品"。
- *
- *   核实后该表述有两处问题，故删除：
- *   ① 【归因错】。破解复盘报告说的 [sp+0x40] 是 ncg_head_unlock 里
- *      pread(fd, slotdata, 96, slot.sh_offset) 的 offset 参数 —— 那是
- *      Elf64_Shdr 结构体跨函数传递落在栈上的字段，属正常编译产物，
- *      不是"刻意设计的隐式传参"。报告作者把它误读成混淆手法。
- *   ② 【现象已不存在】。实测当前产物（-Oz）：ncg_xor_key 是【孤立函数】
- *      （nm 可见独立符号，ncguard_unlock 内对它的 bl 调用 = 0 次，
- *      所有调用点都被内联），不存在"跨帧栈槽传递密钥"。
- *
- *   为什么不试图恢复它：它依赖 -Oz 的栈分配决策，编译器一升级就可能变；
- *   而源码注释一旦宣称"我们有这层防御"，后续所有加固判断都会建立在
- *   错误前提上（正是本条注释过去几轮造成的问题）。不可维护的防御
- *   不该写进注释当保障。冻结靠 T22（二进制等价）仍然有效，但 T22 只能
- *   验证"改动前后一致"，验证不了"某个编译器副产品还在"。
- *
- *   真正强的防线是 CRC 自绑定（见 ncg_self_crc）：改 .text 任一字节 →
- *   CRC 变 → k_stub 变 → .ncxh 解出垃圾 → SIGILL。破解复盘 v2 做了
- *   对照实验证实（改一条正常运行 100% 不可达的指令仍 SIGILL），
- *   且它试图绕过（重加密 .ncxh）仍失败 —— 因为它漏了 .ncxhr 也依赖
- *   k_stub。那条靠的是链式依赖，不是误导。
+ * 真正强的防线是 CRC 自绑定（见 ncg_self_crc）：改 .text 任一字节 →
+ * CRC 变 → k_stub 变 → .ncxh 解出垃圾 → SIGILL。破解复盘 v2 对照实验
+ * 证实（改一条 100% 不可达的指令仍 SIGILL），且重加密 .ncxh 绕过也失败
+ * （漏了 .ncxhr 同样依赖 k_stub）。那是链式依赖，不是误导。
  *
  * 存放约定：逻辑字节 i<4 取第 NCG_XOR_FRAG[i] 个 uint16 的低 8 位；
  *   i>=4 取高 8 位。 */
@@ -569,7 +543,7 @@ int ncg_stub_find_text(const char *so_path, ncg_shdr_t *out) {
  *   不依赖 PC 相对寻址反推基址。基址由调用方以 base 参数传入。
  *   （对照：ncg_slot_read 靠 &ncg_stub_slot 反推基址，改外部符号会让它
  *    从 PC 相对变成 GOT 间接寻址 —— 那条风险留给 P2，且已单独验证过
- *    反推结果仍正确，见 docs/混淆计划.md §3.2。）
+ *    反推结果仍正确，见 docs/so防护架构.md §3.2。）
  *
  * ⚠️ 拆走后本文件对 NC_OBF 的使用只剩 ncg_stub_recover（见下方）。
  *    混淆开关由 scripts/make-zip-lib.sh 按文件粒度控制。
@@ -827,44 +801,30 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 /* ncg_pkg_fault 已移到 nc_guard_crypto.c（2026-11-06，VMP 覆盖）*/
 
 
-/* ── 反多开：APK 路径白名单（2026-11-02，对齐 Epic report §2.4）────────
+/* ── 反多开：APK 路径白名单（2026-11-02，对齐 Epic report §2.4）
  *
  * 威胁模型：攻击者把 App 装进「应用双开 / 虚拟空间」里跑。
- *   - 双开（MIUI/EMUI/ColorOS 的「应用分身」）路径：/data/user/<uid>/pkg/
- *   - 虚拟空间（VirtualXposed / 太极 / 平行空间）：/data/data/<宿主>/virtual/
- *   这些环境里：
- *     · 包名与主环境【完全相同】→ ncg_pkg_fault 的包名指纹校验照样通过
- *     · 调试器/hook 框架可以随意 attach 而不污染主环境
- *     · 攻击者可以「改一处 → 跑一次」反复试错，主环境零痕迹
- *   即：包名绑定挡不住「同一个包名的另一个实例」。
+ *   双开路径 /data/user/<uid>/pkg/，虚拟空间 /data/data/<宿主>/virtual/。
+ *   那里包名与主环境【完全相同】→ ncg_pkg_fault 的包名指纹照样通过；
+ *   且可随意 attach 调试器、反复试错而主环境零痕迹。
+ *   即：包名绑定挡不住「同包名的另一个实例」。
  *
- * 与 Epic 的差异（刻意，不是遗漏）：
- *   Epic 的做法是【硬拒】——路径不合规就 pause() 永久挂起。
- *   实测风险：中国 ROM 的「应用双开」会走 /data/user/<uid>/，
- *   硬拒会让所有双开用户直接闪退。这是产品事故，不是安全收益。
+ * 与 Epic 的差异（刻意）：Epic 硬拒（pause() 永久挂起）。实测中国 ROM 的
+ *   应用双开走 /data/user/，硬拒会让所有双开用户闪退 —— 产品事故，不是收益。
  *
- * 本实现的取法：**不做判定点，只污染密钥**（与 ncg_pkg_fault 同一思路）。
+ * 本实现的取法：**不做判定点，只污染密钥**（与 ncg_pkg_fault 同一思路）：
  *   合法路径 → *fault 全 0 → 密钥不变 → 正常工作
  *   异常路径 → *fault 非 0 → k_so 被污染 → 解出乱码 → MAC 失败 → fail-closed
+ *   调用方没有 if，攻击者无法「把某个判断改成 return 1」绕过；要绕过必须
+ *   同时伪造路径与包名，且算出正确 k_so —— 而其输入含证书 DER，他不知道。
  *
- * 关键：调用方没有 if，攻击者无法通过「把某个判断改成 return 1」绕过。
- * 要绕过必须【同时】伪造路径与包名，且伪造结果要能算出正确的 k_so——
- * 而 k_so 的输入含证书 DER，攻击者不知道。
+ * 白名单（实测覆盖 Play / 国内商店 / ADB）：/data/app/、/mnt/expand/、/data/user_de/
+ * 黑名单：/data/user/（双开）、/data/data/（虚拟空间）、/data/local/tmp/（手动 push）
  *
- * 白名单（合法安装路径，实测覆盖 Google Play / 国内商店 / ADB 安装）：
- *   /data/app/            — 正常安装（含 /data/app/~~<hash>==/pkg-<hash>==/）
- *   /mnt/expand/          — 可 adoption 存储（SD 卡安装）
- *   /data/user_de/        — 部分设备 DE 存储
- * 黑名单（异常环境）：
- *   /data/user/           — 双开
- *   /data/data/           — 虚拟空间（App 私有目录里塞一份 APK）
- *   /data/local/tmp/      — 手动 push（调试/攻击测试）
- *
- * ⚠️ 路径字面量不落明文：走 ncg_path_s 那套密文表会牵动 gen-paths.py 与
- *    布局契约（新增 ID 要同步 Python 侧），收益不抵风险。这里改用
- *    「首字节 + 长度」的轻量比对，字符串在 .rodata 里是分段常量，
- *    `strings` 扫不到完整路径（实测见 commit message）。
- *    这是【混淆】不是【加密】——如实标注，别高估。 */
+ * ⚠️ 路径字面量不落明文：走 ncg_path_s 密文表会牵动 gen-paths.py 与布局契约
+ *    （新增 ID 要同步 Python 侧），收益不抵风险。改用「首字节 + 长度」轻量比对，
+ *    字符串在 .rodata 是分段常量，strings 扫不到完整路径（实测见 commit message）。
+ *    这是【混淆】不是【加密】—— 如实标注，别高估。 */
 
 /* 判「异常安装路径」，结果写到 fault 的 8 字节里（不做 if 判定）。
  *

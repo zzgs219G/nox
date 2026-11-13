@@ -68,7 +68,7 @@ int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]);
  *     img_base = (uintptr_t)&ncg_stub_slot - stub_sh_addr
  * ⚠️ 改外部符号后该引用从 PC 相对变成 GOT 间接（实测 4 对
  *    ADR_GOT_PAGE/LD64_GOT_LO12_NC），但 GOT 里存的就是段表 sh_addr，
- *    两者实测相等 → 反推结果不变。详见 docs/混淆计划.md §3.2。 */
+ *    两者实测相等 → 反推结果不变。详见 docs/so防护架构.md §3.2。 */
 extern const volatile unsigned char ncg_stub_slot[];
 
 /* 小端读 32 位（slot 字段解析）。 */
