@@ -959,6 +959,30 @@ else
     bad "V14c nox CLI 改回硬编码 GUARD_SRCS 了 —— 新增 .c 会静默漏掉"
 fi
 
+# ── V15 版本文档与 git tag 一致性（2026-11-13 新增）──
+# 为什么需要：11-13 实测发现 nox 的最后一个 tag 停在 v0.9.29，
+# 而实际已经构建到 v0.9.37；消费方的工具包版本表更落后 25 个版本。
+# 这类"版本表与实物不符"没有任何机制能拦（docs 路径检查只验证文件存在）。
+# 本组钉住：docs/版本记录.md 里的"当前版本"必须等于最近的 git tag。
+echo "── V15 版本文档一致性 ──"
+cd "$ROOT" || exit 2
+if [ ! -f docs/版本记录.md ]; then
+    skip "V15 无 docs/版本记录.md"
+elif ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
+    skip "V15 不在 git 仓库内"
+else
+    _DOC_VER=$(grep -oE 'v0\.9\.[0-9]+-[a-z0-9-]+' docs/版本记录.md | head -1)
+    _TAG_VER=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+    if [ -z "$_DOC_VER" ]; then
+        bad "V15 版本记录.md 里找不到版本号（v0.9.x-xxx 格式）"
+    elif [ "$_DOC_VER" = "$_TAG_VER" ]; then
+        ok "V15 版本记录.md 与 git tag 一致（$_DOC_VER）"
+    else
+        bad "V15 版本不一致：文档=$_DOC_VER  tag=$_TAG_VER"
+        echo "     → 两边必须同步（换版要打 tag + 改文档 + 改消费方的工具包版本.md）" >&2
+    fi
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
 [ "$FAIL" -eq 0 ] || exit 1
