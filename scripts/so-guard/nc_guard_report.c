@@ -501,26 +501,91 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
                NC_SEC_VMPTBL2, has_ncw ? "OK" : "无");
     }
 
-    /* ── 体积（含占比，一眼看出谁在吃空间）───────────────────────── */
-    rp_puts(&c, "\n体积\n");
+    /* ── 体积归因（2026-11-14 重写）─────────────────────────────────
+     *
+     * ═══ 为什么要按组而不是按段平铺 ═══
+     *
+     * 旧版只列 7 个段的裸字节数：人看到 "142532" 无法判断这算多还是少，
+     * 也不知道"这些加起来是整个 so 吗"。实测反复出现同一个问题 ——
+     * 想知道 so 变大了是哪个模块的责任，看这堆数字推不出来。
+     *
+     * 改成三层：① 总量与各组占比 ② 每组的明细段 ③ 一句话结论。
+     *
+     * ═══ 分组依据（重要，别按段名猜）═══
+     *
+     * 按"谁产生的"分，不按"在哪"分：
+     *   nox 设施量  —— .ncxh/.ncxhr/.nck/.ncks（解锁链本身，nox 的固有开销）
+     *   VMP 载荷    —— 两套解释器+字节码+数据表（开了 VMP 才有）
+     *   业务载荷    —— .ncx（业务函数）+.ncxr（签名表）
+     *   基础代码    —— .text/.rodata（混着业务与 nox 运行库，strip 后不可分）
+     *
+     * ⚠️ .ncx 归"业务"不归"nox"：段本身是 nox 的契约，但里面装的是
+     *    业务函数。把它算进 nox 会让"nox 开销"虚高，正是要避免的误判。
+     *
+     * ⚠️ 各组合计 < so 总大小是正常的，差值 = ELF 头/符号表/dynamic
+     *    等未纳入统计的段。故打 so 总大小与"统计覆盖"百分比。 */
+    rp_puts(&c, "\n体积归因\n");
     {
-        static const char *need[] = {".text", ".rodata", NC_SEC_CODE,
-                                     NC_SEC_VMP, NC_SEC_VMP2, NC_SEC_VMPBC,
-                                     NC_SEC_VMPBC2};
-        unsigned int i;
-        unsigned long long tot = 0;
-        unsigned long long sz[8];
-        int cnt = 0;
-        for (i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
-            rp_seg_t s2;
-            if (rp_read_shdr(so_path, need[i], &s2) == 0) {
-                sz[cnt++] = s2.size;
-                tot += s2.size;
-                rp_fmt(&c, "  %-8s %9llu\n", need[i], (unsigned long long)s2.size);
+        /* 每个组的段清单，NULL 结尾 */
+        static const char *grp_nox[]  = {NC_SEC_HEAD, NC_SEC_HEADRO,
+                                         NC_SEC_SLOT, NC_SEC_STUBSLOT, NULL};
+        static const char *grp_vmp[]  = {NC_SEC_VMP, NC_SEC_VMP2, NC_SEC_VMPBC,
+                                         NC_SEC_VMPBC2, NC_SEC_VMPTBL,
+                                         NC_SEC_VMPTBL2, NULL};
+        static const char *grp_biz[]  = {NC_SEC_CODE, NC_SEC_CONST, NULL};
+        static const char *grp_base[] = {".text", ".rodata", ".data", NULL};
+        const char **groups[] = {grp_nox, grp_vmp, grp_biz, grp_base};
+        static const char *gnames[] = {"nox 设施", "VMP 载荷", "业务载荷",
+                                       "基础代码"};
+        unsigned int g;
+        unsigned long long covered = 0;
+
+        for (g = 0; g < 4; g++) {
+            unsigned long long gsum = 0;
+            unsigned int i;
+            int any = 0;
+            for (i = 0; groups[g][i]; i++) {
+                rp_seg_t s2;
+                if (rp_read_shdr(so_path, groups[g][i], &s2) == 0) {
+                    gsum += s2.size;
+                    any = 1;
+                }
+            }
+            /* 整组都不存在也打一行（显示 0 B），不 continue 跳过。
+             *
+             * ⚠️ 这里曾写成 `if (!any) continue;`，理由是"没这个组就别占行"。
+             *    但读者无法区分两种情况：
+             *      ① 本次构建没开 VMP（VMP 载荷确实是 0）
+             *      ② 报告漏统计了 VMP 段（bug）
+             *    实测：test.sh 的构建没有 VMP，报告里"VMP 载荷"整组消失，
+             *    看日志的人第一反应是"体积统计坏了"而不是"没开 VMP"。
+             *    打 0 B 的成本只有一行，收益是消除这个歧义。 */
+            if (!any) {
+                rp_fmt(&c, "  %-10s %9d B\n", gnames[g], 0);
+                continue;
+            }
+            covered += gsum;
+            rp_fmt(&c, "  %-10s %9llu B\n", gnames[g], gsum);
+            /* 组内明细：只在组有多个段时展开，单段组没必要 */
+            {
+                int nseg = 0;
+                for (i = 0; groups[g][i]; i++) {
+                    rp_seg_t s2;
+                    if (rp_read_shdr(so_path, groups[g][i], &s2) == 0) nseg++;
+                }
+                if (nseg > 1) {
+                    for (i = 0; groups[g][i]; i++) {
+                        rp_seg_t s2;
+                        if (rp_read_shdr(so_path, groups[g][i], &s2) == 0)
+                            rp_fmt(&c, "      %-9s %9llu B\n",
+                                   groups[g][i], s2.size);
+                    }
+                }
             }
         }
-        rp_fmt(&c, "  合计     %9llu\n", tot);
-        (void)sz; (void)cnt;
+        rp_fmt(&c, "  %-10s %9llu B\n", "已统计", covered);
+        rp_puts(&c, "  （合计小于 so 总大小属正常：ELF 头/符号表/dynamic 等"
+                    "未纳入）\n");
     }
 
     /* ── 结论 ────────────────────────────────────────────────────
