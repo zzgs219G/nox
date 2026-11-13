@@ -1,28 +1,21 @@
-/* nc_guard_probe.c — so 段加密设施的密钥槽定义 + 样例消费者
+/* nc_guard_probe.c — 密钥槽定义 + 样例消费者
  *
- * ⚠️ 本文件是设施的【承重墙】，不是试探残留：
- *   ncg_key_slot[96] 就是 .nck 段的全部内容。删掉本文件 = .nck 段消失
- *   → ncguard_unlock() 返回 -3 → 段保持密文 → 探针踩密文 → SIGILL
- *   → App 起不来。（文件头曾写"验证通过后可整体删除"，那是错的。）
+ * ⚠️ 本文件是设施的【承重墙】，不是试探残留：ncg_key_slot[96] 就是 .nck
+ *    段的全部内容。删掉它 = .nck 段消失 → ncguard_unlock() 返回 -3 →
+ *    段保持密文 → 探针踩密文 → SIGILL → App 起不来。
+ *    （文件头曾写"验证通过后可整体删除"，那句是错的。）
  *
  * 两个角色：
- *   ① 设施本体：ncg_key_slot —— .nck 段的唯一定义处，锁箱侧往里写
- *      【诱饵密钥】+ expect_mac + pkg_sha8（布局见 nc_guard_layout.h）
- *   ② 样例消费者：ncguard_probe() —— 演示"一个函数如何进 .ncx"，
+ *   ① ncg_key_slot —— .nck 段的唯一定义处，锁箱侧往里写诱饵密钥 +
+ *      expect_mac + pkg_sha8（布局见 nc_guard_layout.h）
+ *   ② ncguard_probe() —— 样例消费者，演示"一个函数如何进 .ncx"，
  *      对拍契约 probe(0) == 59
  *
- * 新增消费者（dex2c 转译产物等）不需要改本文件，也不需要手写
- * __attribute__ —— 用 scripts/so-guard/so_section_mark.py 按规则注入。
+ * 新增消费者（dex2c 转译产物等）不需要改本文件，用
+ * scripts/so-guard/so_section_mark.py 按规则注入 __attribute__。
  *
- * 机制（抄自 XopProtector .bitcode 自解密）：
- *   编译期：ncguard_probe() 进 .ncx 段
- *   构建期：so-section-lock.py 用 RC4 加密 .ncx 后写回
- *   运行期：ncguard_unlock() 先解 .ncxh 拿到 k_so（证书派生），再解 .ncx
- *   之后  ：ncguard_probe() 才可被调用（解密前调用 = 执行密文 = SIGILL）
- *
- * 注：不引 <jni.h> —— 本文件无 JNI 类型需求，host 侧缺 jni_md.h、
- * NDK 侧也平白多一个依赖。唯一 include 是 nc_guard_layout.h（零依赖，
- * 只含契约常数与 _Static_assert，任何工具链都能编）。
+ * 不引 <jni.h>：本文件无 JNI 类型需求，host 侧缺 jni_md.h、
+ * NDK 侧也平白多一个依赖。唯一 include 是零依赖的 nc_guard_layout.h。
  */
 
 #include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/尺寸/偏移 */

@@ -1,23 +1,16 @@
-/* nc_guard_paths.h — so 加密设施自带的路径密文表（独立化，2026-10-30）
+/* nc_guard_paths.h — 自带的路径密文表
  *
- * 为什么需要本文件：
- *   设施原先从主项目生成的 sig_log_data.h 取两条 /proc 路径，导致
- *   "单独拿设施编译"直接失败（fatal error: 'sig_log_data.h' file not found）。
- *   本文件让设施自带这两条路径，从此零外部源码依赖。
+ * 为什么需要：设施原先从主项目的 sig_log_data.h 取两条 /proc 路径，
+ * 导致"单独拿设施编译"直接失败。本文件让设施零外部源码依赖。
  *
- * 为什么不能直接写明文：
- *   改造前这两条路径是密文（由 sig_log_data.h 提供），改成明文字符串
- *   等于防护退步 —— `strings -n 6` 一行就能扫出 /proc/self/cmdline。
- *   本文件用与既有实现同族的密钥流保持同等强度。
+ * 为什么不明文：`strings -n 6` 一行就能扫出 /proc/self/cmdline，
+ * 等于告诉逆向者"我们在查进程名"。用密钥流保持同等强度。
  *
- * ⚠️ 强度边界（如实，勿高估）：
- *   这是【混淆】不是【加密】。密钥与算法都在本设施的源码里，攻击者若
- *   愿意反汇编 ncg_path_ctr_xor 并读常量，可以还原这两条路径。
- *   它买到的是"自动扫描失效"（strings/grep 扫不到），不是"人工逆向成本"。
- *   这与 nc_guard_layout.h 里 magic seed 的诚实口径一致。
+ * ⚠️ 强度边界（如实）：这是【混淆】不是【加密】。密钥与算法都在本设施
+ *    源码里，愿意反汇编 ncg_path_ctr_xor 的人可以还原。它买到的是
+ *    "自动扫描失效"，不是"人工逆向成本"。
  *
- * 布局纪律：本文件零逻辑、只放接口与常量声明，故任何工具链都能编
- *   （与 nc_guard_layout.h 同款约束）。实现在 nc_guard_paths.c。
+ * ⚠️ 本文件零逻辑、只放接口与常量（实现在 nc_guard_paths.c）。
  */
 #ifndef _NC_GUARD_PATHS_H_
 #define _NC_GUARD_PATHS_H_

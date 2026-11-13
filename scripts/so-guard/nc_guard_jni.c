@@ -1,45 +1,34 @@
 /* nc_guard_jni.c — .ncx 机制的 JNI 自检入口
  *
  * 为什么需要：加固包跑在真机上【没有任何现象】可观测 ——
- *   -fvisibility=hidden 把 ncguard_unlock/ncguard_probe 全藏了，
- *   "不闪退"因此什么都证明不了（那段密文可能根本没被执行）。
- * 本文件给一个显式入口，让 CI/真机拿到【可判读的回执】：
- *   Java: NcLink.selftest()   C: Java_com_nc_link_NcLink_selftest()
- *
- * ⚠️ 曾用独立类 Lcom/nc/guard/NcGuard;，但那类从未被 inject-javacheck.py
- *   生成 → selftest 抛 UnsatisfiedLinkError 被 catch 吞掉 → 连带跳过
- *   heartbeat（报错四十九）。现挂到已注入的 NcLink 上，与 ncVerify/
- *   heartbeat 同源。
+ * -fvisibility=hidden 把 ncguard_unlock/ncguard_probe 全藏了，
+ * "不闪退"因此什么都证明不了（那段密文可能根本没被执行）。
+ * 本文件给一个显式入口，让 CI/真机拿到可判读的回执：
+ *   Java: NcLink.selftest()
  *
  * 返回值语义：
- *    59     完整链路通过：解锁 → 解密 → 执行 .ncx 代码（见 nc_guard_probe.c）
- *    -1     dladdr 失败（拿不到 so 基址）
- *    -2     .ncx 段定位失败
- *    -3     .nck 段定位失败
+ *    59     完整链路通过：解锁 → 解密 → 执行 .ncx 代码
+ *    -1/-2/-3   dladdr 失败 / .ncx 段定位失败 / .nck 段定位失败
  *    -4/-5  .ncx 段为空 / 非 SHF_ALLOC
  *    -6/-7  open so 失败 / slot 读取不足
- *    -8/-10 mprotect 失败（Android 对 SHF_EXECINSTR 页的限制比 Linux 严）
- *    -9     内存分配失败
+ *    -8/-10 mprotect 失败（Android 对 SHF_EXECINSTR 页限制比 Linux 严）
+ *    -9     malloc 失败
  *    -11    密文 MAC 校验失败（.ncx/.ncxr 被篡改，或密钥与密文不匹配）
- *    -12    证书/包名不可得（fail-closed：读不到 APK 证书或包名指纹不符）
+ *    -12    证书/包名不可得（fail-closed）
  *    -100   重入（本进程已自检过）
  *
- * ⚠️ 调用本函数即触发【一次性】解锁。再次调用走幂等分支返回 0
- *   （不再是 59）—— 故自检只调一次。
+ * ⚠️ 本函数必须带 used/retain：动态注册后它没有任何直接调用者（下游只有
+ *    weak 引用），libnox.a + --gc-sections 会把它整个回收 → selftest 永远
+ *    UnsatisfiedLinkError。而症状是【静默】的（构建全绿、判决与心跳照常）。
+ *    在消费方给 extern 声明加 used/retain 无效（属性只对定义生效）。
  *
- * ⚠️⚠️ 2026-11-04（改动态注册时实测踩到）：本函数必须带
- *   __attribute__((used, retain))。原因：
- *   动态注册后它【没有任何直接调用者】—— 下游 nc_link_jni.c 里只有一个
- *   weak 引用（`if (nc_link_jni_selftest != NULL)`），而 weak 引用不构成
- *   强依赖。静态库形态（libnox.a）+ 消费方 -Wl,--gc-sections 时，
- *   链接器判定"这段没人要" → 整个 .text.nc_link_jni_selftest 被回收。
- *   实测：不加 retain 时 `llvm-nm libnc.so | grep selftest` 无输出，
- *        加 retain 后符号存在（segment flags 里出现 G = SHF_GNU_RETAIN）。
- *   后果是【静默】的：构建全绿、判决与心跳照常，只是 selftest 永远
- *   UnsatisfiedLinkError —— 与报错四十九（自检类没生成、异常被吞）
- *   是同一类"假绿"。retain 是唯一在 .o 侧就能钉住的办法：
- *   在消费方加 used/retain 对 extern 声明无效（属性只对定义生效）。
+ * ⚠️ 调用本函数即触发一次性解锁；再次调用返回 -100（不是 0）——
+ *    首次解锁尾部的 mprotect(RX)/clear_cache 时序会让第二次取指命中
+ *    I-cache 不一致 → SIGILL（实测：第一次 59，第二次 Illegal instruction）。
+ *
+ * 动态注册 / 短名绑定的取舍见 踩坑记录 K-11
  */
+
 #include <jni.h>
 #include <stdatomic.h>
 

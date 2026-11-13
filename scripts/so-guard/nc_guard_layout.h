@@ -1,37 +1,29 @@
 /* nc_guard_layout.h — so 段加密设施的【唯一契约真相源】
  *
- * 本文件不含任何逻辑，只有契约常数。存在目的：把"改一处必须同步另一处"
- * 从注释变成编译期/构建期强制。
+ * 本文件不含逻辑，只有契约常数。目的是把"改一处必须同步另一处"
+ * 从注释变成编译期强制（_Static_assert 挡偏移重叠）。
  *
- * 背景：契约常数此前散落 4 种语言、7 个文件、24 处副本。slot 已扩过两次
- * （80→96、88→104），漏同步的症状是【运行期 SIGILL】——Java 侧只看到
- * selftest != 59，完全指不出"某个长度常量没同步"。历史报错三/九/十一/十二
- * 全是同类根因。
+ * ⚠️ 改任何常量必须跑 bash scripts/lib/tests/test-so-lock.sh：
+ *    T20 = 与 so-section-lock.py 逐字节对拍
+ *    T21 = 全仓段名字面量登记
+ *    T22 = 产物字节等价
+ *    任一红 = 构建期 fail-fast，好过运行期 SIGILL。
+ * ⚠️ 本文件会被拷进 NDK 工程 → 不得 include 仓库内其它头文件（零依赖）。
+ * ⚠️ 会被拷进各种 NDK 工程 → 不要在这里加逻辑。
  *
- * ⚠️ 纪律：改本文件任何常量，必须跑 bash scripts/lib/tests/test-so-lock.sh
- *   T20 与 so-section-lock.py 逐字节对拍；T21 扫描全仓段名字面量；
- *   T22 验证不改变产物字节。任一红 = 构建期 fail-fast 而非运行期 SIGILL。
- *
- * ⚠️ 本文件会被拷进 NDK 工程，故不得 include 仓库内其它头文件
- *    （零依赖，任何工具链都能编）。
+ * 段名对照表、加密取舍、两套 VMP 的关系：
+ *   见 docs/so防护架构.md §15
  */
 #ifndef _NC_GUARD_LAYOUT_H_
 #define _NC_GUARD_LAYOUT_H_
 
-/* ═══ 一、段名（6 + 3 个）═══════════════════════════════════════════
- * 2026-10-19 中性化改名（旧名自解释，readelf -S 即可列举加固结构）：
- *   .ncguard     → .ncx     .ncguard_ro      → .ncxr
- *   .ncguard_head→ .ncxh    .ncguard_head_ro → .ncxhr
- *   .nckey       → .nck     .nckey_stub      → .ncks
+/* ═══ 一、段名 ═══════════════════════════════════════════════════════
+ * ⚠️ 段名是 so 的指纹特征，改名 = 所有历史产物的锁箱/开箱契约失效。
+ *    要加新段先在 T21 登记。
  *
- * 2026-11-13 新增 3 个 VMP 段（.ncr/.nct/.ncd，见下方注释）。
- * 它们是【可选段】——不开 VMP 的构建没有，所以不影响历史产物的契约。
- *
- * ⚠️ 段名是 so 的指纹特征。改名会让所有历史产物的锁箱/开箱契约失效，
- *    故 2026-10-19 之后不再变动。要加新段，先在 T21 登记。
- *
- * 消费方（改名前同步检查）：
- *   C:  nc_guard_boot.c / nc_link.c / env_check.c / sig_check.c / nc_guard_probe.c
+ * 消费方（改名时同步检查）：
+ *   C:  nc_guard_boot.c / nc_link.c / env_check.c / sig_check.c /
+ *       nc_guard_probe.c / nc_guard_report.c
  *   Py: so-section-lock.py / so_section_mark.py
  *   Sh: make-sig-hash.sh / protect.sh
  */
@@ -42,57 +34,22 @@
 #define NC_SEC_SLOT      ".nck"    /* 一级密钥槽*/
 #define NC_SEC_STUBSLOT  ".ncks"   /* 二级 stub 密钥槽*/
 
-/* ── VMP 段名对照表（2026-11-13）─────────────────────────────────────
+/* ── VMP 段（由 Amice 生成，本仓库的 C 代码不标记它们）
  *
- * ⚠️ 段名是【产物格式契约】，改一个字所有历史产物就解不开。所以下面
- *    这些名字一旦定下就不再动 —— 只在这里写清楚每个是什么。
+ * 两套 VMP，各三个段。段名刻意不带 vm/vmp/amice（段名留在 .shstrtab，
+ * strip 删不掉，自解释的名字等于告诉逆向者"这里是 VM"）。
  *
- * 名字本身没有语义（刻意不带 vm/vmp/amice —— 段名留在 .shstrtab 里
- * strip 删不掉，自解释的名字等于告诉逆向者"这里是 VM"）。记忆靠下表：
+ *   第一套（nox 解密链）      .ncr 解释器  .ncq 字节码  .ncs 表
+ *   第二套（消费方 sigcheck） .nct 解释器  .ncv 字节码  .ncw 表
  *
- * ┌──────┬────────┬────────┬──────────────────────────────────────┐
- * │ 段名 │ 大小   │ 加密   │ 是什么                               │
- * ├──────┼────────┼────────┼──────────────────────────────────────┤
- * │ .ncx │  39 KB │ ✅     │ 代码：业务函数 + VMP 壳（wrapper）    │
- * │ .nct │ 104 KB │ ❌     │ 代码：第二套【解释器】dispatcher      │
- * │ .ncv │ 128 KB │ ❌     │ 数据：第二套【字节码】+ 常量池        │
- * │ .ncw │  1 KB  │ ❌     │ 数据：第二套 descriptor / native 表   │
- * │ .ncr │ 142 KB │ ❌     │ 代码：第一套【解释器】                │
- * │ .ncq │  95 KB │ ❌     │ 数据：第一套【字节码】                │
- * │ .ncs │ 1.3 KB │ ❌     │ 数据：第一套 descriptor / native 表   │
- * │ .ncxr│  96 B  │ ✅     │ 数据：签名表（SIG_SALT/HASH_STORED）  │
- * │ .ncxh│ 3.8 KB │ ✅     │ 代码：解锁器本体                      │
- * └──────┴────────┴────────┴──────────────────────────────────────┘
+ * 判断"代码还是数据"：readelf -SW 权限列带 x = 代码，别靠段名猜。
  *
- * 判断"是代码还是数据"的可靠方法：readelf -SW 看权限列，
- *   带 x 的（AX/AXR）= 代码    不带 x 的（A/WA）= 数据
+ * ⚠️ 两套段名必须不同：链接进同一个 so，同名会混淆 → 第一套解释器
+ *    按 adr 偏移找到第二套的表 → 寄存器读垃圾 → SIGSEGV。
+ * ⚠️ .nct/.ncv 不加密（体积代价 +91KB/+59KB，强度增益接近零）。
+ * ⚠️ .ncr/.ncq 必须明文（结构性：解 .ncx 的钥匙要执行第一套解释器）。
  *
- * 两条执行链：
- *   第一套 = nox 自己的解密链（保护"怎么解锁"）
- *     .ncr 解释器 ──→ .ncq 字节码 + .ncs 表
- *   第二套 = 消费方签名校验（保护"判定逻辑"）
- *     .nct 解释器 ──→ .ncv 字节码 + .ncw 表
- *   而 .ncx 里是这些函数的【壳】：它 bl 到解释器，逻辑已被抽走。
- *
- * ⚠️ 为什么 .nct/.ncv 不加密（2026-11-13 用户决定）：
- *    .ncv 128KB 加密后 APK 压后从 37KB 涨到 128KB（+91KB）
- *    .nct 104KB 加密后从 45KB 涨到 104KB（+59KB）
- *    加密段熵 8.0，zlib 完全压不动 —— 体积代价是硬开销。
- *    而强度增益接近零：
- *      ① 解释器是通用 VM 规则，Amice 开源可抄，不是秘密
- *      ② 它必须能执行 → 运行期必然内存明文，frida dump 就有
- *      ③ 所有段共用同一 master，攻破一次全开 —— 收益一次性、代价线性
- *    字节码的强度来自 VMP（理解成本），不来自加密（获取成本）。
- *
- * ⚠️ 为什么 .ncr/.ncq 必须明文（结构性约束，不是选择）：
- *    解 .ncx 的钥匙（k_so）要执行第一套解释器里的代码
- *    （ncg_boot_key 被 VMP，字节码在 .ncq）。加密即自锁。
- *
- * ⚠️ 为什么两套段名必须不同：
- *    两套链接进同一个 so。同名会混在一起 → 第一套解释器按 adr 偏移
- *    找表却找到第二套的 → VM 寄存器读垃圾 → SIGSEGV
- *    （2026-11-13 实测，pc 落在 .ncr+0x5bc8）。
- */
+ * 详见 docs/so防护架构.md §15.2 / §15.5 */
 #define NC_SEC_VMP       ".ncr"    /* 第一套解释器（代码，明文）*/
 #define NC_SEC_VMP2      ".nct"    /* 第二套解释器（代码，明文）*/
 #define NC_SEC_VMPBC     ".ncq"    /* 第一套字节码（数据，明文）*/
@@ -100,53 +57,43 @@
 #define NC_SEC_VMPBC2    ".ncv"    /* 第二套字节码（数据，明文）*/
 #define NC_SEC_VMPTBL2   ".ncw"    /* 第二套 descriptor/native 表（数据）*/
 
-/* ═══════════════════════════════════════════════════════════════════
- * 二、.nck 一级密钥槽：96 字节
- * ═══════════════════════════════════════════════════════════════════
- * 布局（偏移为相对 slot 起始的字节数）：
+/* ═══ 二、.nck 一级密钥槽：96 字节 ═══════════════════════════════════
  *   [ 0:16) magic        seed + 8 个 0
- *   [16:32) decoy        诱饵（P1-a 起非真密钥，真 k_so 由运行期证书派生）
- *   [32:48) decoy_mac    诱饵（同上）
+ *   [16:32) decoy        诱饵（非真密钥；真 k_so 由运行期证书派生）
+ *   [32:48) decoy_mac    诱饵
  *   [48:80) expect_mac   HMAC-SHA256(k_mac, 密文) 32B
  *   [80:88) pkg_sha8     SHA256(包名) 前 8 字节
- *   [88:96) reserved     对齐预留
+ *   [88:96) reserved
  *
- * 锁箱侧：so-section-lock.py lock() 的 blob 组装
- * 开箱侧：nc_guard_boot.c ncg_head_unlock()
- * C 侧段本体：nc_guard_probe.c 的 ncg_key_slot[NC_SLOT_SIZE]
+ * 锁箱：so-section-lock.py lock()  开箱：ncg_head_unlock()
+ * 段本体：nc_guard_probe.c 的 ncg_key_slot[NC_SLOT_SIZE]
  */
 #define NC_SLOT_SIZE      96
 #define NC_OFF_EXPMAC     48   /* [48:80) expect_mac 起点*/
 #define NC_OFF_PKG_SHA    80   /* [80:88) 包名指纹起点*/
 
-/* ═══════════════════════════════════════════════════════════════════
- * 三、.ncks 二级 stub 密钥槽：104 字节
- * ═══════════════════════════════════════════════════════════════════
- * 布局：
+/* ═══ 三、.ncks 二级 stub 密钥槽：112 字节 ═════════════════════════════
  *   [ 0: 8) magic seed
  *   [ 8:24) wrapped k_stub      = k_stub ^ XOR_KEY
  *   [24:28) stub_sh_addr        .ncks 段自身链接期虚拟地址
  *   [28:32) head_sh_addr        .ncxh 链接期虚拟地址
  *   [32:36) head_size           .ncxh 字节数
- *   [36:40) code_addr           .text 段起始（自绑定 CRC 区间起点）
- *   [40:44) code_len            .text 段长度
+ *   [36:40) code_addr           .text 起始（自绑定 CRC 区间起点）
+ *   [40:44) code_len            .text 长度
  *   [44:48) reserved
  *   [48:64) wrapped k_mac_head  = k_mac_head ^ XOR_KEY
  *   [64:96) expect_mac_head     HMAC-SHA256(k_mac_head, head 密文)
- *   [96:100) head_ro_addr       .ncxhr 段链接期虚拟地址
+ *   [96:100) head_ro_addr       .ncxhr 链接期虚拟地址
  *   [100:104) head_ro_size      该段字节数
- *   [104:112) frag[4]           XOR_KEY 碎片（构建期随机，见 NC_OFF_FRAGS）
+ *   [104:112) frag[4]           XOR_KEY 碎片（构建期随机）
  *
- * 锁箱侧：so-section-lock.py lock_head() 的 blob 组装 + 两条 assert
- * 开箱侧：nc_guard_boot.c 明文 stub（ncg_stub_recover / ncguard_unlock）
- * C 侧段本体：nc_guard_boot.c 的 ncg_stub_slot[NC_STUB_SIZE]
+ * 锁箱：so-section-lock.py lock_head()  开箱：ncg_stub_recover()
+ * 段本体：nc_guard_boot.c 的 ncg_stub_slot[NC_STUB_SIZE]
  */
 #define NC_STUB_SIZE        112   /* [104:112) 为碎片区，见 NC_OFF_FRAGS */
-/* 碎片区：XOR_KEY 的 4 个 uint16，构建期随机生成后写进 slot。
- * 为什么放这里而不放 .data：破解复盘实测"objdump 读 .data + 反汇编
- * 5 分钟重组出 XOR_KEY"。挪进 slot 后攻击者必须先读懂 slot 布局
- * （壳的核心格式）才有重组输入——把"读常量"变成"读格式"。
- * 详细演进与反向纪律见 nc_guard_boot.c 的 XOR_KEY 碎片化注释。 */
+/* 碎片区：XOR_KEY 的 4 个 uint16，构建期随机。放 slot 而非 .data ——
+ * 破解复盘实测"objdump 读 .data + 反汇编 5 分钟重组出 XOR_KEY"。
+ * 详见 踩坑记录 K-02 */
 #define NC_OFF_FRAGS        104   /* [104:112) 4×uint16 碎片（随机）*/
 #define NC_OFF_CODE_ADDR    36   /* 代码自绑定 CRC 区间起始*/
 #define NC_OFF_CODE_LEN     40   /* 区间长度（字节）*/

@@ -183,7 +183,7 @@ static void ncg_baseline_init(uint8_t *const *addrs, const uint32_t *sizes,
  * 存放约定：逻辑字节 i<4 取第 NCG_XOR_FRAG[i] 个 uint16 的低 8 位；
  *   i>=4 取高 8 位。
  *
- * 详见 docs/踩坑记录.md#xor_key-碎片化 */
+ * 详见 踩坑记录 K-02 */
 
 static volatile uint16_t ncg_frag_a = 0x51a3u;
 static volatile uint16_t ncg_frag_b = 0xe27bu;
@@ -222,7 +222,7 @@ extern const volatile unsigned char ncg_stub_slot[NC_STUB_SIZE];
  * readelf 拿偏移后 dd 读 8 字节即可拼出 XOR_KEY。
  *
  * 修法：boot_key 由 .text 的 CRC + 首尾字节派生，加密两个槽段。
- * 详见 docs/踩坑记录.md#xor_key-碎片化 */
+ * 详见 踩坑记录 K-02 */
 
 /* 解密 .ncks 到调用方提供的缓冲。返回 0 成功。
  *
@@ -496,7 +496,7 @@ static void ncg_rc4(const uint8_t *key, size_t keylen,
 /* 判断 [addr, addr+len) 覆盖的页范围内，是否存在其它 SHF_WRITE 的段。
  *
  * 存在 → 该页不能设只读（否则同页的可写段也变只读 → 之后写入即 SIGSEGV）。
- * 详见 docs/踩坑记录.md#mprotect-粒度与同页可写段 */
+ * 详见 踩坑记录 K-01 */
 /* ⚠️ 2026-11-12：参数宽度统一成 uint64_t。
  * 原因：Amice 把它算成 [64, 32, 32, 32]，而调用点传的是 [64, 64, 64, 64]
  * → "argument 1 width mismatch"。uintptr_t/size_t 在 LLVM IR 里虽然是 i64，
@@ -684,7 +684,7 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
  * ⚠️ 路径字面量不落明文（「首字节 + 长度」轻量比对，非完整字符串）。
  *    这是【混淆】不是【加密】，别高估。
  *
- * 详见 docs/踩坑记录.md#反多开-路径白名单 */
+ * 详见 踩坑记录 K-03 */
 
 /* 判「异常安装路径」，结果写到 fault 的 8 字节里（不做 if 判定）。
  *
@@ -1035,7 +1035,7 @@ static int ncg_decrypt_one_seg(const void *base,
          *
          * 修法：数据段若与"本来可写"的段同页，保持 RW。
          * 密文段的安全性靠"内容是密文"，不靠页权限。
-         * 详见 docs/踩坑记录.md#mprotect-粒度与同页可写段 */
+         * 详见 踩坑记录 K-01 */
         {
             int prot = PROT_READ;
             if (is_code) {
@@ -1203,7 +1203,7 @@ int ncg_head_unlock(const void *self_addr) {
      *
      * 铁律：magic 判"未锁"在前（开发期不锁箱要能跑）；magic 之后
      * **不允许**再有"长度不够就放行"的分支。本仓库第三次复发同类病。
-     * 详见 docs/踩坑记录.md#槽完整性-fail-open-修复 */
+     * 详见 踩坑记录 K-04 */
     if (got < NC_SLOT_SIZE || slot.size < NC_SLOT_SIZE) {
         /* 此刻尚未派生任何密钥（key[] 在下方才声明），故只需清槽缓冲。
          * 清 slotdata 是既有纪律：它含 wrapped 值，不留残渣。 */
@@ -1396,7 +1396,7 @@ static uint32_t ncg_crc32(const uint8_t *p, size_t n) {
  *
  * 能自洽的前提：.text 段 addr == offset 且整体无重定位（实测重定位全部
  * 落在 .text 之外），所以锁箱期按文件算的 CRC == 运行期按内存算的 CRC。
- * 详见 docs/踩坑记录.md#代码自绑定-k_stub */
+ * 详见 docs/踩坑记录.md 的 K-02（密钥链） */
 uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
 
 /* ── 解密后代码段完整性基线
@@ -1416,7 +1416,7 @@ uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
  *
  * 能力边界：能挡 inline hook / 代码段 patch 后加载。
  * 挡不住 PLT/GOT hook、ART 层 hook、以及把校验函数自身 patch 成恒真。
- * 详见 docs/踩坑记录.md#解密后明文完整性基线 */
+ * 后者只能靠"校验逻辑在密文段"提高门槛。 */
 
 static volatile uint8_t  *ncg_bl_base[NC_CODE_SEG_MAX];
 static volatile uint32_t  ncg_bl_len[NC_CODE_SEG_MAX];
