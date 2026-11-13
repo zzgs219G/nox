@@ -2040,7 +2040,20 @@ int ncguard_unlock(void) {
              *    改变 .ncxhr 与 .bss 的页面归属 → ncg_page_has_writable_neighbor
              *    判定变化 → SIGILL（2026-11-13 实测踩过，rc=132）。 */
             char rbuf[NCG_REPORT_CAP];
-            ncg_report_build(rbuf, sizeof(rbuf), _rp, _rbase, rc == 0);
+            /* nseg 在 ncg_head_unlock 内部，这里重新数一遍：
+             * 用于对照锁箱侧的 --section 段数（不一致则 MAC 必失败）。 */
+            int rnseg = 0;
+            {
+                static const char *names[] = {NC_SEC_VMP2, NC_SEC_VMPBC2,
+                                              NC_SEC_CODE, NC_SEC_CONST};
+                unsigned int ni;
+                for (ni = 0; ni < sizeof(names) / sizeof(names[0]); ni++) {
+                    ncg_shdr_t t;
+                    if (ncg_find_section(_rp, names[ni], &t) == 0
+                        && t.size > 0 && (t.flags & SHF_ALLOC)) rnseg++;
+                }
+            }
+            ncg_report_build(rbuf, sizeof(rbuf), _rp, _rbase, rc, rnseg);
             (void)ncg_report_flush(rbuf, strlen(rbuf));
         }
     }

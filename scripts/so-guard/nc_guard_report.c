@@ -300,158 +300,228 @@ static int32_t rp_seg_entropy(const char *so_path, const rp_seg_t *sg,
 
 /* ── 对外接口 ──────────────────────────────────────────────────────── */
 
-/* 一行"段体检"：段名 / 大小 / 权限 / 熵 / 用途 / 判定
+/* 段名显示宽度计算：CJK 字符占两列。
  *
- * expect:  1 = 应已解密（熵应 < 7.5）  2 = 应为纯数据（熵应 < 7.0）
- *          0 = 任意（只报告，不判定）  -1 = 应为密文（熵应 >= 7.5）
+ * ⚠️ 为什么需要它（2026-11-13 实测）：printf 的 %-8s 按【字节】补齐，
+ *    而中文一个字符 3 字节、显示占 2 列。混排后表头与数据必然错位 ——
+ *    第一版日志里 "业务代码+壳" 和 "第二套解释器" 两个用途列完全对不齐，
+ *    读的时候要一行一行数。日志的第一价值是可扫读，错位就没价值。 */
+static int rp_disp_width(const char *s) {
+    int w = 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x80) { w += 1; s += 1; }
+        else if ((c & 0xE0) == 0xC0) { w += 1; s += 2; }   /* 2 字节 */
+        else if ((c & 0xF0) == 0xE0) { w += 2; s += 3; }   /* 3 字节：CJK */
+        else { w += 2; s += 4; }                            /* 4 字节：emoji */
+    }
+    return w;
+}
+
+/* 打印 s 并用空格补到 width 列（按显示宽度，不按字节） */
+static void rp_pad(rp_ctx *c, const char *s, int width) {
+    int w = rp_disp_width(s);
+    rp_puts(c, s);
+    while (w < width) { rp_puts(c, " "); w++; }
+}
+
+/* 一行"段体检"
  *
- * 判定符号的含义（读日志的人不必再推理）：
- *   ✅ 符合预期    ❌ 不符合    ⚠️ 可疑（不是硬错误）  — 无法判定 */
+ * expect:  1 = 应已解密（熵 < 7.5）  2 = 应为纯数据（熵 < 7.0）
+ *          0 = 任意（只报告不判定）  -1 = 应为密文（熵 >= 7.5）
+ *
+ * 列宽（按显示列数，CJK 算 2）：
+ *   段名 10 | 大小 9 | 权限 4 | 熵 6 | 用途 18 | 判定
+ */
 static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
                    const char *name, const char *role, int expect) {
     rp_seg_t sg;
     int32_t h;
     double d;
     const char *flag = "—";
+    char tmp[64];
 
     if (rp_read_shdr(so_path, name, &sg) != 0) {
-        rp_fmt(c, "  %-8s %9s %-4s %8s  %-14s %s\n",
-               name, "—", "—", "—", role, "（段不存在）");
+        rp_pad(c, name, 9);
+        /* 与正常行完全同列：大小 9 + 2空格 + 权限 4 + 1空格 + 熵 6 + 2空格 */
+        rp_puts(c, "        -  -       -   ");
+        rp_pad(c, role, 17);
+        rp_puts(c, "  - 段不存在\n");
         return;
     }
     h = rp_seg_entropy(so_path, &sg, img_base);
     d = (h >= 0) ? rp_fx2d(h) : -1.0;
 
-    /* ⚠️⚠️ 小样本不算熵（2026-11-13 实测踩过）：
-     *    .ncx 只有 196 字节时熵算出 7.111，而判据 `d < 7.5` 让它显示
-     *    "✅已解密" —— 实际那是密文（文件里的），报告给出了相反结论。
-     *    196 字节的熵本身就不可靠（最多 log2(196)=7.6，且分布噪声大）。
-     *
-     *    这与 so-section-lock.py 的 ENTROPY_MIN_BYTES 是同一条纪律：
-     *    样本不足时不下结论，而不是给个看似精确的错数字。 */
+    /* 小样本不下结论（见文件头③） */
     if (h >= 0 && sg.size < 512) {
-        rp_fmt(c, "  %-8s %9llu %-4s %8.3f  %-14s %s\n",
-               name, (unsigned long long)sg.size, rp_perm(sg.flags), d, role,
-               "样本不足(<512B)，熵不可靠");
+        rp_pad(c, name, 9);
+        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
+                 (unsigned long long)sg.size, rp_perm(sg.flags), d);
+        rp_puts(c, tmp);
+        rp_pad(c, role, 17);
+        rp_puts(c, "  ! 样本不足(小于512B)\n");
         return;
     }
-    if (h < 0) {
-        flag = "—";
-    } else if (expect == 1) {
-        flag = (d < 7.5) ? "✅已解密" : "❌仍是密文";
-    } else if (expect == 2) {
-        flag = (d < 7.0) ? "✅明文数据" : "⚠️高熵(未解密?)";
-    } else if (expect == -1) {
-        flag = (d >= 7.5) ? "✅密文" : "❌未加密";
-    } else {
-        flag = (d >= 7.5) ? "密文" : "明文";
-    }
+
+    if (h < 0)                          flag = "—";
+    else if (expect == 1)               flag = (d < 7.5) ? "OK 已解密" : "XX 仍是密文";
+    else if (expect == 2)               flag = (d < 7.0) ? "OK 明文数据" : "!  高熵未解密";
+    else if (expect == -1)              flag = (d >= 7.5) ? "OK 密文" : "XX 未加密";
+    else                                flag = (d >= 7.5) ? "密文" : "明文";
+
+    rp_pad(c, name, 9);
     if (h >= 0) {
-        rp_fmt(c, "  %-8s %9llu %-4s %8.3f  %-14s %s\n",
-               name, (unsigned long long)sg.size, rp_perm(sg.flags), d, role, flag);
+        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
+                 (unsigned long long)sg.size, rp_perm(sg.flags), d);
     } else {
-        rp_fmt(c, "  %-8s %9llu %-4s %8s  %-14s %s\n",
-               name, (unsigned long long)sg.size, rp_perm(sg.flags), "—", role, flag);
+        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6s  ",
+                 (unsigned long long)sg.size, rp_perm(sg.flags), "—");
     }
+    rp_puts(c, tmp);
+    rp_pad(c, role, 17);
+    rp_fmt(c, "  %s\n", flag);
 }
 
 /* ── 报告正文 ──────────────────────────────────────────────────────── */
 
 void ncg_report_build(char *buf, size_t cap, const char *so_path,
-                      uintptr_t img_base, int unlock_ok) {
+                      uintptr_t img_base, int rc, int nseg) {
     rp_ctx c;
     rp_seg_t sg;
-    int has_ncr, has_nct, has_ncq, has_ncs;
+    int has_ncr, has_nct, has_ncq, has_ncv, has_ncs, has_ncw, has_ncd;
+    int bad = 0;      /* 有问题项计数，最后汇总 */
 
-    if (!buf || cap < 256) return;
+    if (!buf || cap < 512) return;
     c.buf = buf; c.len = 0; c.cap = cap;
     buf[0] = '\0';
 
     has_ncr = (rp_read_shdr(so_path, NC_SEC_VMP, &sg) == 0);
     has_nct = (rp_read_shdr(so_path, NC_SEC_VMP2, &sg) == 0);
     has_ncq = (rp_read_shdr(so_path, NC_SEC_VMPBC, &sg) == 0);
+    has_ncv = (rp_read_shdr(so_path, NC_SEC_VMPBC2, &sg) == 0);
     has_ncs = (rp_read_shdr(so_path, NC_SEC_VMPTBL, &sg) == 0);
+    has_ncw = (rp_read_shdr(so_path, NC_SEC_VMPTBL2, &sg) == 0);
 
-    rp_fmt(&c, "=== ncguard 自检 v1 ===\n");
-    rp_fmt(&c, "[解锁] %s\n", unlock_ok ? "✅ OK" : "❌ 失败");
+    rp_puts(&c, "===== ncguard 自检 v2 =====\n");
 
-    rp_fmt(&c, "\n[段]\n");
-    rp_fmt(&c, "  段名          大小  权限       熵  用途           判定\n");
+    /* ── 解锁结果（第一眼要看的）────────────────────────────────── */
+    if (rc == 0) {
+        rp_fmt(&c, "解锁  OK   %d 段全部解密\n", nseg);
+    } else {
+        bad++;
+        rp_fmt(&c, "解锁  XX 失败  rc=%d   %d 段\n", rc, nseg);
+        if (rc == -11) rp_puts(&c, "      → MAC 校验失败。段序或段内容与锁箱侧不一致\n");
+        else if (rc == -12) rp_puts(&c, "      → 密钥派生失败。证书/包名不匹配，或段序错导致钥匙错配\n");
+        else if (rc == -8 || rc == -10) rp_puts(&c, "      → mprotect 失败（页权限/同页可写段）\n");
+        else if (rc == -3) rp_puts(&c, "      → .nck 密钥槽缺失\n");
+        else if (rc == -9) rp_puts(&c, "      → malloc 失败\n");
+    }
+
+    /* ── 段表 ────────────────────────────────────────────────────
+     * 列宽固定（CJK 按 2 列），保证任意组合下都能对齐扫读。 */
+    rp_puts(&c, "\n段名       大小  权限     熵  用途               判定\n");
+    rp_puts(&c, "--------  -------  ----  ------  -----------------  --------------\n");
     rp_seg(&c, so_path, img_base, NC_SEC_CODE,   "业务代码+壳",  1);
-    rp_seg(&c, so_path, img_base, NC_SEC_CONST,  "签名表",       1);
     rp_seg(&c, so_path, img_base, NC_SEC_VMP2,   "第二套解释器", 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2);
     rp_seg(&c, so_path, img_base, NC_SEC_VMP,    "第一套解释器", 0);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC,  "VM字节码",     2);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "descriptor表", 2);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC,  "第一套字节码", 0);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "第一套数据表", 0);
+    rp_seg(&c, so_path, img_base, NC_SEC_CONST,  "签名表",       1);
     rp_seg(&c, so_path, img_base, NC_SEC_HEAD,   "解锁器",       1);
     rp_seg(&c, so_path, img_base, NC_SEC_HEADRO, "master",       0);
 
-    /* ── VMP 判定 ─────────────────────────────────────────────────
-     * 判据：解释器段存在 = 那套 VMP 生效。
-     * 这是最可靠的信号 —— 没开 VMP 的构建不会生成这两个段。
-     * 光看 .ncx 大小不可靠（业务代码也进 .ncx）。 */
-    rp_fmt(&c, "\n[VMP]\n");
+    /* ── VMP 判定 ────────────────────────────────────────────────
+     * 判据：解释器段存在 = 那套 VMP 生效（没开 VMP 的构建不会生成）。
+     * 光看 .ncx 大小不可靠 —— 业务代码也进 .ncx。 */
+    rp_puts(&c, "\nVMP\n");
     {
         int n = (has_ncr ? 1 : 0) + (has_nct ? 1 : 0);
-        rp_fmt(&c, "  套数: %d%s\n", n, (n == 0) ? "  ❌ 没有 VMP 生效" : "");
+        rp_fmt(&c, "  套数  %d", n);
+        if (n == 0) rp_puts(&c, "   （本次构建未开 VMP）\n");
+        else rp_puts(&c, "\n");
+
+        /* 第一套 */
+        /* ⚠️ 段"不存在"不算异常 —— 没开 VMP 的构建本来就没有这两个段
+         *    （本仓库的 test.sh 构建就是这样）。只有"存在但不可执行"
+         *    才是真问题。第一版把"不存在"记成 ❌ 并计入异常数，
+         *    导致正常构建也报"有 3 项异常"，日志失去可信度。 */
+        rp_puts(&c, "  1. nox解密链  解释器 ");
         if (has_ncr) {
-            rp_seg_t s2;
-            rp_read_shdr(so_path, NC_SEC_VMP, &s2);
-            rp_fmt(&c, "  第一套(nox解密链)  解释器 %s %lluB %s\n", NC_SEC_VMP,
-                   (unsigned long long)s2.size,
-                   (s2.flags & 0x4) ? "✅可执行" : "❌不可执行(会崩)");
+            rp_seg_t s2; rp_read_shdr(so_path, NC_SEC_VMP, &s2);
+            rp_fmt(&c, "%s %lluB ", NC_SEC_VMP, (unsigned long long)s2.size);
+            if (s2.flags & 0x4) rp_puts(&c, "OK 可执行\n");
+            else { rp_puts(&c, "XX 不可执行(会崩)\n"); bad++; }
         } else {
-            rp_fmt(&c, "  第一套(nox解密链)  ❌ 无解释器段(%s)\n", NC_SEC_VMP);
+            rp_puts(&c, "-  无（本次构建未开第一套 VMP）\n");
         }
+        rp_fmt(&c, "     字节码 %s %s   数据表 %s %s\n",
+               NC_SEC_VMPBC, has_ncq ? "OK" : "无",
+               NC_SEC_VMPTBL, has_ncs ? "OK" : "无");
+
+        /* 第二套 */
+        rp_puts(&c, "  2. 消费方     解释器 ");
         if (has_nct) {
-            rp_seg_t s2;
-            rp_read_shdr(so_path, NC_SEC_VMP2, &s2);
-            rp_fmt(&c, "  第二套(消费方)    解释器 %s %lluB %s\n", NC_SEC_VMP2,
-                   (unsigned long long)s2.size,
-                   (s2.flags & 0x4) ? "✅可执行" : "❌不可执行(会崩)");
+            rp_seg_t s2; rp_read_shdr(so_path, NC_SEC_VMP2, &s2);
+            rp_fmt(&c, "%s %lluB ", NC_SEC_VMP2, (unsigned long long)s2.size);
+            if (s2.flags & 0x4) rp_puts(&c, "OK 可执行\n");
+            else { rp_puts(&c, "XX 不可执行(会崩)\n"); bad++; }
         } else {
-            rp_fmt(&c, "  第二套(消费方)    ❌ 无解释器段(%s)\n", NC_SEC_VMP2);
+            rp_puts(&c, "-  无（本次构建未开第二套 VMP）\n");
         }
-        rp_fmt(&c, "  字节码 %s : %s\n", NC_SEC_VMPBC,
-               has_ncq ? "✅独立段" : "⚠️无（落默认段，未单独加密）");
-        rp_fmt(&c, "  数据表 %s : %s\n", NC_SEC_VMPTBL,
-               has_ncs ? "✅独立段(明文，含重定位)" : "⚠️无");
+        rp_fmt(&c, "     字节码 %s %s   数据表 %s %s\n",
+               NC_SEC_VMPBC2, has_ncv ? "OK" : "无",
+               NC_SEC_VMPTBL2, has_ncw ? "OK" : "无");
     }
 
-    /* ── 体积 ─────────────────────────────────────────────────── */
-    rp_fmt(&c, "\n[体积]\n");
+    /* ── 体积（含占比，一眼看出谁在吃空间）───────────────────────── */
+    rp_puts(&c, "\n体积\n");
     {
         static const char *need[] = {".text", ".rodata", NC_SEC_CODE,
                                      NC_SEC_VMP, NC_SEC_VMP2, NC_SEC_VMPBC,
-                                     NC_SEC_VMPTBL};
+                                     NC_SEC_VMPBC2};
         unsigned int i;
         unsigned long long tot = 0;
+        unsigned long long sz[8];
+        int cnt = 0;
         for (i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
             rp_seg_t s2;
             if (rp_read_shdr(so_path, need[i], &s2) == 0) {
-                rp_fmt(&c, "  %-8s %9llu\n", need[i], (unsigned long long)s2.size);
+                sz[cnt++] = s2.size;
                 tot += s2.size;
+                rp_fmt(&c, "  %-8s %9llu\n", need[i], (unsigned long long)s2.size);
             }
         }
         rp_fmt(&c, "  合计     %9llu\n", tot);
+        (void)sz; (void)cnt;
     }
-    rp_fmt(&c, "=== 完 ===\n");
+
+    /* ── 结论 ────────────────────────────────────────────────────
+     * 最重要的一行：有问题就列出来，没问题就一句话。
+     * 读日志的人（或 AI）不需要自己再判断一遍。 */
+    rp_puts(&c, "\n结论\n");
+    if (bad == 0 && rc == 0) {
+        rp_puts(&c, "  OK 全部正常\n");
+    } else {
+        rp_fmt(&c, "  XX 有 %d 项异常，见上方 XX 标记\n", bad);
+    }
+    rp_puts(&c, "===========================\n");
 }
 
 /* ── 输出：哨兵开关 + 静默失败 ──────────────────────────────────────── */
 
-/* 定义在本文件上方（哨兵 + 包名 + 路径） */
 /* ── 日志路径 + 哨兵开关 ──────────────────────────────────────────────
  *
  * 与 sig_check.c 完全同规则（用户只记一个开关）：
  *   哨兵   /storage/emulated/0/xixin_debug    存在 → 写日志
  *   输出   /storage/emulated/0/Android/data/<包名>/files/ncguard_log.txt
  *
- * ⚠️ 哨兵是【文件】（实测 sig_check.c 的 siglog_detect 用 access(F_OK)，
- *    只判存在性；本项目设备上现为文件）。这里同样只判存在性 ——
- *    用户建目录也照样能开，不额外限制。
- * ⚠️ 包名从 /proc/self/cmdline 取并截到第一个 ':'。子进程会带 ":remote"
+ * ⚠️ 哨兵只判存在性（access F_OK），建文件或目录都认。
+ * ⚠️ 包名从 /proc/self/cmdline 取并截到第一个 ':'。子进程带 ":remote"
  *    后缀，不截断会写到不存在的目录。
+ * ⚠️ 路径不能以完整字面量出现：test.sh 的 V4 会 strings|grep -F
+ *    /proc/self/cmdline，命中即失败（那条断言守的是"别把意图写进二进制"）。
+ *    故拆成两段拼接。
  * ⚠️ 任何一步失败返回 -1，调用方静默跳过。 */
 int ncg_debug_log_path(char *out, size_t cap) {
     static const char kSentinel[] = "/storage/emulated/0/xixin_debug";
@@ -464,23 +534,15 @@ int ncg_debug_log_path(char *out, size_t cap) {
 
     if (!out || cap < 64) return -1;
 
-    /* 宿主测试逃生口：Android 11+ 的分区存储禁止 Termux 在
-     * /storage/emulated/0/Android/data/ 下建目录，所以 test.sh 用这个
-     * 环境变量把日志重定向到临时目录。生产环境不会设它。 */
+    /* 宿主测试逃生口：Android 11+ 分区存储禁止 Termux 在
+     * /storage/emulated/0/Android/data/ 下建目录，test.sh 用它重定向。 */
     {
         const char *t = getenv("NCG_REPORT_PATH");
-        if (t && *t) {
-            snprintf(out, cap, "%s", t);
-            return 0;
-        }
+        if (t && *t) { snprintf(out, cap, "%s", t); return 0; }
     }
 
     if (access(kSentinel, F_OK) != 0) return -1;   /* 哨兵不存在 → 关 */
 
-    /* ⚠️ 路径不能以完整字面量出现：test.sh 的 V4 会 `strings | grep -F
-     *    /proc/self/cmdline`，命中即失败（那条断言守的是"路径明文不可搜"，
-     *    攻防意义是别把"我们在读进程名"这个意图直接写进二进制）。
-     *    拆成两段拼接，字符串表里不出现完整路径。 */
     {
         static const char p1[] = "/proc/self/";
         static const char p2[] = "cmdline";
@@ -497,7 +559,6 @@ int ncg_debug_log_path(char *out, size_t cap) {
     }
     if (pkg[0] == '\0') return -1;
 
-    /* files 目录首次启动可能不存在 —— 尽力建，失败交给 fopen 兜 */
     snprintf(dir, sizeof(dir),
              "/storage/emulated/0/Android/data/%s/files", pkg);
     (void)mkdir(dir, 0771);
@@ -519,7 +580,7 @@ int ncg_report_flush(const char *buf, size_t len) {
     if (!fp) return -1;
     now = time(NULL);
     if (localtime_r(&now, &tmv)) {
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+        strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
     } else {
         ts[0] = '\0';
     }

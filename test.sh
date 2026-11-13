@@ -776,9 +776,9 @@ else
         #       报告对 <512B 的段会显示"样本不足"，不参与判定。
         #    ⚠️ 这条曾是真 bug：第一版从【文件】读熵，而解锁后的明文在
         #       【内存】里，导致解锁成功的包把已解密段报成"仍是密文"。
-        if grep -q '\.ncxh .*✅已解密' "$RLOG"; then
+        if grep -q '\.ncxh .*OK 已解密' "$RLOG"; then
             ok "V12b .ncxh 判定为已解密（熵判据读内存，正确）"
-        elif grep -q '\.ncxh .*❌仍是密文' "$RLOG"; then
+        elif grep -q '\.ncxh .*XX 仍是密文' "$RLOG"; then
             bad "V12b .ncxh 被误报为密文 —— 报告读的是文件而非内存"
             grep '\.ncxh ' "$RLOG" | head -2
         else
@@ -796,11 +796,12 @@ else
         fi
 
         # ③ VMP 套数：本测试构建【没有】VMP，必须报 0 且不误报
-        if grep -q '套数: 0' "$RLOG"; then
+        # 格式："  套数  0"（v2 排版改了分隔符，断言跟着改）
+        if grep -qE '套数[[:space:]]+0' "$RLOG"; then
             ok "V12c VMP 套数判定正确（本构建无 VMP → 0）"
         else
             bad "V12c VMP 套数判定错误（本构建无 VMP，应为 0）"
-            grep -A2 '\[VMP\]' "$RLOG" | head -3
+            grep -A2 '^VMP' "$RLOG" | head -3
         fi
 
         # ④ 权限列：ELF64 的 flags 偏移曾读成 type（@4 而非 @8），
