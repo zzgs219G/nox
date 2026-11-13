@@ -2,16 +2,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* so 段加密设施（全项目共用）的密钥派生接口：SHA-256 / HMAC / HKDF /
- * APK 证书 DER / K_so / K_mac 派生。
- * 与 scripts/so-guard/so-section-lock.py 的派生规则逐字节一致（契约，改一侧必须同步另一侧）。
+/* 密钥派生接口：SHA-256 / HMAC / HKDF + 六个域密钥
  *
- * ⚠️ 2026-10-18 定位重构：文件名仍叫 nc_guard_key.c（改名会动冻结清单、牵连
- * 回归测试，收益不抵风险），但它是【设施层】而非某个模块的私有代码：
- *   第1层 段加密服务：本文件 + nc_guard_unlock.c + so-section-lock.py
- *   第2层 通用标记器：so_section_mark.py（规则=函数头正则）
- *   第3层 消费者：sigcheck 探针 / ncguard_probe / dex2c 转译产物 / 未来模块
- */
+ * 与 so-section-lock.py 的 derive_app_keys() 必须逐字节一致（T20 对拍）。
+ * 每个域一把 16 字节钥匙，label 前缀做域分隔（复用 = 两条链互相印证）。 */
 
 /* SHA-256（实现照抄 sig_check.c 已验证版本；此处只暴露不透明句柄） */
 typedef struct ksha_ctx_s ksha_ctx;
@@ -29,13 +23,8 @@ void ksha256(const uint8_t *data, size_t len, uint8_t out[32]);
 void khmac_sha256(const uint8_t *key, size_t key_len,
                   const uint8_t *msg, size_t msg_len, uint8_t out[32]);
 
-/* 增量 HMAC（2026-10-19）：分段喂消息，用于 MAC 覆盖多个不连续段。
- *
- * 为什么需要它：.ncx 与 .ncxr 是两个不连续的 ELF 段，
- * 一次性算 HMAC 得先把两段拼进临时缓冲（最多几十 KB malloc + memcpy）。
- * 增量式零额外内存、零拷贝。
- * 语义与 khmac_sha256(k,m1||m2) 完全等价（对拍测试钉死）。
- * 用法：init → update* → final。ctx 由调用方在栈上开（不透明类型，见下）。 */
+/* 增量 HMAC：分段喂消息，用于 MAC 覆盖多个不连续段。不透明句柄 —— 调用方
+ * 开不出栈对象（所以每个域都要一个 _from_der 便捷版）。 */
 typedef struct khmac_ctx_s khmac_ctx;
 void khmac_init(khmac_ctx *ctx, const uint8_t *key, size_t key_len);
 void khmac_update(khmac_ctx *ctx, const uint8_t *data, size_t len);
@@ -77,30 +66,15 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
                               const uint8_t *cert_der, size_t der_len,
                               const char *pkg, uint8_t out[16]);
 
-/* k_mac = HKDF-SHA256(..., info="nc-so-mac-v1"+pkg, 16)
- * 完整性校验专用域，只参与 .ncx 密文的 HMAC 计算。
- * ⚠️ 与 k_so 必须用不同 label —— 复用同一把钥匙等于"知道 RC4 密钥就能
- * 伪造 MAC"，校验形同虚设。改 label 必须同步 so-section-lock.py 的
- * derive_app_keys()（已用真证书对拍验证两侧逐字节一致）。
- *
- * 调用关系：nc_guard_boot.c 的 ncg_head_unlock() 调
- *   ncg_derive_k_mac_from_der()，后者内部调本函数。
- *   （早期注释写"当前无调用方，只是契约的可执行证明"——那是 P1-a 之前
- *   的口径，k_mac 改为运行期证书派生后本函数就真参与解锁了。
- *   同理 ncg_derive_k_so() 由 ncg_derive_k_so_from_der() 调用。） */
+/* k_mac = HKDF(master, SHA256(cert), "nc-so-mac-v1"+pkg, 16)
+ * 只参与"密文段是否被改过"的 HMAC，绝不能与 k_so 复用
+ * （复用 = 知道 RC4 密钥即可伪造 MAC，完整性校验形同虚设）。 */
 int ncg_derive_k_mac(const uint8_t master[32], const uint8_t cert_sha256[32],
                      const char *pkg, uint8_t out[16]);
 
-/* k_so_r = HKDF-SHA256(..., info="nc-so-r-v1"+pkg, 16)  【2026-10-28 新增】
- *
- * .ncxr 常量表段专用。动机（逆向报告 §6.2）：此前 .ncx 与 .ncxr 都用 k_so，
- * 且锁箱侧每段独立调用 rc4() 都从 keystream 偏移 0 起 → two-time-pad 误用。
- * 实测 C_ncx[i] ^ C_ncxr[i] == P_ncx[i] ^ P_ncxr[i] 成立，已知 .ncxr 明文
- * （96 字节签名表，结构高度可猜）即可反推 .ncx 同位置明文。
- *
- * ⚠️ 必须与 k_so / k_mac / k_stub 全部不同。域分隔靠 label 前缀；
- *    改 label 必须同步 so-section-lock.py 的 derive_app_keys()。
- * 调用关系：nc_guard_boot.c 的 ncg_head_unlock() 解密第 1 段时用它。 */
+/* k_so_r = HKDF(..., "nc-so-r-v1"+pkg, 16)   .ncxr 常量表专用
+ * ⚠️ 必须与 k_so 不同：RC4 流密码两段共用 keystream = two-time-pad 误用
+ * （实测 C_ncx[i]^C_ncxr[i] == P_ncx[i]^P_ncxr[i]）。 */
 int ncg_derive_k_so_r(const uint8_t master[32], const uint8_t cert_sha256[32],
                       const char *pkg, uint8_t out[16]);
 
@@ -109,22 +83,14 @@ int ncg_derive_k_so_r_from_der(const uint8_t master[32],
                                const uint8_t *cert_der, size_t der_len,
                                const char *pkg, uint8_t out[16]);
 
-/* k_nct = HKDF-SHA256(..., info="nc-insn-v1"+pkg, 16)  【2026-11-13 新增】
+/* k_nct = HKDF(..., "nc-insn-v1"+pkg, 16)   .nct 解释器段用
  *
- * .nct 段专用 —— 消费方（第二套）VMP 的字节码 / const_pool / metadata。
- *
- * 为什么与 .ncr（第一套）区别对待：
- *   .ncr 里的字节码属于本仓库自己的解密链，解它的钥匙要由 master 派生，
- *   而 master 要 k_stub，k_stub 要 boot_key，boot_key 由 ncg_boot_key 算
- *   —— 那个函数自己就被 VMP、字节码就在 .ncr 里。要解 .ncr 得先执行
- *   .ncr 里的代码，结构上无解，只能明文。
- *   .nct 装的是消费方 VMP（sig_check 等），那些函数在 constructor(65535)
- *   才第一次执行，远在本解锁流程（constructor(50)）之后，可加密。
- *
- * ⚠️ 只加密纯数据。指针表（descriptor_table / native_call_table）由 amice
- *    分到 .ncd，**必须明文** —— 那些位置是 R_AARCH64_RELATIVE 重定位槽，
- *    dlopen 时由动态链接器填真值，解锁写回会覆盖它们 → 真机 SIGILL。
- * ⚠️ label 必须与 so-section-lock.py 的 derive_app_keys() 逐字节一致。 */
+ * ⚠️ 别当死代码删掉：.nct/.ncv 目前不加密（体积优先，见 so防护架构 §15.5），
+ *    所以运行期没有调用点。但这三个域（insn/warm/dex）：
+ *      ① 是 test-k-nct-parity.py 的跨语言对拍对象 —— 删了断言失效
+ *      ② 是"将来想重新加密 .nct/.ncv"时的现成钥匙链，改回 segs[] 即可
+ *    真正用时**只加密纯数据**：指针表在 .ncs/.ncw 不能加密（含
+ *    R_AARCH64_RELATIVE 重定位槽，写回会覆盖链接器填的指针 → SIGILL）。 */
 int ncg_derive_k_nct(const uint8_t master[32], const uint8_t cert_sha256[32],
                      const char *pkg, uint8_t out[16]);
 
@@ -133,13 +99,9 @@ int ncg_derive_k_nct_from_der(const uint8_t master[32],
                               const uint8_t *cert_der, size_t der_len,
                               const char *pkg, uint8_t out[16]);
 
-/* ── k_bc（.ncq VM 字节码段，2026-11-13）──────────────────────────
- *
- * k_bc = HKDF-SHA256(..., info="nc-warm-v1"+pkg, 16)
- *
- * 与 so-section-lock.py 的 derive_app_keys()['warm'] 逐字节一致。
- * ⚠️ 不复用 k_nct：RC4 流密码共用 keystream = two-time-pad 误用。
- *    本项目 2026-10-28 在 .ncx/.ncxr 上踩过这个坑。 */
+/* k_bc = HKDF(..., "nc-warm-v1"+pkg, 16)   .ncq 字节码段用
+ * k_bc2 = HKDF(..., "nc-dex-v1"+pkg, 16)   .ncv 字节码段用（第二套）
+ * ⚠️ 两者与 k_nct 都不同：RC4 流密码共用 keystream = two-time-pad。 */
 int ncg_derive_k_bc(const uint8_t master[32], const uint8_t cert_sha256[32],
                     const char *pkg, uint8_t out[16]);
 

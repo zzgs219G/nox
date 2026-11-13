@@ -446,7 +446,10 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     rp_puts(&c, "\n");
     rp_puts(&c, "（段名 | 大小 | 权限 | 熵 | 用途 | 判定）\n");
     rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 1, &unknown);
+    /* ⚠️ .nct 现在**不加密**（体积优先，见 so防护架构 §15.5），所以判据是
+     * "应为明文"（2）而不是"应已解密"（1）。写成 1 会显示"OK 已解密"——
+     * 结论碰巧对（熵低），但语义错，会让人以为它被加密过。 */
+    rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 2, &unknown);
     rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2, &unknown);
     rp_seg(&c, so_path, img_base, NC_SEC_VMP, "第一套解释器", 0, &unknown);
     rp_seg(&c, so_path, img_base, NC_SEC_VMPBC, "第一套字节码", 0, &unknown);

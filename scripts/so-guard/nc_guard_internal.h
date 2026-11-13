@@ -1,24 +1,11 @@
-/* nc_guard_internal.h — so-guard 内部跨编译单元的声明（2026-11-06）
+/* nc_guard_internal.h — so-guard 内部跨编译单元的声明
  *
- * 存在的唯一理由：`ncg_boot_key` 为提高 VMP 保护强度被拆到
- * `nc_guard_crypto.c`（VMP 与 annotate 互斥，只能走文件级开关，
- * 详见 nc_guard_xor.c 的文件头说明）。它需要 3 个仍留在
- * `nc_guard_boot.c` 里的辅助函数，故在此统一声明。
+ * 只在本设施的 .c 之间用，不构成对外契约（改它不影响历史产物）。
+ * 与 nc_guard_layout.h 分工：那边是【产物格式契约】（零 include 零逻辑），
+ * 这边是【内部函数声明】。
  *
- * ⚠️ 与 nc_guard_layout.h 的分工（不要混）：
- *   nc_guard_layout.h   契约常量 —— 零 include 零逻辑，会被拷进各种
- *                       NDK 工程。它描述的是【产物格式】。
- *   nc_guard_internal.h 内部函数声明 —— 只在本设施的几个 .c 之间用，
- *                       不构成对外契约，改它不影响任何历史产物。
- *   把声明塞进 layout.h 会破坏它"零依赖"的刻意约束。
- *
- * ⚠️ 本文件不参与"格式契约"，但仍有一条纪律：这里的函数签名是
- *    boot.c 与 crypto.c 共享的，改签名必须同时改两侧 —— 编译器会拦，
- *    不会静默。这正是把它抽成头文件的目的（此前是各写一份前向声明）。
- *
- * ⚠️ 符号可见性：这些函数都没有加 visibility("default")，生产构建
- *    （-fvisibility=hidden）下不会进 .dynsym。实测见 test.sh V2。
- */
+ * ⚠️ 这里的函数签名是 boot.c 与 crypto.c 共享的，改签名编译器会拦。
+ * ⚠️ 全部无 visibility("default")，生产构建下不进 .dynsym（test.sh V2）。 */
 #ifndef _NC_GUARD_INTERNAL_H_
 #define _NC_GUARD_INTERNAL_H_
 

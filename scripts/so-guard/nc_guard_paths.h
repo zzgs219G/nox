@@ -1,17 +1,11 @@
 /* nc_guard_paths.h — 自带的路径密文表
  *
- * 为什么需要：设施原先从主项目的 sig_log_data.h 取两条 /proc 路径，
- * 导致"单独拿设施编译"直接失败。本文件让设施零外部源码依赖。
+ * 设施原先从主项目的 sig_log_data.h 取两条 /proc 路径，导致单独编译失败。
+ * 本文件让设施零外部源码依赖。
  *
- * 为什么不明文：`strings -n 6` 一行就能扫出 /proc/self/cmdline，
- * 等于告诉逆向者"我们在查进程名"。用密钥流保持同等强度。
- *
- * ⚠️ 强度边界（如实）：这是【混淆】不是【加密】。密钥与算法都在本设施
- *    源码里，愿意反汇编 ncg_path_ctr_xor 的人可以还原。它买到的是
- *    "自动扫描失效"，不是"人工逆向成本"。
- *
- * ⚠️ 本文件零逻辑、只放接口与常量（实现在 nc_guard_paths.c）。
- */
+ * ⚠️ 强度边界（如实）：这是【混淆】不是【加密】。密钥与算法都在本设施源码里，
+ *    愿意反汇编 ncg_path_ctr_xor 的人可以还原。买到的是"strings 扫不到"。
+ * ⚠️ 本文件零逻辑、只放接口与常量（实现在 nc_guard_paths.c）。 */
 #ifndef _NC_GUARD_PATHS_H_
 #define _NC_GUARD_PATHS_H_
 
@@ -25,19 +19,9 @@ typedef enum {
     NCG_PATH_COUNT   = 2
 } ncg_path_id;
 
-/* 取第 id 条路径的明文，写入调用方缓冲，返回 buf；失败返回 NULL。
- *
- * 语义与原先的 lsg_s() 一致：
- *   · 成功时返回 buf，且 buf 以 NUL 结尾（C 字符串语义）
- *   · id 越界、buf 为 NULL、cap 不足 → 返回 NULL
- *   · 调用方自备缓冲；本函数不分配内存、不做 I/O
- *
- * ⚠️ 返回的指针指向调用方缓冲（不是内部静态区），所以多线程各自持有
- *    自己的 buf 时天然安全 —— 这与 lsg_s 的用法一致。
- *
- * ⚠️ 本函数必须留在 .text（明文段）：调用它的 ncg_self_pkg /
- *    ncg_find_apk_path 都在 .ncxh 密文段内，而 .ncxh 解开之前就要能用。
- *    实现文件不加 __attribute__((section))，自然落 .text。 */
+/* 取第 id 条路径的明文写入 buf，返回 buf；失败返回 NULL。
+ * 语义同原 lsg_s()：成功时 buf 以 NUL 结尾；id 越界/buf 为 NULL/cap 不足 → NULL。
+ * 调用方自备缓冲；本函数不分配内存、不做 I/O。 */
 const char *ncg_path_s(int id, char *buf, size_t cap);
 
 #endif /* _NC_GUARD_PATHS_H_ */
