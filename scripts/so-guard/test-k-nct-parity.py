@@ -75,6 +75,10 @@ int main(int argc, char **argv) {
     printf(" ");
     if (ncg_derive_k_bc_from_der(master, der, n, argv[3], out) != 0) return 5;
     for (int i = 0; i < 16; i++) printf("%02x", out[i]);
+    printf(" ");
+    /* k_bc2 = .ncv 消费方第二套字节码段用（label "nc-dex-v1"） */
+    if (ncg_derive_k_bc2_from_der(master, der, n, argv[3], out) != 0) return 5;
+    for (int i = 0; i < 16; i++) printf("%02x", out[i]);
     printf("\n");
     return 0;
 }
@@ -99,7 +103,8 @@ int main(int argc, char **argv) {
             print("✗ C 侧调用失败 rc=%d\n%s" % (r.returncode, r.stderr[:1000]))
             sys.exit(1)
         parts = r.stdout.split()
-        return bytes.fromhex(parts[0]), bytes.fromhex(parts[1])
+        return (bytes.fromhex(parts[0]), bytes.fromhex(parts[1]),
+                bytes.fromhex(parts[2]))
 
 
 def main() -> int:
@@ -122,7 +127,8 @@ def main() -> int:
     for pkg, why in cases:
         p_nct = py_side(master, cert_der, pkg, "insn")
         p_bc  = py_side(master, cert_der, pkg, "warm")
-        c_nct, c_bc = c_side(master, cert_der, pkg, cc)
+        p_bc2 = py_side(master, cert_der, pkg, "dex")
+        c_nct, c_bc, c_bc2 = c_side(master, cert_der, pkg, cc)
         if p_nct == c_nct:
             print("✓ k_nct(%s) = %s   [%s]" % (pkg, p_nct.hex(), why))
         else:
@@ -136,6 +142,13 @@ def main() -> int:
             print("✗ k_bc (%s) 两侧不一致" % pkg)
             print("    Python: %s" % p_bc.hex())
             print("    C     : %s" % c_bc.hex())
+            bad += 1
+        if p_bc2 == c_bc2:
+            print("✓ k_bc2(%s) = %s" % (pkg, p_bc2.hex()))
+        else:
+            print("✗ k_bc2(%s) 两侧不一致" % pkg)
+            print("    Python: %s" % p_bc2.hex())
+            print("    C     : %s" % c_bc2.hex())
             bad += 1
 
     # 反向验证：k_nct 必须与其它四个域都不同（label 复用 = 两条链互相印证）

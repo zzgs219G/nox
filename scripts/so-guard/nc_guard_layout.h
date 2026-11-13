@@ -86,8 +86,23 @@
 /* 2026-11-13：VMP 数据段。与解释器段分开是 clang 硬约束 ——
  * 同名段里既有函数又有 const 数据会报
  *   `error: 'f' causes a section type conflict with 'tbl'`（实测确认）。 */
-#define NC_SEC_VMPBC     ".ncq"    /* VM 字节码（纯数据，可加密）*/
-#define NC_SEC_VMPTBL    ".ncs"    /* descriptor/native 表（含重定位，必须明文）*/
+/* ⚠️⚠️ 两套 VMP 必须用【不同】段名（2026-11-13 实测踩过）：
+ *    第一版两套都用 ".ncq,.ncs" → 链接后混在同一段里 →
+ *    第一套解释器（.ncr）按 adr 偏移去 .ncs 找表，找到的却是第二套的
+ *    → 寄存器读到垃圾（x20=0x48416df089015220）→ SIGSEGV。
+ *
+ *    实测证据（2026-11-13 06:42 产物）：
+ *      .ncs 里 129 个 RELATIVE 重定位的 addend 全部指向 .text
+ *      （那是第二套的 handler 表），第一套的表被挤掉/错位。
+ *
+ *    命名沿用同族风格，不暴露"vm/vmp/amice"字样：
+ *      第一套：.ncq 字节码 / .ncs 表
+ *      第二套：.ncv 字节码 / .ncw 表
+ */
+#define NC_SEC_VMPBC     ".ncq"    /* 第一套 VM 字节码（纯数据，可加密）*/
+#define NC_SEC_VMPTBL    ".ncs"    /* 第一套 descriptor/native 表（明文）*/
+#define NC_SEC_VMPBC2    ".ncv"    /* 第二套 VM 字节码（消费方）*/
+#define NC_SEC_VMPTBL2   ".ncw"    /* 第二套 descriptor/native 表（消费方）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节

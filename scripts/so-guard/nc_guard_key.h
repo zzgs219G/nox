@@ -146,3 +146,14 @@ int ncg_derive_k_bc(const uint8_t master[32], const uint8_t cert_sha256[32],
 int ncg_derive_k_bc_from_der(const uint8_t master[32],
                              const uint8_t *cert_der, size_t der_len,
                              const char *pkg, uint8_t out[16]);
+
+/* ── k_bc2（.ncv 消费方第二套字节码段，2026-11-13）──────────────────
+ * k_bc2 = HKDF-SHA256(..., info="nc-dex-v1"+pkg, 16)
+ * 与 derive_app_keys()['dex'] 逐字节一致。
+ * ⚠️ 与 k_bc（.ncq，nox 第一套）必须不同 —— 两套链接进同一个 so。 */
+int ncg_derive_k_bc2(const uint8_t master[32], const uint8_t cert_sha256[32],
+                     const char *pkg, uint8_t out[16]);
+
+int ncg_derive_k_bc2_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der, size_t der_len,
+                              const char *pkg, uint8_t out[16]);

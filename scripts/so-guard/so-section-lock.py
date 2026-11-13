@@ -898,6 +898,9 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         # k_bc  = HKDF 的 'nc-warm-v1' 域 → .ncq（VM 字节码）
         # ⚠️ 不能用 k_nct：RC4 流密码两段共用 keystream = two-time-pad 误用。
         _LAYOUT['NC_SEC_VMPBC']: keys['warm'],
+        # .ncv = 消费方第二套字节码。用 'dex' 域（nc-dex-v1）。
+        # ⚠️ 与 .ncq 的 k_bc 不同：两套链接进同一个 so，同钥匙 = keystream 复用。
+        _LAYOUT['NC_SEC_VMPBC2']: keys['dex'],
     }
     segs = []                      # [(name, sec, plain, cipher)]
     for _idx, nm in enumerate(sec_names):
@@ -1016,7 +1019,8 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         _kd = ('k_so' if nm == _LAYOUT['NC_SEC_CODE'] else
                'k_so_r' if nm == _LAYOUT['NC_SEC_CONST'] else
                'k_nct' if nm == _LAYOUT['NC_SEC_VMP2'] else
-               'k_bc'  if nm == _LAYOUT['NC_SEC_VMPBC'] else '?')
+               'k_bc'  if nm == _LAYOUT['NC_SEC_VMPBC'] else
+               'k_bc2' if nm == _LAYOUT['NC_SEC_VMPBC2'] else '?')
         print('   段 %s: %d 字节已加密（size-preserving，域密钥 %s）'
               % (nm, len(pl), _kd))
     print('   密钥槽 %s: %d 字节' % (SLOT_NAME, len(blob)))

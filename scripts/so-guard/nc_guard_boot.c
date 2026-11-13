@@ -1206,8 +1206,9 @@ static int ncg_decrypt_one_seg(const void *base,
                     return -12;
                 }
             } else if (seg_ord == ord_ncq) {
-                if (ncg_derive_k_bc_from_der(cx->master, cx->der, cx->der_len,
-                                             cx->pkg, segkey) != 0) {
+                /* .ncv = 消费方第二套字节码，钥匙 k_bc2（label nc-dex-v1） */
+                if (ncg_derive_k_bc2_from_der(cx->master, cx->der, cx->der_len,
+                                              cx->pkg, segkey) != 0) {
                     ncg_wipe(k_out, 16);
                     return -12;
                 }
@@ -1564,18 +1565,25 @@ int ncg_head_unlock(const void *self_addr) {
             has_nct = 1;
         }
     }
-    /* 2026-11-13：VM 字节码段。排在 .nct 之后、.ncx 之前 ——
-     * 它由解释器在运行期读取，晚于解释器解密即可。
-     * ⚠️ 加密它的意义远大于解释器：字节码是【每包独有的业务逻辑】，
+    /* 2026-11-13：VM 字节码段。
+     *
+     * ⚠️⚠️ 只有【消费方第二套】的字节码在这里（.ncv）：它由 protect.sh
+     *    锁箱。第一套的字节码（.ncq）与 descriptor 表（.ncs）在
+     *    libnox.a 里【预编译】进来、是明文（循环依赖，加密即自锁），
+     *    不参与本解锁流程。
+     *
+     * ⚠️ 加密字节码的意义远大于解释器：字节码是【每包独有的业务逻辑】，
      *    解释器只是通用 VM 规则（逆一次通吃所有包）。
-     *    此前它在 .rodata 明文段，只靠 Amice 的 bytecode.key
-     *    （那个 key 由编译期常量 seed 派生，写在解释器代码里）。 */
+     *
+     * ⚠️ 为什么两套段名必须不同：链接进同一个 so，同名会混在一起 →
+     *    第一套解释器按 adr 偏移找表却找到第二套的 → 寄存器读垃圾
+     *    → SIGSEGV（2026-11-13 实测，pc 落在 .ncr+0x5bc8）。 */
     {
-        ncg_shdr_t vmpq;
-        if (ncg_find_section(so_path, NC_SEC_VMPBC, &vmpq) == 0
-            && vmpq.size > 0 && (vmpq.flags & SHF_ALLOC)) {
-            segs[nseg++] = vmpq;
-            has_ncq = 1;
+        ncg_shdr_t vmpv;
+        if (ncg_find_section(so_path, NC_SEC_VMPBC2, &vmpv) == 0
+            && vmpv.size > 0 && (vmpv.flags & SHF_ALLOC)) {
+            segs[nseg++] = vmpv;
+            has_ncq = 1;   /* 复用同一个标志：都是"有字节码段要解" */
         }
     }
     segs[nseg++] = sec;
