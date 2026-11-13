@@ -43,7 +43,13 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 必须带上（2026-11-14 修）：
+      # V15 断言用 `git describe --tags` 比对 docs/版本记录.md 与最近 tag。
+      # 默认的浅克隆（depth=1）不拉 tag → describe 返回空 → V15 恒失败。
+      # 实测：手动触发时 checkout 的是分支而非 tag，浅克隆下 tag 反射不可见。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 安装依赖
         run: |
