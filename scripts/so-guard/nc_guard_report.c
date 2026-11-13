@@ -334,7 +334,8 @@ static void rp_pad(rp_ctx *c, const char *s, int width) {
  *   段名 10 | 大小 9 | 权限 4 | 熵 6 | 用途 18 | 判定
  */
 static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
-                   const char *name, const char *role, int expect) {
+                   const char *name, const char *role, int expect,
+                   int *unknown_p) {
     rp_seg_t sg;
     int32_t h;
     double d;
@@ -359,7 +360,8 @@ static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
                  (unsigned long long)sg.size, rp_perm(sg.flags), d);
         rp_puts(c, tmp);
         rp_pad(c, role, 17);
-        rp_puts(c, "  ! 样本不足(小于512B)\n");
+        rp_puts(c, "  ! 样本不足\n");
+        (*unknown_p)++;      /* 由调用方累加 */
         return;
     }
 
@@ -390,6 +392,7 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     rp_seg_t sg;
     int has_ncr, has_nct, has_ncq, has_ncv, has_ncs, has_ncw, has_ncd;
     int bad = 0;      /* 有问题项计数，最后汇总 */
+    int unknown = 0;  /* "无法判断"计数（样本不足），不算异常但要报 */
 
     if (!buf || cap < 512) return;
     c.buf = buf; c.len = 0; c.cap = cap;
@@ -402,7 +405,10 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     has_ncs = (rp_read_shdr(so_path, NC_SEC_VMPTBL, &sg) == 0);
     has_ncw = (rp_read_shdr(so_path, NC_SEC_VMPTBL2, &sg) == 0);
 
-    rp_puts(&c, "===== ncguard 自检 v2 =====\n");
+    rp_puts(&c, "===== ncguard 自检 v3 =====\n");
+    /* 图例放在最前面 —— 此前用户看到 '!' 和 '结论 OK' 并存，不知道
+     * '!' 是什么意思。宁可多占两行，也不要让人猜。 */
+    rp_puts(&c, "符号: OK=通过  XX=有问题  !=无法判断(样本不足)  -=段不存在\n");
 
     /* ── 解锁结果（第一眼要看的）────────────────────────────────── */
     if (rc == 0) {
@@ -421,15 +427,15 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
      * 列宽固定（CJK 按 2 列），保证任意组合下都能对齐扫读。 */
     rp_puts(&c, "\n段名       大小  权限     熵  用途               判定\n");
     rp_puts(&c, "--------  -------  ----  ------  -----------------  --------------\n");
-    rp_seg(&c, so_path, img_base, NC_SEC_CODE,   "业务代码+壳",  1);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMP2,   "第二套解释器", 1);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMP,    "第一套解释器", 0);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC,  "第一套字节码", 0);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "第一套数据表", 0);
-    rp_seg(&c, so_path, img_base, NC_SEC_CONST,  "签名表",       1);
-    rp_seg(&c, so_path, img_base, NC_SEC_HEAD,   "解锁器",       1);
-    rp_seg(&c, so_path, img_base, NC_SEC_HEADRO, "master",       0);
+    rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 1, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMP, "第一套解释器", 0, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC, "第一套字节码", 0, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "第一套数据表", 0, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_CONST, "签名表", 1, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_HEAD, "解锁器", 1, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_HEADRO, "master", 0, &unknown);
 
     /* ── VMP 判定 ────────────────────────────────────────────────
      * 判据：解释器段存在 = 那套 VMP 生效（没开 VMP 的构建不会生成）。
@@ -501,9 +507,19 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
      * 读日志的人（或 AI）不需要自己再判断一遍。 */
     rp_puts(&c, "\n结论\n");
     if (bad == 0 && rc == 0) {
-        rp_puts(&c, "  OK 全部正常\n");
+        rp_puts(&c, "  OK 全部正常");
+        if (unknown > 0) {
+            /* '!' 是"样本太小算不出熵"，不是错误 —— 必须说明，
+             * 否则"有 ! 却说我全部正常"看起来像自相矛盾。 */
+            rp_fmt(&c, "（其中 %d 项标 ! 是样本不足无法判断熵，不影响功能）",
+                   unknown);
+        }
+        rp_puts(&c, "\n");
     } else {
         rp_fmt(&c, "  XX 有 %d 项异常，见上方 XX 标记\n", bad);
+        if (unknown > 0)
+            rp_fmt(&c, "     另有 %d 项标 ! 无法判断（样本不足），不算异常\n",
+                   unknown);
     }
     rp_puts(&c, "===========================\n");
 }

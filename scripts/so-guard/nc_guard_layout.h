@@ -42,67 +42,63 @@
 #define NC_SEC_SLOT      ".nck"    /* 一级密钥槽*/
 #define NC_SEC_STUBSLOT  ".ncks"   /* 二级 stub 密钥槽*/
 
-/* ── VMP 解释器段（2026-11-13 按用户架构重定，amice ≥ v0.1.6-nox15）───
+/* ── VMP 段名对照表（2026-11-13）─────────────────────────────────────
  *
- * 架构（用户明确）：
+ * ⚠️ 段名是【产物格式契约】，改一个字所有历史产物就解不开。所以下面
+ *    这些名字一旦定下就不再动 —— 只在这里写清楚每个是什么。
  *
- *   .ncx   业务代码被 VMP 后的【字节码 + wrapper】  ← 锁箱加密的就是它
- *   .ncr   第一套 VMP（本仓库解密链）的【解释器】   ← 明文
- *   .nct   第二套 VMP（消费方 sigcheck）的【解释器】 ← 锁箱加密
+ * 名字本身没有语义（刻意不带 vm/vmp/amice —— 段名留在 .shstrtab 里
+ * strip 删不掉，自解释的名字等于告诉逆向者"这里是 VM"）。记忆靠下表：
  *
- * Amice（编译期 LLVM pass）把被 VMP 的函数体换成「wrapper + 解释器」：
- *   · wrapper 留在函数原来的段（业务代码 → .ncx）
- *   · 字节码跟着函数走（不单独指定段 → 落在 .ncx 旁边）
- *   · 解释器（dispatch）由 AMICE_VM_INSN_SECTION 指定段
+ * ┌──────┬────────┬────────┬──────────────────────────────────────┐
+ * │ 段名 │ 大小   │ 加密   │ 是什么                               │
+ * ├──────┼────────┼────────┼──────────────────────────────────────┤
+ * │ .ncx │  39 KB │ ✅     │ 代码：业务函数 + VMP 壳（wrapper）    │
+ * │ .nct │ 104 KB │ ❌     │ 代码：第二套【解释器】dispatcher      │
+ * │ .ncv │ 128 KB │ ❌     │ 数据：第二套【字节码】+ 常量池        │
+ * │ .ncw │  1 KB  │ ❌     │ 数据：第二套 descriptor / native 表   │
+ * │ .ncr │ 142 KB │ ❌     │ 代码：第一套【解释器】                │
+ * │ .ncq │  95 KB │ ❌     │ 数据：第一套【字节码】                │
+ * │ .ncs │ 1.3 KB │ ❌     │ 数据：第一套 descriptor / native 表   │
+ * │ .ncxr│  96 B  │ ✅     │ 数据：签名表（SIG_SALT/HASH_STORED）  │
+ * │ .ncxh│ 3.8 KB │ ✅     │ 代码：解锁器本体                      │
+ * └──────┴────────┴────────┴──────────────────────────────────────┘
  *
- * amice v0.1.6-nox15 起解释器段可配置（此前 runtime.rs 里 set_section
- * 出现 0 次，解释器全落在 .text —— 锁箱根本覆盖不到）。
+ * 判断"是代码还是数据"的可靠方法：readelf -SW 看权限列，
+ *   带 x 的（AX/AXR）= 代码    不带 x 的（A/WA）= 数据
  *
- * 两套的区别只在【何时执行】：
+ * 两条执行链：
+ *   第一套 = nox 自己的解密链（保护"怎么解锁"）
+ *     .ncr 解释器 ──→ .ncq 字节码 + .ncs 表
+ *   第二套 = 消费方签名校验（保护"判定逻辑"）
+ *     .nct 解释器 ──→ .ncv 字节码 + .ncw 表
+ *   而 .ncx 里是这些函数的【壳】：它 bl 到解释器，逻辑已被抽走。
  *
- *   .ncr  第一套解释器 → 【必须明文】
- *         循环依赖：解 .ncx 要 k_so ← master ← .ncxhr ← k_stub ← .ncks
- *         ← boot_key ← ncg_boot_key，而 ncg_boot_key 自己被 VMP，
- *         执行它要经过第一套解释器。若解释器加密，解锁前跑不了 → 自锁。
+ * ⚠️ 为什么 .nct/.ncv 不加密（2026-11-13 用户决定）：
+ *    .ncv 128KB 加密后 APK 压后从 37KB 涨到 128KB（+91KB）
+ *    .nct 104KB 加密后从 45KB 涨到 104KB（+59KB）
+ *    加密段熵 8.0，zlib 完全压不动 —— 体积代价是硬开销。
+ *    而强度增益接近零：
+ *      ① 解释器是通用 VM 规则，Amice 开源可抄，不是秘密
+ *      ② 它必须能执行 → 运行期必然内存明文，frida dump 就有
+ *      ③ 所有段共用同一 master，攻破一次全开 —— 收益一次性、代价线性
+ *    字节码的强度来自 VMP（理解成本），不来自加密（获取成本）。
  *
- *   .nct  第二套解释器 → 【锁箱加密】
- *         那些函数在 constructor(65535) 才跑，那时解锁（constructor(50)）
- *         早已完成，解释器已可解密，无循环依赖。
+ * ⚠️ 为什么 .ncr/.ncq 必须明文（结构性约束，不是选择）：
+ *    解 .ncx 的钥匙（k_so）要执行第一套解释器里的代码
+ *    （ncg_boot_key 被 VMP，字节码在 .ncq）。加密即自锁。
  *
- * ⚠️⚠️ 解释器段必须是【可执行】的（SHF_EXECINSTR）。它是 ARM64 代码，
- *    放进只读数据段执行即 SIGSEGV。锁箱解密后会 mprotect 成 RX。
- *    （2026-11-13 之前的 .ncr/.nct 是纯数据段 A，装的是字节码不是代码；
- *      现在语义变了 —— 装代码，必须 AX。）
- *
- * ⚠️ 段名刻意不带 vm/vmp/amice 字样：段名留在 .shstrtab（strip 删不掉），
- *    自解释的名字等于直接告诉逆向者"这里是 VM"。.ncr/.nct 与
- *    .ncx/.ncxh/.ncxr 同族。
- * ⚠️ 本仓库不定义任何 __attribute__((section(NC_SEC_VMP*))) —— 这些段由
- *    Amice 插件生成，这里只登记段名供解锁时查找。
- * ⚠️ .nct 与 .ncr 都是【可选段】：没开 VMP 的构建两者都没有。消费顺序
- *    必须动态决定（见 nc_guard_boot.c 的 has_nct），写死索引会让钥匙错配。 */
-#define NC_SEC_VMP       ".ncr"    /* 第一套解释器（明文，循环依赖，AX）*/
-#define NC_SEC_VMP2      ".nct"    /* 第二套解释器（锁箱加密，AX）*/
-/* 2026-11-13：VMP 数据段。与解释器段分开是 clang 硬约束 ——
- * 同名段里既有函数又有 const 数据会报
- *   `error: 'f' causes a section type conflict with 'tbl'`（实测确认）。 */
-/* ⚠️⚠️ 两套 VMP 必须用【不同】段名（2026-11-13 实测踩过）：
- *    第一版两套都用 ".ncq,.ncs" → 链接后混在同一段里 →
- *    第一套解释器（.ncr）按 adr 偏移去 .ncs 找表，找到的却是第二套的
- *    → 寄存器读到垃圾（x20=0x48416df089015220）→ SIGSEGV。
- *
- *    实测证据（2026-11-13 06:42 产物）：
- *      .ncs 里 129 个 RELATIVE 重定位的 addend 全部指向 .text
- *      （那是第二套的 handler 表），第一套的表被挤掉/错位。
- *
- *    命名沿用同族风格，不暴露"vm/vmp/amice"字样：
- *      第一套：.ncq 字节码 / .ncs 表
- *      第二套：.ncv 字节码 / .ncw 表
+ * ⚠️ 为什么两套段名必须不同：
+ *    两套链接进同一个 so。同名会混在一起 → 第一套解释器按 adr 偏移
+ *    找表却找到第二套的 → VM 寄存器读垃圾 → SIGSEGV
+ *    （2026-11-13 实测，pc 落在 .ncr+0x5bc8）。
  */
-#define NC_SEC_VMPBC     ".ncq"    /* 第一套 VM 字节码（纯数据，可加密）*/
-#define NC_SEC_VMPTBL    ".ncs"    /* 第一套 descriptor/native 表（明文）*/
-#define NC_SEC_VMPBC2    ".ncv"    /* 第二套 VM 字节码（消费方）*/
-#define NC_SEC_VMPTBL2   ".ncw"    /* 第二套 descriptor/native 表（消费方）*/
+#define NC_SEC_VMP       ".ncr"    /* 第一套解释器（代码，明文）*/
+#define NC_SEC_VMP2      ".nct"    /* 第二套解释器（代码，明文）*/
+#define NC_SEC_VMPBC     ".ncq"    /* 第一套字节码（数据，明文）*/
+#define NC_SEC_VMPTBL    ".ncs"    /* 第一套 descriptor/native 表（数据）*/
+#define NC_SEC_VMPBC2    ".ncv"    /* 第二套字节码（数据，明文）*/
+#define NC_SEC_VMPTBL2   ".ncw"    /* 第二套 descriptor/native 表（数据）*/
 
 /* ═══════════════════════════════════════════════════════════════════
  * 二、.nck 一级密钥槽：96 字节

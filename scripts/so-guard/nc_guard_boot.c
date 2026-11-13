@@ -1180,39 +1180,22 @@ static int ncg_decrypt_one_seg(const void *base,
          *   而 k_nct 只需 master（来自 .ncxhr，二级锁箱已解），与 .ncx
          *   无依赖，所以"先解 .nct"不构成循环依赖。 */
         {
-            /* ── 四段分派（2026-11-13）────────────────────────────────
+            /* ── 段密钥分派（2026-11-13）──────────────────────────────
              * 段序（与 protect.sh 的 --section 严格一致）：
-             *   0  .nct   第二套解释器   k_nct  (nc-insn-v1)
-             *   1  .ncq   VM 字节码      k_bc   (nc-warm-v1)
-             *   2  .ncx   业务代码+壳     k_so   (nc-so-v1)
-             *   3  .ncxr  签名表          k_so_r (nc-so-r-v1)
+             *   0  .ncx   业务代码+壳   k_so   (nc-so-v1)
+             *   1  .ncxr  签名表        k_so_r (nc-so-r-v1)
              *
-             * ⚠️ 可选段：没开 VMP 的构建没有 .nct/.ncq，索引要动态算。
-             *    写死索引会让钥匙错配（本项目 2026-11-12 踩过：
-             *    无 .nct 时把 k_nct 用在 .ncx 上 → 解出乱码 → V6 红）。
-             * ⚠️ .ncq 用独立钥匙 k_bc，不复用 k_nct：RC4 流密码共用
-             *    keystream = two-time-pad 误用。 */
-            const size_t ord_nct  = cx->has_nct ? (size_t)0 : (size_t)-1;
-            const size_t ord_ncq  = cx->has_ncq
-                                    ? (size_t)(cx->has_nct ? 1 : 0)
-                                    : (size_t)-1;
-            const size_t kso_idx  = (size_t)(cx->has_nct ? 1 : 0)
-                                    + (size_t)(cx->has_ncq ? 1 : 0);
-            const size_t ksor_idx = kso_idx + 1;
-            if (seg_ord == ord_nct) {
-                if (ncg_derive_k_nct_from_der(cx->master, cx->der, cx->der_len,
-                                              cx->pkg, segkey) != 0) {
-                    ncg_wipe(k_out, 16);
-                    return -12;
-                }
-            } else if (seg_ord == ord_ncq) {
-                /* .ncv = 消费方第二套字节码，钥匙 k_bc2（label nc-dex-v1） */
-                if (ncg_derive_k_bc2_from_der(cx->master, cx->der, cx->der_len,
-                                              cx->pkg, segkey) != 0) {
-                    ncg_wipe(k_out, 16);
-                    return -12;
-                }
-            } else if (seg_ord == kso_idx) {
+             * ⚠️ .nct/.ncv 已不加密（见 segs[] 处注释），所以不在这里。
+             *    它们的钥匙派生函数（k_nct/k_bc/k_bc2）保留 —— 将来若要
+             *    重新启用加密，改回 segs[] 与这里即可，钥匙链是现成的。
+             * ⚠️ .ncxr 是可选段（NC_GUARD_SECTIONED 未定义时没有它）。
+             *    索引必须动态算：写死会让钥匙错配（2026-11-12 踩过：
+             *    无 .ncxr 时把 k_so_r 用在 .ncx 上 → 解出乱码 → V6 红）。 */
+            const size_t kso_idx  = (size_t)0;
+            const size_t ksor_idx = (size_t)1;
+            (void)cx->has_nct;   /* 保留字段：加密开关改回时会用到 */
+            (void)cx->has_ncq;
+            if (seg_ord == kso_idx) {
                 memcpy(segkey, k_out, 16);
             } else if (seg_ord == ksor_idx) {
                 if (ncg_derive_k_so_r_from_der(cx->master, cx->der, cx->der_len,
@@ -1557,35 +1540,22 @@ int ncg_head_unlock(const void *self_addr) {
      *    与位置无关，但 MAC 覆盖顺序仍要与这里一致）。 */
     int has_nct = 0;
     int has_ncq = 0;
-    {
-        ncg_shdr_t vmp2;
-        if (ncg_find_section(so_path, NC_SEC_VMP2, &vmp2) == 0
-            && vmp2.size > 0 && (vmp2.flags & SHF_ALLOC)) {
-            segs[nseg++] = vmp2;
-            has_nct = 1;
-        }
-    }
-    /* 2026-11-13：VM 字节码段。
+    /* ⚠️ 2026-11-13：.nct/.ncv 不再参与解锁（用户决定不加密这两段）。
      *
-     * ⚠️⚠️ 只有【消费方第二套】的字节码在这里（.ncv）：它由 protect.sh
-     *    锁箱。第一套的字节码（.ncq）与 descriptor 表（.ncs）在
-     *    libnox.a 里【预编译】进来、是明文（循环依赖，加密即自锁），
-     *    不参与本解锁流程。
+     * 为什么不加密（实测收益/代价）：
+     *   .ncv 128,533 B 加密后 APK 压后从 37KB 涨到 128KB（+91KB）
+     *   .nct 104,200 B 加密后从 45KB 涨到 104KB（+59KB）
+     *   加密段熵 8.0，zlib 完全压不动。
+     * 而强度增益接近零：
+     *   ① 解释器是通用 VM 规则，Amice 开源可抄，不是秘密
+     *   ② 它必须能执行 → 运行期必然在内存明文，frida dump 就有
+     *   ③ 五段共用同一 master，攻破一次全开 —— 加密收益一次性、
+     *      体积代价线性，多加密的边际收益递减
      *
-     * ⚠️ 加密字节码的意义远大于解释器：字节码是【每包独有的业务逻辑】，
-     *    解释器只是通用 VM 规则（逆一次通吃所有包）。
-     *
-     * ⚠️ 为什么两套段名必须不同：链接进同一个 so，同名会混在一起 →
-     *    第一套解释器按 adr 偏移找表却找到第二套的 → 寄存器读垃圾
-     *    → SIGSEGV（2026-11-13 实测，pc 落在 .ncr+0x5bc8）。 */
-    {
-        ncg_shdr_t vmpv;
-        if (ncg_find_section(so_path, NC_SEC_VMPBC2, &vmpv) == 0
-            && vmpv.size > 0 && (vmpv.flags & SHF_ALLOC)) {
-            segs[nseg++] = vmpv;
-            has_ncq = 1;   /* 复用同一个标志：都是"有字节码段要解" */
-        }
-    }
+     * 保留加密：.ncx / .ncxr / .ncxh（体积小 + 是判定逻辑本身）。
+     * 字节码的强度来自 VMP（理解成本），不来自加密（获取成本）。 */
+    /* .ncv（第二套字节码）同样不参与解锁 —— 理由同上。 */
+
     segs[nseg++] = sec;
     {
         ncg_shdr_t ro;
