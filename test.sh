@@ -835,6 +835,48 @@ PYALIGN
 
         # ④ 权限列：ELF64 的 flags 偏移曾读成 type（@4 而非 @8），
         #    导致 .ncx 显示 '-w-'。这里钉死必须是 r-x。
+        # ⑧ 表头必须与数据行列位一致（2026-11-14 加）
+        #    ⚠️ 为什么单列一条：V12f 只验"判定列所有行同一位置"，
+        #       它抓不到"表头与数据行错位" —— 表头是独立的字面量行，
+        #       不在那段检查范围内。本轮实测：表头列位 [0,16,24,34,38,59]
+        #       而数据行 [0,13,21,27,34,52]，V12f 照样通过。
+        if python3 - "$RLOG" <<'PYHEAD'
+import sys
+def col(s):
+    return sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+rows = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8', errors='replace')]
+head = next((r for r in rows if r.startswith('段名')), None)
+data = next((r for r in rows if r.startswith('.nc') and ' r-' in r), None)
+if not head or not data:
+    sys.exit(1)
+
+# 只比【左对齐列】的起点：段名、权限、用途、判定。
+# ⚠️ 大小和熵是右对齐（%9llu / %6.3f），起点随数字位数变化，
+#    拿起点比必然误报 —— 本轮实测 .ncx 那行是 196（3 位）时起点 11，
+#    104200（6 位）时起点 8。右对齐列应比【结束位置】。
+hw = ('段名', '权限', '用途', '判定')
+hpos = [col(head[:head.index(w)]) for w in hw]
+
+perm_i = data.index(' r-') + 1
+dpos = [col(data[:data.index(data.split()[0])]),   # 段名
+        col(data[:perm_i])]                         # 权限
+# 用途：权限后跳过熵值，找第一段中文
+import re
+m = re.search(r'[\u4e00-\u9fff]', data)
+dpos.append(col(data[:m.start()]) if m else -1)
+# 判定：找 OK/XX/!
+m2 = re.search(r'(OK |XX |!  |   明|   密)', data)
+dpos.append(col(data[:m2.start()]) if m2 else -1)
+
+sys.exit(0 if hpos == dpos else 1)
+PYHEAD
+        then
+            ok "V12i 表头与数据行列位一致"
+        else
+            bad "V12i 表头与数据行错位 —— 改过 rp_seg 格式串或表头字面量？"
+            grep -E '^段名|^\.nc' "$RLOG" | head -3
+        fi
+
         if grep -q '\.ncx .* r-x' "$RLOG"; then
             ok "V12d 段权限解析正确（.ncx = r-x）"
         else
