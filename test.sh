@@ -786,6 +786,35 @@ else
             grep '\.ncxh ' "$RLOG" | head -2
         fi
 
+        # ⑥ 段表对齐：所有段的"判定"列必须落在同一显示列。
+        #    ⚠️ 这条是给"排版"建的断言 —— 我在这张表上连错四次
+        #    （手写空格 / %-10s 按字节 / rp_pad 累加起点 / ASCII 表头），
+        #    每次都是"以为算对了"。机器检查比人眼可靠。
+        if python3 - "$RLOG" <<'PYALIGN'
+import sys
+def col(s):
+    w = 0
+    for ch in s:
+        w += 2 if ord(ch) > 0x2E80 else 1
+    return w
+cols = []
+for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+    if not line.startswith('.nc'):
+        continue
+    for marker in ('OK ', 'XX ', '! ', '- '):
+        i = line.rfind(marker)
+        if i > 20:
+            cols.append(col(line[:i]))
+            break
+sys.exit(0 if len(set(cols)) == 1 else 1)
+PYALIGN
+        then
+            ok "V12f 段表判定列对齐（所有行同一显示列）"
+        else
+            bad "V12f 段表判定列未对齐 —— 改过 rp_seg 的格式串？"
+            grep '^\.nc' "$RLOG" | head -4
+        fi
+
         # ⑤ 小样本保护：.ncx 196B < 512B，必须显示"样本不足"而不是乱给判定
         #    这条钉住的是"宁可不判，也不给错结论"。
         if grep -q '\.ncx .*样本不足' "$RLOG"; then

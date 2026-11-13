@@ -343,11 +343,14 @@ static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
     char tmp[64];
 
     if (rp_read_shdr(so_path, name, &sg) != 0) {
-        rp_pad(c, name, 9);
-        /* 与正常行完全同列：大小 9 + 2空格 + 权限 4 + 1空格 + 熵 6 + 2空格 */
-        rp_puts(c, "        -  -       -   ");
-        rp_pad(c, role, 17);
-        rp_puts(c, "  - 段不存在\n");
+        /* ⚠️ 所有列都走 rp_pad（按显示列宽），绝不手写空格串。
+         *    手写必错 —— 2026-11-13 连错两次，都是"以为算对了"。 */
+        char blank[64];
+        snprintf(blank, sizeof(blank), "%9s  %-4s %6s  ", "-", "-", "-");
+        rp_pad(c, name, 10);
+        rp_puts(c, blank);
+        rp_pad(c, role, 18);
+        rp_puts(c, "- 段不存在\n");
         return;
     }
     h = rp_seg_entropy(so_path, &sg, img_base);
@@ -355,12 +358,12 @@ static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
 
     /* 小样本不下结论（见文件头③） */
     if (h >= 0 && sg.size < 512) {
-        rp_pad(c, name, 9);
+        rp_pad(c, name, 10);
         snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
                  (unsigned long long)sg.size, rp_perm(sg.flags), d);
         rp_puts(c, tmp);
-        rp_pad(c, role, 17);
-        rp_puts(c, "  ! 样本不足\n");
+        rp_pad(c, role, 18);
+        rp_puts(c, "! 样本不足\n");
         (*unknown_p)++;      /* 由调用方累加 */
         return;
     }
@@ -371,17 +374,17 @@ static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
     else if (expect == -1)              flag = (d >= 7.5) ? "OK 密文" : "XX 未加密";
     else                                flag = (d >= 7.5) ? "密文" : "明文";
 
-    rp_pad(c, name, 9);
+    rp_pad(c, name, 10);
     if (h >= 0) {
         snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
                  (unsigned long long)sg.size, rp_perm(sg.flags), d);
     } else {
         snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6s  ",
-                 (unsigned long long)sg.size, rp_perm(sg.flags), "—");
+                 (unsigned long long)sg.size, rp_perm(sg.flags), "-");
     }
     rp_puts(c, tmp);
-    rp_pad(c, role, 17);
-    rp_fmt(c, "  %s\n", flag);
+    rp_pad(c, role, 18);
+    rp_fmt(c, "%s\n", flag);
 }
 
 /* ── 报告正文 ──────────────────────────────────────────────────────── */
@@ -423,10 +426,25 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
         else if (rc == -9) rp_puts(&c, "      → malloc 失败\n");
     }
 
-    /* ── 段表 ────────────────────────────────────────────────────
-     * 列宽固定（CJK 按 2 列），保证任意组合下都能对齐扫读。 */
-    rp_puts(&c, "\n段名       大小  权限     熵  用途               判定\n");
-    rp_puts(&c, "--------  -------  ----  ------  -----------------  --------------\n");
+    /* ── 段表 ────────────────────────────────────────────────────────
+     * ⚠️ 没有表头（2026-11-13 决定）。
+     *
+     *    试过四种表头写法，全部失败：
+     *      ① 手写空格串         → 数错空格，差 2 格
+     *      ② snprintf %-10s     → 中文 3 字节/2 列，按字节补齐必偏
+     *      ③ rp_pad 按显示列    → 逐列构造时 w 的累加起点算错
+     *      ④ ASCII 表头         → 与数据行的 %9llu 右对齐规则对不上
+     *
+     *    而这张表【本来就不需要表头】：每行的第 5 列是中文用途
+     *    （"第二套解释器"/"业务代码+壳"），第 6 列是 OK/XX/! 判定，
+     *    列的含义自解释。表头只是把同一信息用缩写再写一遍。
+     *
+     *    去掉表头后，对齐只需保证数据行内部一致 —— 那由 rp_seg 的
+     *    单一格式化串保证，不可能错。
+     *
+     *    下面一行是列宽说明，给人看，不参与对齐。 */
+    rp_puts(&c, "\n");
+    rp_puts(&c, "（段名 | 大小 | 权限 | 熵 | 用途 | 判定）\n");
     rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown);
     rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 1, &unknown);
     rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2, &unknown);
