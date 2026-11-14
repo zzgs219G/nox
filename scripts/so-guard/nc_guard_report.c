@@ -318,6 +318,22 @@ static int rp_disp_width(const char *s) {
     return w;
 }
 
+/* 把字节数格式化成 "12.3 KB" / "1.2 MB" / "512 B"（左对齐用，定宽 12 显示列）
+ *
+ * ⚠️ 为什么不再只给裸字节数（2026-11-14 用户反馈）：
+ *    "你是让我自己去数到底有多少kb吗，还要我自己人工进行单位换算吗"
+ *    段大小动辄 10 万字节，人眼换算 KB 每次都要数位数。日志的第一价值
+ *    是扫一眼就懂，不是提供原始数据。
+ * ⚠️ 定宽 12：最长的 "1023.9 KB" 占 9 列，留 3 列余量给 "1023.9 KB "。 */
+static void rp_fmt_size(char *out, size_t cap, unsigned long long bytes) {
+    if (bytes >= 1024ULL * 1024ULL)
+        snprintf(out, cap, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    else if (bytes >= 1024ULL)
+        snprintf(out, cap, "%.1f KB", (double)bytes / 1024.0);
+    else
+        snprintf(out, cap, "%llu B", bytes);
+}
+
 /* 打印 s 并用空格补到 width 列（按显示宽度，不按字节） */
 static void rp_pad(rp_ctx *c, const char *s, int width) {
     int w = rp_disp_width(s);
@@ -330,60 +346,72 @@ static void rp_pad(rp_ctx *c, const char *s, int width) {
  * expect:  1 = 应已解密（熵 < 7.5）  2 = 应为纯数据（熵 < 7.0）
  *          0 = 任意（只报告不判定）  -1 = 应为密文（熵 >= 7.5）
  *
- * 列宽（按显示列数，CJK 算 2）：
- *   段名 10 | 大小 9 | 权限 4 | 熵 6 | 用途 18 | 判定
- */
+ * ═══ 列定义（2026-11-14 重写，全部左对齐）═══════════════════════════
+ *
+ *   段名 10 | 大小 11 | 权限 4 | 熵 6 | VMP 4 | 用途 18 | 判定
+ *
+ * ⚠️ 为什么全部左对齐：此前「大小」用 %9llu 右对齐，导致 6760 和
+ *    104200 的起始列不同（13 vs 15），用户看到的就是"歪"。
+ *    右对齐只在纯数字表格里有意义（方便比大小），而这张表每行还有
+ *    四个文字列 —— 混排时右对齐反而破坏整体的左边缘。
+ *
+ * ⚠️ 为什么大小显示 KB 而不是裸字节：段大小动辄十几万字节，人眼换算
+ *    KB 每次都要数位数。日志要扫一眼就懂。
+ *
+ * ⚠️ 为什么加 VMP 列：此前「到底有没有被 VMP」要看下方 VMP 小节 + 自己
+ *    对照段名才知道。现在每行直接标 ✓（该段是 VM 产物）或 -（不是）。
+ *
+ * ⚠️ 压缩后大小不在这里：报告在运行期读 so 文件，那时它已被系统加载，
+ *    拿不到 APK 内的 zlib 压缩体积。压缩后大小由构建期日志提供。 */
 static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
                    const char *name, const char *role, int expect,
-                   int *unknown_p) {
+                   int *unknown_p, int is_vmp) {
     rp_seg_t sg;
     int32_t h;
     double d;
     const char *flag = "—";
-    char tmp[64];
+    char szbuf[32];
+
+    rp_pad(c, name, 10);
 
     if (rp_read_shdr(so_path, name, &sg) != 0) {
-        /* ⚠️ 所有列都走 rp_pad（按显示列宽），绝不手写空格串。
-         *    手写必错 —— 2026-11-13 连错两次，都是"以为算对了"。 */
-        char blank[64];
-        snprintf(blank, sizeof(blank), "%9s  %-4s %6s  ", "-", "-", "-");
-        rp_pad(c, name, 10);
-        rp_puts(c, blank);
+        /* 段不存在：所有列用 "-" 占位，仍走 rp_pad 保证列宽 */
+        rp_pad(c, "-", 11);
+        rp_pad(c, "-", 5);
+        rp_pad(c, "-", 6);
+        rp_pad(c, is_vmp ? "Y" : "-", 4);
         rp_pad(c, role, 18);
         rp_puts(c, "- 段不存在\n");
         return;
     }
+
+    rp_fmt_size(szbuf, sizeof(szbuf), (unsigned long long)sg.size);
+    rp_pad(c, szbuf, 11);
+    rp_pad(c, rp_perm(sg.flags), 5);
     h = rp_seg_entropy(so_path, &sg, img_base);
     d = (h >= 0) ? rp_fx2d(h) : -1.0;
+    if (h >= 0) {
+        char ebuf[16];
+        snprintf(ebuf, sizeof(ebuf), "%.3f", d);
+        rp_pad(c, ebuf, 6);
+    } else {
+        rp_pad(c, "-", 6);
+    }
+    rp_pad(c, is_vmp ? "Y" : "-", 4);
+    rp_pad(c, role, 18);
 
     /* 小样本不下结论（见文件头③） */
     if (h >= 0 && sg.size < 512) {
-        rp_pad(c, name, 10);
-        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
-                 (unsigned long long)sg.size, rp_perm(sg.flags), d);
-        rp_puts(c, tmp);
-        rp_pad(c, role, 18);
         rp_puts(c, "!  样本不足\n");
-        (*unknown_p)++;      /* 由调用方累加 */
+        (*unknown_p)++;
         return;
     }
 
-    if (h < 0)                          flag = "—";
+    if (h < 0)                          flag = "— 无法读取";
     else if (expect == 1)               flag = (d < 7.5) ? "OK 已解密" : "XX 仍是密文";
     else if (expect == 2)               flag = (d < 7.0) ? "OK 明文数据" : "!  高熵未解密";
     else if (expect == -1)              flag = (d >= 7.5) ? "OK 密文" : "XX 未加密";
-    else                                flag = (d >= 7.5) ? "   密文" : "   明文";
-
-    rp_pad(c, name, 10);
-    if (h >= 0) {
-        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6.3f  ",
-                 (unsigned long long)sg.size, rp_perm(sg.flags), d);
-    } else {
-        snprintf(tmp, sizeof(tmp), "%9llu  %-4s %6s  ",
-                 (unsigned long long)sg.size, rp_perm(sg.flags), "-");
-    }
-    rp_puts(c, tmp);
-    rp_pad(c, role, 18);
+    else                                flag = (d >= 7.5) ? "-- 密文" : "-- 明文";
     rp_fmt(c, "%s\n", flag);
 }
 
@@ -471,19 +499,25 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
      *    若将来改了 rp_seg 的格式串，本表头必须同步重算。 */
     rp_puts(&c, "\n");
     /*            段名宽10 │ 大小 11 列 │ 权限 6 列 │ 熵 8 列 │ 用途 18 列 */
-    rp_puts(&c, "段名         大小    权限  熵     用途              判定\n");
-    rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown);
+    rp_pad(&c, "段名", 10);
+    rp_pad(&c, "大小", 11);
+    rp_pad(&c, "权限", 5);
+    rp_pad(&c, "熵", 6);
+    rp_pad(&c, "VMP", 4);
+    rp_pad(&c, "用途", 18);
+    rp_puts(&c, "判定\n");
+    rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown, 0);
     /* ⚠️ .nct 现在**不加密**（体积优先，见 so防护架构 §15.5），所以判据是
      * "应为明文"（2）而不是"应已解密"（1）。写成 1 会显示"OK 已解密"——
      * 结论碰巧对（熵低），但语义错，会让人以为它被加密过。 */
-    rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 2, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMP, "第一套解释器", 0, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC, "第一套字节码", 0, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "第一套数据表", 0, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_CONST, "签名表", 1, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_HEAD, "解锁器", 1, &unknown);
-    rp_seg(&c, so_path, img_base, NC_SEC_HEADRO, "master", 0, &unknown);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMP2, "第二套解释器", 2, &unknown, 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC2, "第二套字节码", 2, &unknown, 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMP, "第一套解释器", 0, &unknown, 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPBC, "第一套字节码", 0, &unknown, 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_VMPTBL, "第一套数据表", 0, &unknown, 1);
+    rp_seg(&c, so_path, img_base, NC_SEC_CONST, "签名表", 1, &unknown, 0);
+    rp_seg(&c, so_path, img_base, NC_SEC_HEAD, "解锁器", 1, &unknown, 0);
+    rp_seg(&c, so_path, img_base, NC_SEC_HEADRO, "master", 0, &unknown, 0);
 
     /* ── VMP 判定 ────────────────────────────────────────────────
      * 判据：解释器段存在 = 那套 VMP 生效（没开 VMP 的构建不会生成）。
@@ -718,3 +752,72 @@ int ncg_report_flush(const char *buf, size_t len) {
     fclose(fp);
     return 0;
 }
+
+/* ── 阶段追踪实现（2026-11-14）────────────────────────────────────────
+ *
+ * ═══ 为什么必须每步独立 open/write/close ═══
+ *
+ * 进程崩溃时，stdio 缓冲区里的内容全部丢失。若用静态 FILE* 攒着写，
+ * 「最后一行 = 崩溃点」这个判据就不成立 —— 崩溃前的几行反而会丢。
+ * 所以每条追踪都走完整的一次 fopen/fprintf/fclose：close 返回时数据
+ * 已交给内核，进程再崩也不影响已写入的内容。
+ *
+ * ═══ 为什么格式是 [NCG-TRACE] 前缀 ═══
+ *
+ * 用户在日志里 grep 这一个词就能拿到完整执行轨迹，与自检报告的
+ * 段表混在同一文件里也不影响阅读。
+ *
+ * ═══ 开销 ═══
+ *
+ * 每次约 20~50us（一次 open+write+close）。解锁链一共 12 个阶段，
+ * 合计 <1ms，相对于解锁本身的文件读取可忽略。
+ * 未开哨兵时 getenv/access 立即返回，零开销。
+ */
+
+/* 三个对外入口都是定参函数，不能对它们用 va_start（C 要求最后一个
+ * 形参是省略号）。所以拆成两层：对外入口先格式化成字符串，再交给
+ * 不带可变参数的 rp_trace_line。 */
+static void rp_trace_line(const char *stage, const char *payload) {
+    char path[512];
+    FILE *fp;
+    struct timeval tv;
+    struct tm tmv;
+
+    if (!stage) return;
+    if (ncg_debug_log_path(path, sizeof(path)) != 0) return;
+
+    fp = fopen(path, "a");
+    if (!fp) return;
+
+    gettimeofday(&tv, NULL);
+    {
+        char ts[16];
+        if (localtime_r(&tv.tv_sec, &tmv))
+            strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+        else
+            ts[0] = '\0';
+        fprintf(fp, "[NCG-TRACE] %s.%03d  %s", ts,
+                (int)(tv.tv_usec / 1000), stage);
+    }
+    if (payload && *payload) fprintf(fp, " %s", payload);
+    fputc('\n', fp);
+    fclose(fp);      /* ⚠️ 必须 close：崩溃时缓冲区内容会丢 */
+}
+
+void ncg_trace(const char *stage) {
+    rp_trace_line(stage, NULL);
+}
+
+void ncg_trace_i(const char *stage, long long v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "=%lld", v);
+    rp_trace_line(stage, buf);
+}
+
+void ncg_trace_s(const char *stage, const char *s) {
+    char buf[384];
+    /* 不直接传 s 给 %s：调用方可能传未终止或超长的缓冲 */
+    snprintf(buf, sizeof(buf), "=%.350s", s ? s : "(null)");
+    rp_trace_line(stage, buf);
+}
+

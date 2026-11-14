@@ -1126,13 +1126,39 @@ __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 int ncg_head_unlock(const void *self_addr) {
     void *base;
     char so_path[512];
-    if (ncg_resolve_self(self_addr, &base, so_path, sizeof(so_path)) != 0) return -1;
+
+    /* ── 阶段追踪（2026-11-14）───────────────────────────────────────
+     *
+     * 每个阶段【一进入】就写一行到磁盘并 close。崩在第 N 步，磁盘上就
+     * 有前 N-1 步的记录，最后一行即崩溃点（详见 nc_guard_internal.h 的
+     * ncg_trace 注释）。
+     *
+     * ⚠️ 追踪点只加在【分支入口】和【失败返回前】，不加在每条语句前 ——
+     *    后者会让日志淹没在噪音里，反而看不出阶段边界。 */
+    ncg_trace("U1 resolve_self 进入");
+    if (ncg_resolve_self(self_addr, &base, so_path, sizeof(so_path)) != 0) {
+        ncg_trace("U1 FAIL resolve_self（拿不到 so 路径与基址）");
+        return -1;
+    }
+    ncg_trace_s("U1 OK so_path", so_path);
 
     ncg_shdr_t sec, slot;
-    if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) return -2;
-    if (ncg_find_section(so_path, NC_SEC_SLOT, &slot) != 0) return -3;
-    if (sec.size == 0) return -4;
-    if ((sec.flags & SHF_ALLOC) == 0) return -5;
+    if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) {
+        ncg_trace_s("U2 FAIL 找不到段", NC_SEC_CODE);
+        return -2;
+    }
+    if (ncg_find_section(so_path, NC_SEC_SLOT, &slot) != 0) {
+        ncg_trace_s("U3 FAIL 找不到段", NC_SEC_SLOT);
+        return -3;
+    }
+    if (sec.size == 0) {
+        ncg_trace("U4 FAIL .ncx 段大小为 0");
+        return -4;
+    }
+    if ((sec.flags & SHF_ALLOC) == 0) {
+        ncg_trace_i("U5 FAIL .ncx 不可分配(flags)", (long long)sec.flags);
+        return -5;
+    }
 
     uint8_t slotdata[NC_SLOT_SIZE];
     /* scrbuf：probe（8B）与 dec（96B）共用的暂存区，两者作用域不重叠。
@@ -1140,10 +1166,16 @@ int ncg_head_unlock(const void *self_addr) {
     uint8_t scrbuf[NC_SLOT_SIZE];
     memset(slotdata, 0, sizeof(slotdata));
     int fd = open(so_path, O_RDONLY);
-    if (fd < 0) return -6;
+    if (fd < 0) {
+        ncg_trace("U6 FAIL open(so_path) 失败");
+        return -6;
+    }
     ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.offset);
     close(fd);
-    if (got < 32) return -7;
+    if (got < 32) {
+        ncg_trace_i("U7 FAIL pread(.nck) 读到的字节数", (long long)got);
+        return -7;
+    }
 
     /* ── T4（2026-10-28）：.nck 已加密，先解密 ──────────────────────
      * .nck 整段（96 字节）在锁箱时被 boot_key 加密（见 _encrypt_slots）。
@@ -1170,6 +1202,7 @@ int ncg_head_unlock(const void *self_addr) {
             }
         }
     }
+    ncg_trace_i("U8 锁箱状态(1=已锁 0=未锁)", (long long)so_locked);
     if (so_locked && slot.size >= NC_SLOT_SIZE) {
         /* 2026-11-12：原先这里再调一次 dladdr(&ncg_head_unlock) ——
          * 那是本函数内的第二次「取自身地址」，会让 Amice 判定
@@ -1177,10 +1210,13 @@ int ncg_head_unlock(const void *self_addr) {
          * 而 so_path / base 在本函数开头已由 ncg_resolve_self 得到，
          * 直接复用即可，语义完全相同（同一 so，同一基址）。 */
         uint8_t bk2[16];
+        ncg_trace("U9 派生 boot_key 进入");
         if (ncg_boot_key(so_path, (uintptr_t)base, bk2) != 0) {
             ncg_wipe(bk2, sizeof(bk2));
+            ncg_trace("U9 FAIL boot_key 派生失败（fail-closed -12）");
             return -12;   /* fail-closed */
         }
+        ncg_trace("U9 OK boot_key 已派生");
         {
             ncg_rc4(bk2, 16, slotdata, scrbuf, NC_SLOT_SIZE);
             memcpy(slotdata, scrbuf, NC_SLOT_SIZE);
@@ -1189,8 +1225,10 @@ int ncg_head_unlock(const void *self_addr) {
         ncg_wipe(bk2, sizeof(bk2));
     }
     if (!ncg_magic_ok(slotdata, NCG_MAGIC_SEED_SLOT)) {
+        ncg_trace("U10 未锁箱（magic 不匹配）→ 直接返回 0");
         return 0;   /* 未锁，无需解锁 */
     }
+    ncg_trace("U10 已确认锁箱，进入解锁流程");
 
     /* ── 槽完整性（fail-open 修复）
      *
@@ -1258,21 +1296,28 @@ int ncg_head_unlock(const void *self_addr) {
             /* 未锁箱：走原来的路径（.ncx 本就是明文，不需要解密密钥），
              * 但也不应把全零 master 当成"有效派生源"去算 —— 直接返回 0
              * 让上层走"未锁"分支（magic 不匹配时本就返回 0）。 */
+            ncg_trace("U11 master 全零（未锁箱）→ 返回 0");
             return 0;
         }
+        ncg_trace("U11 master 非零，继续派生");
     }
     /* 2026-11-12：拆成独立函数（降寄存器压力）。两条污染纪律不变。 */
     {
         uint8_t k_cert[16];
+        ncg_trace("U12 派生 k_so 进入（读证书+包名）");
         if (ncg_derive_kso_bound(so_path, master, der_buf, &der_len,
                                  pkg_buf, sizeof(pkg_buf), slotdata, k_cert) != 0) {
             ncg_wipe(k_cert, sizeof(k_cert));
             ncg_wipe(key, sizeof(key));
             memset(slotdata, 0, sizeof(slotdata));
+            /* 最常撞见的失败：证书与产物不匹配（换 key 重签）、
+             * 包名不匹配（改了 applicationId） */
+            ncg_trace("U12 FAIL k_so 派生失败 —— 证书/包名不匹配（fail-closed -12）");
             return -12;   /* fail-closed：证书/包名任一不可得 */
         }
         memcpy(key, k_cert, 16);
         ncg_wipe(k_cert, sizeof(k_cert));
+        ncg_trace("U12 OK k_so 已派生");
     }
 
 
@@ -1331,25 +1376,36 @@ int ncg_head_unlock(const void *self_addr) {
 
     /* 完整性校验：先验后解（位置在 mprotect/解密之前）。
      * 2026-11-12：拆成独立函数（降 alloca）。⚠️ 时序不变。 */
+    ncg_trace_i("U13 待校验段数", (long long)nseg);
     {
         int mrc = ncg_verify_seg_mac(master, der_buf, der_len, pkg_buf,
                                      segs, nseg, base, slotdata);
         if (mrc != 0) {
             ncg_wipe(key, sizeof(key));
             if (mrc == -12) memset(slotdata, 0, sizeof(slotdata));
+            /* -11 = MAC 不符（段内容/段序与锁箱侧不一致）
+             * -12 = 派生失败（证书/包名） */
+            ncg_trace_i("U14 FAIL 段完整性校验 rc", (long long)mrc);
             return mrc;
         }
+        ncg_trace("U14 OK 段完整性校验通过（MAC 一致）");
     }
 
     /* 2026-11-12：拆成独立函数（降 alloca）。逐段解密+权限+基线都在里面。 */
     {
+        ncg_trace("U15 逐段解密进入");
         int drc = ncg_decrypt_segments(so_path, base, master, der_buf, der_len,
                                        pkg_buf, segs, nseg, has_nct, has_ncq,
                                        key);
-        if (drc != 0) return drc;
+        if (drc != 0) {
+            ncg_trace_i("U15 FAIL 逐段解密 rc", (long long)drc);
+            return drc;
+        }
+        ncg_trace("U15 OK 所有段已解密");
     }
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
     ncg_unlocked = 1;
+    ncg_trace("U16 解锁完成（ncg_unlocked=1）");
 
     /* 用后即毁已挪至 ncguard_unlock（.text 侧）——第一版放在这里
      * （ncg_head_unlock 尾部）是错的：PC 还在本段执行时把自己置零

@@ -146,5 +146,32 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
 /* 追加写入日志文件。哨兵不存在 / 任何 I/O 失败 → 返回 -1，调用方忽略。 */
 int ncg_report_flush(const char *buf, size_t len);
 
+/* ── 阶段追踪（2026-11-14）────────────────────────────────────────────
+ *
+ * 解决什么问题：崩溃时看不到任何日志。
+ *
+ * 此前报告只在 ncg_head_unlock 返回后生成一次 —— 如果解锁过程本身崩了
+ * （SIGSEGV/SIGILL/SIGABRT），那个函数永远不返回，报告永远不写，用户
+ * 只看到"App 闪退"三个字，不知道炸在哪一步。
+ *
+ * 用户原话：「我肯定还是想要运行流程的，就比如哪里闪退了？我肯定要
+ * 知道是哪个步骤爆炸了」。
+ *
+ * 做法：每个关键阶段【一进入就写一行到磁盘并 fflush+fclose】——
+ * 不能攒着，攒着就等于没写（进程崩了缓冲区全丢）。崩在 N 步，
+ * 磁盘上就有前 N-1 步的记录，最后一行就是崩溃点。
+ *
+ * ⚠️ 每条都独立 open/write/close，不用静态 FILE*：崩溃时静态指针的
+ *    缓冲区内容会丢，而独立开关文件是原子的（write 后 close 即落盘）。
+ * ⚠️ 所有失败静默。追踪本身绝不能成为新的崩溃源。
+ * ⚠️ 只在哨兵文件存在时才写（与报告同一开关）。 */
+void ncg_trace(const char *stage);
+
+/* 带一个整数值的阶段（记录 rc、大小、偏移等），用于排障 */
+void ncg_trace_i(const char *stage, long long v);
+
+/* 带字符串的阶段（记录路径、段名、错误描述） */
+void ncg_trace_s(const char *stage, const char *s);
+
 /* 计算日志文件路径（哨兵 /storage/emulated/0/xixin_debug 存在才算开）。 */
 int ncg_debug_log_path(char *out, size_t cap);
