@@ -724,6 +724,10 @@ int ncg_report_flush(const char *buf, size_t len) {
     if (ncg_debug_log_path(path, sizeof(path)) != 0) return -1;
     fp = fopen(path, "a");
     if (!fp) return -1;
+    /* 显式改成 0644（2026-11-14）：fopen 只在新创建时按 umask 设权限，
+     * 已存在的 -rw------- 文件会一直是私有 —— 上一版追踪用 0600 创建过，
+     * 用户因此打不开日志。这里每次追加都纠一次，升级后自动修好旧文件。 */
+    (void)fchmod(fileno(fp), 0644);
     now = time(NULL);
     if (localtime_r(&now, &tmv)) {
         strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
@@ -802,8 +806,21 @@ static void rp_trace_line(const char *stage, const char *payload) {
     if (n > 0 && n < (int)sizeof(line) - 1) {
         line[n++] = '\n';
         line[n] = '\0';
-        fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        /* ⚠️ 权限必须是 0644 而不是 0600（2026-11-14 修）。
+         *
+         * 第一版写 0600，结果追踪作为【第一个】写文件的人，用 0600 创建了
+         * 日志 → 后续报告 fopen 追加时继承已有权限 → 用户在手机文件管理器
+         * 和 adb 里都打不开这个文件（纯文本文件不需要任何保密性，
+         * 里面的段名/大小/熵都是公开信息）。
+         *
+         * 与 fopen("a") 的默认行为对齐：fopen 走 umask(022) → 0644。 */
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
+            /* 文件已存在时 open 的 mode 参数被忽略 —— 上一版用 0600 创建的
+             * 日志会一直是 -rw-------。显式改回 0644，让升级后能自动修好
+             * 用户机器上的旧文件，不用手动删。
+             * ⚠️ fchmod 失败不影响写入（可能是不支持 chmod 的挂载点）。 */
+            (void)fchmod(fd, 0644);
             /* write 后立即 close：崩溃时内核里已落盘的内容不会丢 */
             (void)!write(fd, line, (size_t)n);
             close(fd);
