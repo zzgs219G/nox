@@ -175,64 +175,119 @@ int ncg_report_flush(const char *buf, size_t len);
  *
  * ⚠️ ID 顺序必须与 gen-trace.py 的 STAGES 严格一致。
  *    改动任何一条都要重跑生成器并同步下方枚举。 */
+/* 枚举定义在 nc_guard_report.c 顶部的生成区块（由 gen-trace.py 产出），
+ * 这里不重复定义 —— 两处定义会立刻撞名。 */
+
+/* NCG_TR 文案 ID（顺序与 ncg_trace_tab 表一致，同一列表生成）*/
 typedef enum {
-    /* U1 取自身路径与基址 */
     NCG_TR_U1_ENTER = 0,
     NCG_TR_U1_OK_PATH,
     NCG_TR_U1_FAIL,
-    /* U2 找 .ncx */
     NCG_TR_U2_ENTER,
     NCG_TR_U2_OK_SIZE,
     NCG_TR_U2_FAIL,
-    /* U3 找 .nck */
     NCG_TR_U3_ENTER,
     NCG_TR_U3_OK_SIZE,
     NCG_TR_U3_FAIL,
-    /* U4 .ncx 非空 */
     NCG_TR_U4_ENTER,
     NCG_TR_U4_OK,
     NCG_TR_U4_FAIL,
-    /* U5 .ncx 可分配 */
     NCG_TR_U5_ENTER,
     NCG_TR_U5_OK,
     NCG_TR_U5_FAIL,
-    /* U6 打开 so */
     NCG_TR_U6_ENTER,
     NCG_TR_U6_OK_FD,
     NCG_TR_U6_FAIL,
-    /* U7 读密钥槽 */
     NCG_TR_U7_ENTER,
     NCG_TR_U7_OK_BYTES,
     NCG_TR_U7_FAIL,
-    /* U8 锁箱判定 */
     NCG_TR_U8_ENTER,
     NCG_TR_U8_STATE,
-    /* U9 派生 boot_key */
     NCG_TR_U9_ENTER,
     NCG_TR_U9_OK_BK,
     NCG_TR_U9_FAIL,
-    /* U10 magic */
     NCG_TR_U10_UNLOCKED,
     NCG_TR_U10_LOCKED,
-    /* U11 master */
     NCG_TR_U11_ZERO,
     NCG_TR_U11_NONZERO,
-    /* U12 派生 k_so */
     NCG_TR_U12_ENTER,
     NCG_TR_U12_OK_KSO,
     NCG_TR_U12_FAIL,
-    /* U13 段数 */
     NCG_TR_U13_NSEG,
-    /* U14 MAC */
     NCG_TR_U14_OK,
     NCG_TR_U14_FAIL,
-    /* U15 逐段解密 */
     NCG_TR_U15_ENTER,
     NCG_TR_U15_OK,
     NCG_TR_U15_FAIL,
-    /* U16 完成 */
-    NCG_TR_U16_DONE
-} ncg_trace_id;
+    NCG_TR_U16_DONE,
+} ncg_tr;
+
+/* RPT 文案 ID（顺序与 ncg_report_tab 表一致，同一列表生成）*/
+typedef enum {
+    RPT_TITLE = 0,
+    RPT_LEGEND,
+    RPT_UNLOCK_OK,
+    RPT_UNLOCK_FAIL,
+    RPT_FAIL_MAC,
+    RPT_FAIL_KSO,
+    RPT_FAIL_MPROT,
+    RPT_FAIL_SLOT,
+    RPT_FAIL_NOMEM,
+    RPT_ENT_HDR,
+    RPT_ENT_HINT,
+    RPT_SEG_HDR,
+    RPT_SEG_SEP,
+    RPT_SEG_ABSENT,
+    RPT_SEG_TINY,
+    RPT_SEG_ROW,
+    RPT_VMP_HDR,
+    RPT_VMP_N,
+    RPT_VMP_OFF,
+    RPT_VMP_TBL,
+    RPT_VMP_SEP,
+    RPT_VMP1,
+    RPT_VMP1_OFF,
+    RPT_VMP2,
+    RPT_VMP2_OFF,
+    RPT_VMP_NOEXEC,
+    RPT_SZ_HDR,
+    RPT_SZ_NOX,
+    RPT_SZ_VMP,
+    RPT_SZ_BIZ,
+    RPT_SZ_BASE,
+    RPT_SZ_TOTAL,
+    RPT_SZ_NOTE,
+    RPT_CONCL_HDR,
+    RPT_CONCL_OK,
+    RPT_CONCL_UNK,
+    RPT_CONCL_BAD,
+    RPT_CONCL_BAD2,
+    RPT_END,
+    RPT_V_READFAIL,
+    RPT_V_DECRYPTED,
+    RPT_V_STILL_ENC,
+    RPT_V_PLAIN_DATA,
+    RPT_V_HIGH_ENT,
+    RPT_V_CIPHER,
+    RPT_V_NOT_ENC,
+    RPT_V_ENC_LOCKED,
+    RPT_V_PLAIN_INHERENT,
+    RPT_V_DISK_PLAIN,
+    RPT_T_EMPTY,
+    RPT_T_UNREADABLE,
+    RPT_T_PLAIN,
+    RPT_T_CIPHER,
+    RPT_ROLE_CODE,
+    RPT_ROLE_VMP2,
+    RPT_ROLE_BC2,
+    RPT_ROLE_VMP1,
+    RPT_ROLE_BC1,
+    RPT_ROLE_TBL1,
+    RPT_ROLE_CONST,
+    RPT_ROLE_HEAD,
+    RPT_ROLE_MASTER,
+} rpt;
+
 
 void ncg_trace(int id);
 
