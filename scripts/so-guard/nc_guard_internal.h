@@ -123,7 +123,6 @@ void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg, uint8_t fault[8]);
  *    在 VMP 文件里会因寄存器预算超限被跳过并刷告警日志。 */
 int ncg_scan_maps_for_base_apk(const char *maps_path, char *out, size_t cap);
 
-#endif /* _NC_GUARD_INTERNAL_H_ */
 
 
 /* ── 自检报告（2026-11-13，nc_guard_report.c）─────────────────────────
@@ -154,24 +153,96 @@ int ncg_report_flush(const char *buf, size_t len);
  * （SIGSEGV/SIGILL/SIGABRT），那个函数永远不返回，报告永远不写，用户
  * 只看到"App 闪退"三个字，不知道炸在哪一步。
  *
- * 用户原话：「我肯定还是想要运行流程的，就比如哪里闪退了？我肯定要
- * 知道是哪个步骤爆炸了」。
- *
- * 做法：每个关键阶段【一进入就写一行到磁盘并 fflush+fclose】——
+ * 做法：每个关键阶段【一进入就写一行到磁盘并 close】——
  * 不能攒着，攒着就等于没写（进程崩了缓冲区全丢）。崩在 N 步，
  * 磁盘上就有前 N-1 步的记录，最后一行就是崩溃点。
+ *
+ * ⚠️⚠️ 参数是【文案 ID】不是字符串（2026-11-14 改）：
+ *
+ *    旧签名 ncg_trace("U9 OK boot_key") 会把中文写进 .rodata，
+ *    `strings` 一条命令就能拿到完整解锁流程（U1→U2→U3→U6→U7→U9→
+ *    U11→U12→U14→U15）—— 等于送出一份解锁说明书。
+ *
+ *    现在只传 ID，文案在构建期被 gen-trace.py 加密成密文数组
+ *    （与 nc_guard_paths.c 同一套机制），运行期解码后再写日志。
+ *    买到的是「strings 扫不到路标词」，不是「不可还原」——
+ *    key 与算法都在源码里，反汇编就能解。如实标注。
  *
  * ⚠️ 每条都独立 open/write/close，不用静态 FILE*：崩溃时静态指针的
  *    缓冲区内容会丢，而独立开关文件是原子的（write 后 close 即落盘）。
  * ⚠️ 所有失败静默。追踪本身绝不能成为新的崩溃源。
- * ⚠️ 只在哨兵文件存在时才写（与报告同一开关）。 */
-void ncg_trace(const char *stage);
+ * ⚠️ 只在哨兵文件存在时才写（与报告同一开关）。
+ *
+ * ⚠️ ID 顺序必须与 gen-trace.py 的 STAGES 严格一致。
+ *    改动任何一条都要重跑生成器并同步下方枚举。 */
+typedef enum {
+    /* U1 取自身路径与基址 */
+    NCG_TR_U1_ENTER = 0,
+    NCG_TR_U1_OK_PATH,
+    NCG_TR_U1_FAIL,
+    /* U2 找 .ncx */
+    NCG_TR_U2_ENTER,
+    NCG_TR_U2_OK_SIZE,
+    NCG_TR_U2_FAIL,
+    /* U3 找 .nck */
+    NCG_TR_U3_ENTER,
+    NCG_TR_U3_OK_SIZE,
+    NCG_TR_U3_FAIL,
+    /* U4 .ncx 非空 */
+    NCG_TR_U4_ENTER,
+    NCG_TR_U4_OK,
+    NCG_TR_U4_FAIL,
+    /* U5 .ncx 可分配 */
+    NCG_TR_U5_ENTER,
+    NCG_TR_U5_OK,
+    NCG_TR_U5_FAIL,
+    /* U6 打开 so */
+    NCG_TR_U6_ENTER,
+    NCG_TR_U6_OK_FD,
+    NCG_TR_U6_FAIL,
+    /* U7 读密钥槽 */
+    NCG_TR_U7_ENTER,
+    NCG_TR_U7_OK_BYTES,
+    NCG_TR_U7_FAIL,
+    /* U8 锁箱判定 */
+    NCG_TR_U8_ENTER,
+    NCG_TR_U8_STATE,
+    /* U9 派生 boot_key */
+    NCG_TR_U9_ENTER,
+    NCG_TR_U9_OK_BK,
+    NCG_TR_U9_FAIL,
+    /* U10 magic */
+    NCG_TR_U10_UNLOCKED,
+    NCG_TR_U10_LOCKED,
+    /* U11 master */
+    NCG_TR_U11_ZERO,
+    NCG_TR_U11_NONZERO,
+    /* U12 派生 k_so */
+    NCG_TR_U12_ENTER,
+    NCG_TR_U12_OK_KSO,
+    NCG_TR_U12_FAIL,
+    /* U13 段数 */
+    NCG_TR_U13_NSEG,
+    /* U14 MAC */
+    NCG_TR_U14_OK,
+    NCG_TR_U14_FAIL,
+    /* U15 逐段解密 */
+    NCG_TR_U15_ENTER,
+    NCG_TR_U15_OK,
+    NCG_TR_U15_FAIL,
+    /* U16 完成 */
+    NCG_TR_U16_DONE
+} ncg_trace_id;
+
+void ncg_trace(int id);
 
 /* 带一个整数值的阶段（记录 rc、大小、偏移等），用于排障 */
-void ncg_trace_i(const char *stage, long long v);
+void ncg_trace_i(int id, long long v);
 
 /* 带字符串的阶段（记录路径、段名、错误描述） */
-void ncg_trace_s(const char *stage, const char *s);
+void ncg_trace_s(int id, const char *s);
 
 /* 计算日志文件路径（哨兵 /storage/emulated/0/xixin_debug 存在才算开）。 */
 int ncg_debug_log_path(char *out, size_t cap);
+
+#endif /* _NC_GUARD_INTERNAL_H_ */
