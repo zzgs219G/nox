@@ -776,112 +776,85 @@ else
         #       报告对 <512B 的段会显示"样本不足"，不参与判定。
         #    ⚠️ 这条曾是真 bug：第一版从【文件】读熵，而解锁后的明文在
         #       【内存】里，导致解锁成功的包把已解密段报成"仍是密文"。
-        if grep -q '\.ncxh .*OK 已解密' "$RLOG"; then
+        if grep -qE '\| `\.ncxh` \|.*✅ 已解密' "$RLOG"; then
             ok "V12b .ncxh 判定为已解密（熵判据读内存，正确）"
-        elif grep -q '\.ncxh .*XX 仍是密文' "$RLOG"; then
+        elif grep -qE '\| `\.ncxh` \|.*❌ 仍是密文' "$RLOG"; then
             bad "V12b .ncxh 被误报为密文 —— 报告读的是文件而非内存"
-            grep '\.ncxh ' "$RLOG" | head -2
+            grep '`\.ncxh`' "$RLOG" | head -2
         else
             bad "V12b .ncxh 判定缺失"
-            grep '\.ncxh ' "$RLOG" | head -2
+            grep '`\.ncxh`' "$RLOG" | head -2
         fi
 
-        # ⑥ 段表对齐：所有段的"判定"列必须落在同一显示列。
-        #    ⚠️ 这条是给"排版"建的断言 —— 我在这张表上连错四次
-        #    （手写空格 / %-10s 按字节 / rp_pad 累加起点 / ASCII 表头），
-        #    每次都是"以为算对了"。机器检查比人眼可靠。
+        # ⑥ 段表格式：Markdown 表格要求每行以 `| ` 开头且列数一致。
+        #    2026-11-14 改：此前用手工补空格的定宽文本，断言验"判定列
+        #    是否落在同一显示列"。但用户反馈在手机上看永远是歪的 ——
+        #    根因是中文宽度取决于渲染字体，本文件按 2 列补而查看器可能
+        #    按 1 列渲染。改用 Markdown 后列宽交给渲染器，只需验结构。
         if python3 - "$RLOG" <<'PYALIGN'
 import sys
-def col(s):
-    w = 0
-    for ch in s:
-        w += 2 if ord(ch) > 0x2E80 else 1
-    return w
-cols = []
-for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
-    if not line.startswith('.nc'):
-        continue
-    for marker in ('OK ', 'XX ', '! ', '- '):
-        i = line.rfind(marker)
-        if i > 20:
-            cols.append(col(line[:i]))
-            break
-sys.exit(0 if len(set(cols)) == 1 else 1)
+rows = [l.rstrip('\n') for l in
+        open(sys.argv[1], encoding='utf-8', errors='replace')]
+seg = [l for l in rows if l.startswith('| `')]
+if len(seg) < 3:
+    sys.exit(1)                      # 段表行太少，结构不对
+# 每行必须是 7 列（首尾各一个空列 + 6 个字段）
+bad = [l for l in seg if l.count('|') != 7]
+sys.exit(0 if not bad else 1)
 PYALIGN
         then
-            ok "V12f 段表判定列对齐（所有行同一显示列）"
+            ok "V12f 段表为合法 Markdown 表格（每行 7 竖线）"
         else
-            bad "V12f 段表判定列未对齐 —— 改过 rp_seg 的格式串？"
-            grep '^\.nc' "$RLOG" | head -4
+            bad "V12f 段表不是合法 Markdown 表格 —— 检查 rp_seg 的格式串"
+            grep '^| `' "$RLOG" | head -4
         fi
 
         # ⑤ 小样本保护：.ncx 196B < 512B，必须显示"样本不足"而不是乱给判定
         #    这条钉住的是"宁可不判，也不给错结论"。
-        if grep -q '\.ncx .*样本不足' "$RLOG"; then
+        if grep -qE '\| `\.ncx` \|.*样本不足' "$RLOG"; then
             ok "V12e 小样本不下结论（.ncx 196B → 样本不足）"
         else
             bad "V12e 小样本给了熵判定 —— 会误导（曾把密文报成已解密）"
-            grep '\.ncx ' "$RLOG" | head -2
+            grep '`\.ncx`' "$RLOG" | head -2
         fi
 
         # ③ VMP 套数：本测试构建【没有】VMP，必须报 0 且不误报
-        # 格式："  套数  0"（v2 排版改了分隔符，断言跟着改）
-        if grep -qE '套数[[:space:]]+0' "$RLOG"; then
+        # 格式（2026-11-14 改 Markdown）：**套数**：0
+        if grep -qE '套数\*\*[:：][[:space:]]*0' "$RLOG"; then
             ok "V12c VMP 套数判定正确（本构建无 VMP → 0）"
         else
             bad "V12c VMP 套数判定错误（本构建无 VMP，应为 0）"
-            grep -A2 '^VMP' "$RLOG" | head -3
+            grep -A2 '## VMP' "$RLOG" | head -3
         fi
 
         # ④ 权限列：ELF64 的 flags 偏移曾读成 type（@4 而非 @8），
         #    导致 .ncx 显示 '-w-'。这里钉死必须是 r-x。
-        # ⑧ 表头必须与数据行列位一致（2026-11-14 加）
-        #    ⚠️ 为什么单列一条：V12f 只验"判定列所有行同一位置"，
-        #       它抓不到"表头与数据行错位" —— 表头是独立的字面量行，
-        #       不在那段检查范围内。本轮实测：表头列位 [0,16,24,34,38,59]
-        #       而数据行 [0,13,21,27,34,52]，V12f 照样通过。
+        # ⑧ 表头与数据行列数一致（2026-11-14 改 Markdown）
+        #    ⚠️ 此前验"表头与数据行的列位逐个相等"，因为定宽文本靠补
+        #       空格对齐。改 Markdown 后列宽由渲染器决定，只需验
+        #       「表头行与数据行列数相同」—— 列数不同才会渲染错位。
         if python3 - "$RLOG" <<'PYHEAD'
 import sys
-def col(s):
-    return sum(2 if ord(c) > 0x2E80 else 1 for c in s)
-rows = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8', errors='replace')]
-head = next((r for r in rows if r.startswith('段名')), None)
-data = next((r for r in rows if r.startswith('.nc') and ' r-' in r), None)
+rows = [l.rstrip('\n') for l in
+        open(sys.argv[1], encoding='utf-8', errors='replace')]
+head = [l for l in rows if l.startswith('| 段名')]
+data = [l for l in rows if l.startswith('| `')]
 if not head or not data:
     sys.exit(1)
-
-# 只比【左对齐列】的起点：段名、权限、用途、判定。
-# ⚠️ 大小和熵是右对齐（%9llu / %6.3f），起点随数字位数变化，
-#    拿起点比必然误报 —— 本轮实测 .ncx 那行是 196（3 位）时起点 11，
-#    104200（6 位）时起点 8。右对齐列应比【结束位置】。
-hw = ('段名', '权限', '用途', '判定')
-hpos = [col(head[:head.index(w)]) for w in hw]
-
-perm_i = data.index(' r-') + 1
-dpos = [col(data[:data.index(data.split()[0])]),   # 段名
-        col(data[:perm_i])]                         # 权限
-# 用途：权限后跳过熵值，找第一段中文
-import re
-m = re.search(r'[\u4e00-\u9fff]', data)
-dpos.append(col(data[:m.start()]) if m else -1)
-# 判定：找 OK/XX/!
-m2 = re.search(r'(OK |XX |!  |   明|   密)', data)
-dpos.append(col(data[:m2.start()]) if m2 else -1)
-
-sys.exit(0 if hpos == dpos else 1)
+sys.exit(0 if all(l.count('|') == head[0].count('|') for l in data) else 1)
 PYHEAD
         then
-            ok "V12i 表头与数据行列位一致"
+            ok "V12i 表头与数据行列数一致"
         else
-            bad "V12i 表头与数据行错位 —— 改过 rp_seg 格式串或表头字面量？"
-            grep -E '^段名|^\.nc' "$RLOG" | head -3
+            bad "V12i 表头与数据行列数不同 —— Markdown 会渲染错位"
+            grep -E '^\| 段名|^\| `' "$RLOG" | head -3
         fi
 
-        if grep -q '\.ncx .* r-x' "$RLOG"; then
+        if grep -qE '\| `\.ncx` \| [0-9.]+ [KMB]*B? ?\| r-x \|' "$RLOG"; then
             ok "V12d 段权限解析正确（.ncx = r-x）"
         else
             bad "V12d 段权限解析错误（.ncx 应为 r-x）—— ELF64 flags 偏移查一遍"
-            grep '\.ncx ' "$RLOG" | head -2
+            grep '`\.ncx`' "$RLOG" | head -2
         fi
 
         # ⑦ 体积归因（2026-11-14）：报告必须按【组】汇总而不是只平铺段。

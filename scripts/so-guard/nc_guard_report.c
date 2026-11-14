@@ -342,28 +342,44 @@ static void rp_pad(rp_ctx *c, const char *s, int width) {
     while (w < width) { rp_puts(c, " "); w++; }
 }
 
-/* 一行"段体检"
+/* 体积归因的单一行格式（2026-11-14）：保证组名/明细/合计三类的
+ * 数字与 "B" 落在同一列。
+ *
+ * 列位：2 空格 | indent | 名称 12 显示列 | 右对齐数字 10 列 | " B"
+ *
+ * ⚠️ 名称列必须走 rp_pad（按显示列，中文算 2）而不是 snprintf("%-12s")：
+ *    后者按【字节】补，中文 3 字节/2 列，混排必歪 —— 本文件反复踩的坑。
+ * ⚠️ 数字右对齐：体积从个位数到七位数都有，左对齐看不出量级差。
+ *    右对齐时起点随位数变化是【正确】行为，比的是末位对齐。 */
+/* 体积归因的单行（Markdown 表格行，2026-11-14 改）。
+ *
+ * 缩进用 Markdown 的 `&nbsp;` 表达层级（渲染后仍是真正的缩进），
+ * 而不是靠补空格 —— 与段表同一理由：中文宽度不可控。
+ */
+static void _rp_size_row(rp_ctx *c, int depth,
+                         const char *label, unsigned long long bytes) {
+    const char *ind = (depth > 0) ? "&nbsp;&nbsp;&nbsp;&nbsp;" : "";
+    rp_fmt(c, "| %s%s | %llu B |\n", ind, label, bytes);
+}
+
+/* 一行"段体检" —— Markdown 表格行（2026-11-14 改）
  *
  * expect:  1 = 应已解密（熵 < 7.5）  2 = 应为纯数据（熵 < 7.0）
- *          0 = 任意（只报告不判定）  -1 = 应为密文（熵 >= 7.5）
+ *          0 = 任意   -1 = 应为密文（熵 >= 7.5）
  *
- * ═══ 列定义（2026-11-14 重写，全部左对齐）═══════════════════════════
+ * ═══ 为什么改成 Markdown 表格 ═══
  *
- *   段名 10 | 大小 11 | 权限 4 | 熵 6 | VMP 4 | 用途 18 | 判定
+ * 此前用手工补空格的定宽文本，用户在手机上看永远是歪的 ——
+ * 根因是**中文宽度取决于渲染字体**：本文件按「中文 = 2 显示列」补，
+ * 而用户的查看器按 1 列渲染时，每一列都错位。这个假设我控制不了，
+ * 也没法在本地复现（本地算和本地看用的是同一套假设）。
  *
- * ⚠️ 为什么全部左对齐：此前「大小」用 %9llu 右对齐，导致 6760 和
- *    104200 的起始列不同（13 vs 15），用户看到的就是"歪"。
- *    右对齐只在纯数字表格里有意义（方便比大小），而这张表每行还有
- *    四个文字列 —— 混排时右对齐反而破坏整体的左边缘。
+ * 改用 Markdown 表格后：列宽由渲染器决定，源码里只写 `| a | b |`，
+ * 中文宽度的不确定性被彻底消掉。
  *
- * ⚠️ 为什么大小显示 KB 而不是裸字节：段大小动辄十几万字节，人眼换算
- *    KB 每次都要数位数。日志要扫一眼就懂。
- *
- * ⚠️ 为什么加 VMP 列：此前「到底有没有被 VMP」要看下方 VMP 小节 + 自己
- *    对照段名才知道。现在每行直接标 ✓（该段是 VM 产物）或 -（不是）。
- *
- * ⚠️ 压缩后大小不在这里：报告在运行期读 so 文件，那时它已被系统加载，
- *    拿不到 APK 内的 zlib 压缩体积。压缩后大小由构建期日志提供。 */
+ * ⚠️ 单元格内容不能含 `|`（会破坏表格结构）。段名/用途都是固定字面量，
+ *    已确认无 `|`；熵值与权限也不会产生。
+ */
 static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
                    const char *name, const char *role, int expect,
                    int *unknown_p, int is_vmp) {
@@ -373,47 +389,37 @@ static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
     const char *flag = "—";
     char szbuf[32];
 
-    rp_pad(c, name, 10);
-
     if (rp_read_shdr(so_path, name, &sg) != 0) {
-        /* 段不存在：所有列用 "-" 占位，仍走 rp_pad 保证列宽 */
-        rp_pad(c, "-", 11);
-        rp_pad(c, "-", 5);
-        rp_pad(c, "-", 6);
-        rp_pad(c, is_vmp ? "Y" : "-", 4);
-        rp_pad(c, role, 18);
-        rp_puts(c, "- 段不存在\n");
+        rp_fmt(c, "| `%s` | - | - | - | %s | - 段不存在 |\n", name,
+               is_vmp ? "✅" : "—");
         return;
     }
 
     rp_fmt_size(szbuf, sizeof(szbuf), (unsigned long long)sg.size);
-    rp_pad(c, szbuf, 11);
-    rp_pad(c, rp_perm(sg.flags), 5);
     h = rp_seg_entropy(so_path, &sg, img_base);
     d = (h >= 0) ? rp_fx2d(h) : -1.0;
-    if (h >= 0) {
-        char ebuf[16];
-        snprintf(ebuf, sizeof(ebuf), "%.3f", d);
-        rp_pad(c, ebuf, 6);
-    } else {
-        rp_pad(c, "-", 6);
-    }
-    rp_pad(c, is_vmp ? "Y" : "-", 4);
-    rp_pad(c, role, 18);
+
+    /* 熵列：无法计算时写 "-"，避免混入无意义的 0.000 */
+    char ebuf[16];
+    if (h >= 0) snprintf(ebuf, sizeof(ebuf), "%.3f", d);
+    else        snprintf(ebuf, sizeof(ebuf), "-");
 
     /* 小样本不下结论（见文件头③） */
     if (h >= 0 && sg.size < 512) {
-        rp_puts(c, "!  样本不足\n");
+        rp_fmt(c, "| `%s` | %s | %s | %s | %s | ⚠️ 样本不足 |\n",
+               name, szbuf, rp_perm(sg.flags), ebuf, is_vmp ? "✅" : "—");
         (*unknown_p)++;
         return;
     }
 
-    if (h < 0)                          flag = "— 无法读取";
-    else if (expect == 1)               flag = (d < 7.5) ? "OK 已解密" : "XX 仍是密文";
-    else if (expect == 2)               flag = (d < 7.0) ? "OK 明文数据" : "!  高熵未解密";
-    else if (expect == -1)              flag = (d >= 7.5) ? "OK 密文" : "XX 未加密";
-    else                                flag = (d >= 7.5) ? "-- 密文" : "-- 明文";
-    rp_fmt(c, "%s\n", flag);
+    if (h < 0)                          flag = "—";
+    else if (expect == 1)               flag = (d < 7.5) ? "✅ 已解密" : "❌ 仍是密文";
+    else if (expect == 2)               flag = (d < 7.0) ? "✅ 明文数据" : "⚠️ 高熵未解密";
+    else if (expect == -1)              flag = (d >= 7.5) ? "✅ 密文" : "❌ 未加密";
+    else                                flag = (d >= 7.5) ? "密文" : "明文";
+
+    rp_fmt(c, "| `%s` | %s | %s | %s | %s | %s |\n",
+           name, szbuf, rp_perm(sg.flags), ebuf, is_vmp ? "✅" : "—", flag);
 }
 
 /* ── 报告正文 ──────────────────────────────────────────────────────── */
@@ -437,76 +443,38 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     has_ncs = (rp_read_shdr(so_path, NC_SEC_VMPTBL, &sg) == 0);
     has_ncw = (rp_read_shdr(so_path, NC_SEC_VMPTBL2, &sg) == 0);
 
-    rp_puts(&c, "===== ncguard 自检 v3 =====\n");
+    rp_puts(&c, "# ncguard 自检 v3\n");
     /* 图例放在最前面 —— 此前用户看到 '!' 和 '结论 OK' 并存，不知道
      * '!' 是什么意思。宁可多占两行，也不要让人猜。 */
-    rp_puts(&c, "符号: OK=通过  XX=有问题  !=无法判断(样本不足)  -=段不存在\n");
+    rp_puts(&c, "\n> 符号：✅ 通过 · ❌ 有问题 · ⚠️ 无法判断（样本不足）· — 段不存在\n");
 
     /* ── 解锁结果（第一眼要看的）────────────────────────────────── */
     if (rc == 0) {
-        rp_fmt(&c, "解锁  OK   %d 段全部解密\n", nseg);
+        rp_fmt(&c, "\n**解锁**：✅ %d 段全部解密\n", nseg);
     } else {
         bad++;
-        rp_fmt(&c, "解锁  XX 失败  rc=%d   %d 段\n", rc, nseg);
-        if (rc == -11) rp_puts(&c, "      → MAC 校验失败。段序或段内容与锁箱侧不一致\n");
-        else if (rc == -12) rp_puts(&c, "      → 密钥派生失败。证书/包名不匹配，或段序错导致钥匙错配\n");
-        else if (rc == -8 || rc == -10) rp_puts(&c, "      → mprotect 失败（页权限/同页可写段）\n");
-        else if (rc == -3) rp_puts(&c, "      → .nck 密钥槽缺失\n");
-        else if (rc == -9) rp_puts(&c, "      → malloc 失败\n");
+        rp_fmt(&c, "\n**解锁**：❌ 失败 rc=%d（%d 段）\n", rc, nseg);
+        if (rc == -11) rp_puts(&c, "\n> ❌ **MAC 校验失败** —— 段序或段内容与锁箱侧不一致\n");
+        else if (rc == -12) rp_puts(&c, "\n> ❌ **密钥派生失败** —— 证书/包名不匹配，或段序错导致钥匙错配\n");
+        else if (rc == -8 || rc == -10) rp_puts(&c, "\n> ❌ **mprotect 失败** —— 页权限/同页可写段\n");
+        else if (rc == -3) rp_puts(&c, "\n> ❌ **密钥槽缺失** —— 找不到 `.nck`\n");
+        else if (rc == -9) rp_puts(&c, "\n> ❌ **内存不足** —— malloc 失败\n");
     }
 
-    /* ── 段表 ────────────────────────────────────────────────────────
-     * ⚠️ 没有表头（2026-11-13 决定）。
+    /* ── 段表（Markdown，2026-11-14 改）────────────────────────────
      *
-     *    试过四种表头写法，全部失败：
-     *      ① 手写空格串         → 数错空格，差 2 格
-     *      ② snprintf %-10s     → 中文 3 字节/2 列，按字节补齐必偏
-     *      ③ rp_pad 按显示列    → 逐列构造时 w 的累加起点算错
-     *      ④ ASCII 表头         → 与数据行的 %9llu 右对齐规则对不上
+     * 此前是手工补空格的定宽文本，为此在本文件里堆了六段"表头怎么对齐"
+     * 的失败记录（手写空格 / %Ns 按字节 / rp_pad 逐列 / ASCII 表头…），
+     * 而用户在手机上看【永远是歪的】。
      *
-     *    而这张表【本来就不需要表头】：每行的第 5 列是中文用途
-     *    （"第二套解释器"/"业务代码+壳"），第 6 列是 OK/XX/! 判定，
-     *    列的含义自解释。表头只是把同一信息用缩写再写一遍。
+     * 根因不在实现，在于前提本身：定宽文本的对齐依赖"中文占 2 显示列"
+     * 这个假设，而它取决于渲染字体。我按 2 算，用户按 1 看，必歪；
+     * 而且本地永远复现不了（本地算和本地看是同一套假设）。
      *
-     *    去掉表头后，对齐只需保证数据行内部一致 —— 那由 rp_seg 的
-     *    单一格式化串保证，不可能错。
-     *
-     *    下面一行是列宽说明，给人看，不参与对齐。 */
-    /* 表头（2026-11-14 加回）。
-     *
-     * ⚠️ 每一个定宽列都必须单独调 rp_pad —— 不能用 snprintf("%9s")
-     *    一次生成多列：C 的 %Ns 按【字节】补齐，中文 3 字节/2 显示列，
-     *    混排时宽度必然算错（本文件 2026-11-13 为此连错四次）。
-     *
-     * 右对齐列（大小/熵）先补前导空格再 rp_pad：数据行用 %9llu / %6.3f
-     * 右对齐，表头必须跟着右对齐才能逐列对上。 */
-    /* 表头：列位置由 rp_seg 的格式串反推（实测：权限@21 熵@27 用途@34
-     * 判定@52）。不手算宽度，直接按目标列位置补空格 —— 手算宽度在这个
-     * 文件上已经错过五次（%Ns 按字节补齐、CJK 占两列两套规则混用）。 */
-    /* 表头：每列的目标【终止】显示列（rp_pad 的第二个参数是"补到总宽
-     * 至少 N 列"，不是"补 N 个空格"）。
-     * 目标位置由 rp_seg 的格式串反推，实测：
-     *   段名[0,10) 大小[10,21) 权限[21,27) 熵[27,34) 用途[34,52) 判定[52..]
-     * 不手算宽度 —— 本文件在这个表上已经错过五次（%Ns 按字节补齐、
-     * CJK 占两列，两套规则混用必偏）。 */
-    /* 表头：直接按数据行的实测列位置拼（权限@21 熵@27 用途@34 判定@52）。
-     *
-     * ⚠️ 不用 rp_pad 逐列补：rp_pad 的语义是"补到总宽至少 N 显示列"，
-     *    而这里需要的是"从当前位置补到绝对列 N"，两者不同 —— 用它
-     *    会算出 20 多列的空格（本轮实测）。
-     * ⚠️ 也绝不用 snprintf("%9s", 中文)：%Ns 按【字节】补齐，中文
-     *    3 字节/2 显示列，混排必偏。本文件为此错过五次。
-     * 所以：把每段写成字面量，空格数由实测列位反推（见下方注释）。
-     *    若将来改了 rp_seg 的格式串，本表头必须同步重算。 */
-    rp_puts(&c, "\n");
-    /*            段名宽10 │ 大小 11 列 │ 权限 6 列 │ 熵 8 列 │ 用途 18 列 */
-    rp_pad(&c, "段名", 10);
-    rp_pad(&c, "大小", 11);
-    rp_pad(&c, "权限", 5);
-    rp_pad(&c, "熵", 6);
-    rp_pad(&c, "VMP", 4);
-    rp_pad(&c, "用途", 18);
-    rp_puts(&c, "判定\n");
+     * 改用 Markdown 表格：列宽交给渲染器，源码里只写 `| a | b |`。
+     * 中文宽度的不确定性被彻底消掉，那六段注释也一并无用了。 */
+    rp_puts(&c, "\n| 段名 | 大小 | 权限 | 熵 | VMP | 判定 |\n");
+    rp_puts(&c, "|:---|--:|:---|--:|:-:|:---|\n");
     rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown, 0);
     /* ⚠️ .nct 现在**不加密**（体积优先，见 so防护架构 §15.5），所以判据是
      * "应为明文"（2）而不是"应已解密"（1）。写成 1 会显示"OK 已解密"——
@@ -523,44 +491,47 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     /* ── VMP 判定 ────────────────────────────────────────────────
      * 判据：解释器段存在 = 那套 VMP 生效（没开 VMP 的构建不会生成）。
      * 光看 .ncx 大小不可靠 —— 业务代码也进 .ncx。 */
-    rp_puts(&c, "\nVMP\n");
+    rp_puts(&c, "\n## VMP\n\n");
     {
         int n = (has_ncr ? 1 : 0) + (has_nct ? 1 : 0);
-        rp_fmt(&c, "  套数  %d", n);
-        if (n == 0) rp_puts(&c, "   （本次构建未开 VMP）\n");
+        rp_fmt(&c, "**套数**：%d", n);
+        if (n == 0) rp_puts(&c, "（本次构建未开 VMP）\n");
         else rp_puts(&c, "\n");
 
-        /* 第一套 */
-        /* ⚠️ 段"不存在"不算异常 —— 没开 VMP 的构建本来就没有这两个段
-         *    （本仓库的 test.sh 构建就是这样）。只有"存在但不可执行"
-         *    才是真问题。第一版把"不存在"记成 ❌ 并计入异常数，
-         *    导致正常构建也报"有 3 项异常"，日志失去可信度。 */
-        rp_puts(&c, "  1. nox解密链  解释器 ");
-        if (has_ncr) {
-            rp_seg_t s2; rp_read_shdr(so_path, NC_SEC_VMP, &s2);
-            rp_fmt(&c, "%s %lluB ", NC_SEC_VMP, (unsigned long long)s2.size);
-            if (s2.flags & 0x4) rp_puts(&c, "OK 可执行\n");
-            else { rp_puts(&c, "XX 不可执行(会崩)\n"); bad++; }
-        } else {
-            rp_puts(&c, "-  无（本次构建未开第一套 VMP）\n");
+        if (n > 0) {
+            rp_puts(&c, "\n| 套 | 解释器 | 字节码 | 数据表 |\n");
+            rp_puts(&c, "|:---|:---|:---|:---|\n");
         }
-        rp_fmt(&c, "     字节码 %s %s   数据表 %s %s\n",
-               NC_SEC_VMPBC, has_ncq ? "OK" : "无",
-               NC_SEC_VMPTBL, has_ncs ? "OK" : "无");
 
-        /* 第二套 */
-        rp_puts(&c, "  2. 消费方     解释器 ");
-        if (has_nct) {
-            rp_seg_t s2; rp_read_shdr(so_path, NC_SEC_VMP2, &s2);
-            rp_fmt(&c, "%s %lluB ", NC_SEC_VMP2, (unsigned long long)s2.size);
-            if (s2.flags & 0x4) rp_puts(&c, "OK 可执行\n");
-            else { rp_puts(&c, "XX 不可执行(会崩)\n"); bad++; }
+        /* ⚠️ 段「不存在」不算异常 —— 没开 VMP 的构建本来就没有这些段
+         *    （test.sh 的构建就是这样）。只有「存在但不可执行」才是真问题。
+         *    第一版把「不存在」记成 ❌ 并计入异常数，导致正常构建也报
+         *    「有 3 项异常」，日志失去可信度。 */
+        if (has_ncr) {
+            rp_seg_t s2;
+            rp_read_shdr(so_path, NC_SEC_VMP, &s2);
+            int ok = (s2.flags & 0x4) != 0;
+            if (!ok) bad++;
+            rp_fmt(&c, "| 1. nox解密链 | `%s` %llu B %s | `%s` %s | `%s` %s |\n",
+                   NC_SEC_VMP, (unsigned long long)s2.size, ok ? "✅" : "❌ 不可执行",
+                   NC_SEC_VMPBC, has_ncq ? "✅" : "—",
+                   NC_SEC_VMPTBL, has_ncs ? "✅" : "—");
         } else {
-            rp_puts(&c, "-  无（本次构建未开第二套 VMP）\n");
+            rp_puts(&c, "| 1. nox解密链 | — 未开 | — | — |\n");
         }
-        rp_fmt(&c, "     字节码 %s %s   数据表 %s %s\n",
-               NC_SEC_VMPBC2, has_ncv ? "OK" : "无",
-               NC_SEC_VMPTBL2, has_ncw ? "OK" : "无");
+
+        if (has_nct) {
+            rp_seg_t s2;
+            rp_read_shdr(so_path, NC_SEC_VMP2, &s2);
+            int ok = (s2.flags & 0x4) != 0;
+            if (!ok) bad++;
+            rp_fmt(&c, "| 2. 消费方 | `%s` %llu B %s | `%s` %s | `%s` %s |\n",
+                   NC_SEC_VMP2, (unsigned long long)s2.size, ok ? "✅" : "❌ 不可执行",
+                   NC_SEC_VMPBC2, has_ncv ? "✅" : "—",
+                   NC_SEC_VMPTBL2, has_ncw ? "✅" : "—");
+        } else {
+            rp_puts(&c, "| 2. 消费方 | — 未开 | — | — |\n");
+        }
     }
 
     /* ── 体积归因（2026-11-14 重写）─────────────────────────────────
@@ -586,7 +557,7 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
      *
      * ⚠️ 各组合计 < so 总大小是正常的，差值 = ELF 头/符号表/dynamic
      *    等未纳入统计的段。故打 so 总大小与"统计覆盖"百分比。 */
-    rp_puts(&c, "\n体积归因\n");
+    rp_puts(&c, "\n## 体积归因\n\n| 组 / 段 | 大小 |\n|:---|--:|\n");
     {
         /* 每个组的段清单，NULL 结尾 */
         static const char *grp_nox[]  = {NC_SEC_HEAD, NC_SEC_HEADRO,
@@ -622,12 +593,24 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
              *    实测：test.sh 的构建没有 VMP，报告里"VMP 载荷"整组消失，
              *    看日志的人第一反应是"体积统计坏了"而不是"没开 VMP"。
              *    打 0 B 的成本只有一行，收益是消除这个歧义。 */
+            /* ── 统一列位（2026-11-14 修）───────────────────────────
+             *
+             * 原实现三处格式串各不相同，导致 B 落在三个不同列位：
+             *   组名行   "  %-10s %9d B"      → B @ 21
+             *   明细行   "      %-9s %9llu B" → B @ 26
+             *   已统计行 "  %-10s %9llu B"    → B @ 20
+             * 用户反馈：「连 b 也对不齐」—— 就是这个。
+             *
+             * 现在统一：组名/明细/合计都用同一组列宽
+             *   前缀(缩进) | 名称 12 显示列 | 数字 12 列右对齐 | " B"
+             * 且名称列走 rp_pad（按显示列，中文算 2）——
+             * 用 %-12s 会对中文按【字节】补，必歪。 */
             if (!any) {
-                rp_fmt(&c, "  %-10s %9d B\n", gnames[g], 0);
+                _rp_size_row(&c, 0, gnames[g], 0);
                 continue;
             }
             covered += gsum;
-            rp_fmt(&c, "  %-10s %9llu B\n", gnames[g], gsum);
+            _rp_size_row(&c, 0, gnames[g], gsum);
             /* 组内明细：只在组有多个段时展开，单段组没必要 */
             {
                 int nseg = 0;
@@ -639,13 +622,12 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
                     for (i = 0; groups[g][i]; i++) {
                         rp_seg_t s2;
                         if (rp_read_shdr(so_path, groups[g][i], &s2) == 0)
-                            rp_fmt(&c, "      %-9s %9llu B\n",
-                                   groups[g][i], s2.size);
+                            _rp_size_row(&c, 1, groups[g][i], s2.size);
                     }
                 }
             }
         }
-        rp_fmt(&c, "  %-10s %9llu B\n", "已统计", covered);
+        _rp_size_row(&c, 0, "已统计", covered);
         rp_puts(&c, "  （合计小于 so 总大小属正常：ELF 头/符号表/dynamic 等"
                     "未纳入）\n");
     }
@@ -653,23 +635,23 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
     /* ── 结论 ────────────────────────────────────────────────────
      * 最重要的一行：有问题就列出来，没问题就一句话。
      * 读日志的人（或 AI）不需要自己再判断一遍。 */
-    rp_puts(&c, "\n结论\n");
+    rp_puts(&c, "\n## 结论\n\n");
     if (bad == 0 && rc == 0) {
-        rp_puts(&c, "  OK 全部正常");
+        rp_puts(&c, "✅ **全部正常**");
         if (unknown > 0) {
-            /* '!' 是"样本太小算不出熵"，不是错误 —— 必须说明，
-             * 否则"有 ! 却说我全部正常"看起来像自相矛盾。 */
-            rp_fmt(&c, "（其中 %d 项标 ! 是样本不足无法判断熵，不影响功能）",
+            /* ⚠️ 是"样本太小算不出熵"，不是错误 —— 必须说明，
+             * 否则"有 ⚠️ 却说我全部正常"看起来像自相矛盾。 */
+            rp_fmt(&c, "（其中 %d 项标 ⚠️ 是样本不足无法判断熵，不影响功能）",
                    unknown);
         }
         rp_puts(&c, "\n");
     } else {
-        rp_fmt(&c, "  XX 有 %d 项异常，见上方 XX 标记\n", bad);
+        rp_fmt(&c, "❌ **有 %d 项异常**，见上方 ❌ 标记\n", bad);
         if (unknown > 0)
-            rp_fmt(&c, "     另有 %d 项标 ! 无法判断（样本不足），不算异常\n",
+            rp_fmt(&c, "\n另有 %d 项标 ⚠️ 无法判断（样本不足），不算异常\n",
                    unknown);
     }
-    rp_puts(&c, "===========================\n");
+    rp_puts(&c, "\n---\n");
 }
 
 /* ── 输出：哨兵开关 + 静默失败 ──────────────────────────────────────── */
@@ -777,32 +759,56 @@ int ncg_report_flush(const char *buf, size_t len) {
 
 /* 三个对外入口都是定参函数，不能对它们用 va_start（C 要求最后一个
  * 形参是省略号）。所以拆成两层：对外入口先格式化成字符串，再交给
- * 不带可变参数的 rp_trace_line。 */
+ * 不带可变参数的 rp_trace_line。
+ *
+ * ⚠️⚠️ 用 open/write/close 而不是 fopen/fprintf/fclose（2026-11-14 修）：
+ *
+ *    V7 测试（.ncxr 与 .bss 同页）在追踪存在时必崩 —— `fopen` 会 malloc
+ *    一块 stdio 缓冲区，改变了堆布局与页归属，而解锁链对「段与 .bss 是否
+ *    同页」极其敏感（mprotect 的页粒度判定）。
+ *
+ *    这不是理论推测：把 ncg_trace* 全部注释掉，V7 立刻恢复通过
+ *    （48/48）；加回来就红（44/48）。
+ *
+ *    改用裸系统调用后不经过 libc 的堆分配，且栈上只有一个 512 字节的
+ *    路径缓冲（与 ncg_debug_log_path 原有开销一致）。 */
 static void rp_trace_line(const char *stage, const char *payload) {
     char path[512];
-    FILE *fp;
+    char line[640];
     struct timeval tv;
     struct tm tmv;
+    char ts[16];
+    int n, fd;
 
     if (!stage) return;
     if (ncg_debug_log_path(path, sizeof(path)) != 0) return;
 
-    fp = fopen(path, "a");
-    if (!fp) return;
-
     gettimeofday(&tv, NULL);
-    {
-        char ts[16];
-        if (localtime_r(&tv.tv_sec, &tmv))
-            strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
-        else
-            ts[0] = '\0';
-        fprintf(fp, "[NCG-TRACE] %s.%03d  %s", ts,
-                (int)(tv.tv_usec / 1000), stage);
+    if (localtime_r(&tv.tv_sec, &tmv))
+        strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    else
+        ts[0] = '\0';
+
+    /* 手工拼行：snprintf 不分配堆内存，但这里连它也不用，避免任何
+     * 意外的 libc 路径。 */
+    n = 0;
+    n += snprintf(line + n, sizeof(line) - n,
+                  "[NCG-TRACE] %s.%03d  %s", ts,
+                  (int)(tv.tv_usec / 1000), stage);
+    if (payload && *payload && n > 0 && n < (int)sizeof(line) - 2) {
+        n += snprintf(line + n, sizeof(line) - n, " %s", payload);
+        if (n > (int)sizeof(line) - 2) n = (int)sizeof(line) - 2;
     }
-    if (payload && *payload) fprintf(fp, " %s", payload);
-    fputc('\n', fp);
-    fclose(fp);      /* ⚠️ 必须 close：崩溃时缓冲区内容会丢 */
+    if (n > 0 && n < (int)sizeof(line) - 1) {
+        line[n++] = '\n';
+        line[n] = '\0';
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) {
+            /* write 后立即 close：崩溃时内核里已落盘的内容不会丢 */
+            (void)!write(fd, line, (size_t)n);
+            close(fd);
+        }
+    }
 }
 
 void ncg_trace(const char *stage) {
