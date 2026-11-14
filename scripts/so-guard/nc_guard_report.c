@@ -270,33 +270,54 @@ static const char *rp_perm(uint32_t fl) {
  *
  *    内存地址 = 镜像基址 + 段链接期地址。镜像基址由调用方传入
  *    （dladdr 得到的 dli_fbase），与 ncg_stub_recover 用的同一算法。 */
+/* 读【内存】的熵 —— 解锁后的真实状态。
+ *
+ * ⚠️ 为什么要和文件熵分开（2026-11-14 用户提问）：
+ *    「逆向者看到的熵和我们看到的熵不太一样呀，不应该有两段吗？」
+ *
+ *    对。App 自己解锁后读内存，看到的是明文（≈6.5）；而逆向者拿到的
+ *    是磁盘上的 so，读到的是密文（≈8.0）。只报一个数字，读者既无法
+ *    判断锁箱有没有生效，也不知道自己看的到底是哪一边。
+ *
+ *    两个都报才能直接对照：
+ *        文件 8.0 / 内存 6.5 → 锁箱有效（磁盘密文，运行期才解密）
+ *        文件 6.5 / 内存 6.5 → 该段本就不加密（或锁箱没生效！）
+ */
+static int32_t rp_seg_entropy_mem(const rp_seg_t *sg, uintptr_t img_base) {
+    size_t n = (size_t)(sg->size > 65536 ? 65536 : sg->size);
+    const unsigned char *m;
+    if (n == 0 || !img_base) return -1;
+    m = (const unsigned char *)(img_base + sg->addr);
+    return rp_entropy_fx(m, n);
+}
+
+/* 读【磁盘文件】的熵 —— 逆向者拿到的就是这份。 */
+static int32_t rp_seg_entropy_file(const char *so_path, const rp_seg_t *sg) {
+    size_t n = (size_t)(sg->size > 65536 ? 65536 : sg->size);
+    unsigned char *p;
+    int fd;
+    int32_t h;
+
+    if (n == 0) return -1;
+    fd = open(so_path, O_RDONLY);
+    if (fd < 0) return -1;
+    p = (unsigned char *)malloc(n);
+    if (!p) { close(fd); return -1; }
+    if (lseek(fd, (off_t)sg->offset, SEEK_SET) < 0 ||
+        read(fd, p, n) != (ssize_t)n) {
+        free(p); close(fd); return -1;
+    }
+    h = rp_entropy_fx(p, n);
+    free(p);
+    close(fd);
+    return h;
+}
+
+/* 兼容旧调用点：有内存基址时返回内存熵，否则返回文件熵。 */
 static int32_t rp_seg_entropy(const char *so_path, const rp_seg_t *sg,
                               uintptr_t img_base) {
-    size_t n = (size_t)(sg->size > 65536 ? 65536 : sg->size);
-    if (n == 0) return -1;
-    if (img_base) {
-        /* 内存优先 —— 解锁后这才是真实状态 */
-        const unsigned char *m = (const unsigned char *)(img_base + sg->addr);
-        return rp_entropy_fx(m, n);
-    }
-    /* 兜底：img_base==0 时读文件（构建期/无 dladdr 场景） */
-    {
-        unsigned char *p;
-        int fd;
-        int32_t h;
-        fd = open(so_path, O_RDONLY);
-        if (fd < 0) return -1;
-        p = (unsigned char *)malloc(n);
-        if (!p) { close(fd); return -1; }
-        if (lseek(fd, (off_t)sg->offset, SEEK_SET) < 0 ||
-            read(fd, p, n) != (ssize_t)n) {
-            free(p); close(fd); return -1;
-        }
-        h = rp_entropy_fx(p, n);
-        free(p);
-        close(fd);
-        return h;
-    }
+    if (img_base) return rp_seg_entropy_mem(sg, img_base);
+    return rp_seg_entropy_file(so_path, sg);
 }
 
 /* ── 对外接口 ──────────────────────────────────────────────────────── */
@@ -380,50 +401,120 @@ static void _rp_size_row(rp_ctx *c, int depth,
  * ⚠️ 单元格内容不能含 `|`（会破坏表格结构）。段名/用途都是固定字面量，
  *    已确认无 `|`；熵值与权限也不会产生。
  */
+/* 小段（<512B）的明文/密文判定 —— 按内容特征而非熵。
+ *
+ * 为什么需要（2026-11-14 用户反馈「样本不足是什么意思？那到底是明文
+ * 还是密文？」）：熵是统计量，小样本时频率分布没收敛，算出来的数字
+ * 不可信 —— 旧版就只说「样本不足」然后不给结论，等于什么都没回答。
+ *
+ * 但小段其实可以直接看内容：
+ *   · 出现连续 8 个 0x00 → 结构体填充/对齐 → 明文（密文几乎不可能
+ *     连续 8 字节全零，概率 1/2^64）
+ *   · 全部字节落在可打印 ASCII 范围 → 明文（字符串表之类）
+ *   · 都不满足 → 视为密文（分布均匀、无可识别结构）
+ *
+ * ⚠️ 内存优先：解锁后要判的是内存里的状态。
+ * ⚠️ 读不到就返回「无法判断」，绝不猜。 */
+static const char *rp_tiny_verdict(const char *so_path, const rp_seg_t *sg,
+                                   uintptr_t img_base) {
+    unsigned char buf[512];
+    size_t n = (size_t)(sg->size < sizeof(buf) ? sg->size : sizeof(buf));
+    size_t i, zero_run = 0, printable = 1;
+    int got = 0;
+
+    if (n == 0) return "— 空段";
+    if (img_base) {
+        const unsigned char *m =
+            (const unsigned char *)(img_base + sg->addr);
+        memcpy(buf, m, n);
+        got = 1;
+    } else {
+        int fd = open(so_path, O_RDONLY);
+        if (fd >= 0) {
+            if (lseek(fd, (off_t)sg->offset, SEEK_SET) >= 0 &&
+                read(fd, buf, n) == (ssize_t)n)
+                got = 1;
+            close(fd);
+        }
+    }
+    if (!got) return "— 无法读取";
+
+    for (i = 0; i < n; i++) {
+        if (buf[i] == 0x00) { if (++zero_run >= 8) return "✅ 明文"; }
+        else zero_run = 0;
+        if (buf[i] < 0x09 || (buf[i] > 0x0D && buf[i] < 0x20) || buf[i] >= 0x7F)
+            printable = 0;
+    }
+    if (printable) return "✅ 明文";
+    return "🔒 密文";
+}
+
 static void rp_seg(rp_ctx *c, const char *so_path, uintptr_t img_base,
                    const char *name, const char *role, int expect,
                    int *unknown_p, int is_vmp) {
     rp_seg_t sg;
-    int32_t h;
-    double d;
+    int32_t hf, hm;
+    double d, dm;
     const char *flag = "—";
     char szbuf[32];
+    char efbuf[16], embuf[16];
 
     if (rp_read_shdr(so_path, name, &sg) != 0) {
-        rp_fmt(c, "| `%s` | - | - | - | %s | - 段不存在 |\n", name,
+        rp_fmt(c, "| `%s` | - | - | - | - | %s | - 段不存在 |\n", name,
                is_vmp ? "✅" : "—");
         return;
     }
 
     rp_fmt_size(szbuf, sizeof(szbuf), (unsigned long long)sg.size);
-    h = rp_seg_entropy(so_path, &sg, img_base);
-    d = (h >= 0) ? rp_fx2d(h) : -1.0;
 
-    /* 熵列：无法计算时写 "-"，避免混入无意义的 0.000 */
-    char ebuf[16];
-    if (h >= 0) snprintf(ebuf, sizeof(ebuf), "%.3f", d);
-    else        snprintf(ebuf, sizeof(ebuf), "-");
+    /* ── 两个熵都算（2026-11-14 用户提问）────────────────────────────
+     *
+     * 「逆向者看到的熵和我们看到的熵不太一样呀，不应该有两段吗？」
+     *
+     * 对。App 解锁后读内存看到明文（≈6.5），而逆向者拿到的磁盘 so 是
+     * 密文（≈8.0）。只报一个数字，就没法判断锁箱到底有没有生效：
+     *
+     *     文件 8.0 / 内存 6.5 → 锁箱有效（磁盘密文，运行期才解密）
+     *     文件 6.5 / 内存 6.5 → 该段本就不加密（或锁箱没生效！）
+     *
+     * 所以两列都打。判定用内存值（那才是运行时的真实状态）。 */
+    hf = rp_seg_entropy_file(so_path, &sg);
+    hm = rp_seg_entropy_mem(&sg, img_base);
+    d  = (hm >= 0) ? rp_fx2d(hm) : -1.0;
+    dm = d;
+    if (hf >= 0) snprintf(efbuf, sizeof(efbuf), "%.3f", rp_fx2d(hf));
+    else         snprintf(efbuf, sizeof(efbuf), "-");
+    if (hm >= 0) snprintf(embuf, sizeof(embuf), "%.3f", dm);
+    else         snprintf(embuf, sizeof(embuf), "-");
 
-    /* 小样本不下结论（见文件头③） */
-    if (h >= 0 && sg.size < 512) {
-        rp_fmt(c, "| `%s` | %s | %s | %s | %s | ⚠️ 样本不足 |\n",
-               name, szbuf, rp_perm(sg.flags), ebuf, is_vmp ? "✅" : "—");
+    /* 小样本：按内容判定（见下方注释） */
+    if (sg.size < 512) {
+        const char *tiny = rp_tiny_verdict(so_path, &sg, img_base);
+        rp_fmt(c, "| `%s` | %s | %s | %s | %s | %s | %s（小段，按内容判） |\n",
+               name, szbuf, rp_perm(sg.flags), efbuf, embuf,
+               is_vmp ? "✅" : "—", tiny);
         (*unknown_p)++;
         return;
     }
 
-    if (h < 0)                          flag = "—";
-    else if (expect == 1)               flag = (d < 7.5) ? "✅ 已解密" : "❌ 仍是密文";
+    if (hm < 0)                         flag = "— 无法读取内存";
+    else if (expect == 1)               flag = (dm < 7.5) ? "✅ 已解密" : "❌ 仍是密文";
     /* 判定文案要能自解释（2026-11-14 用户反馈「看不懂」）：
      * 旧版 expect==0 时只打「明文」，读者会以为「这个段被解密了」。
      * 实际上 .ncr/.ncq/.ncs 是【设计上就不加密】的段 —— 它们从来不是
      * 密文，也就谈不上「解密」。措辞必须区分这两件事。 */
-    else if (expect == 2)               flag = (d < 7.0) ? "✅ 明文数据（本就不加密）" : "⚠️ 高熵异常";
-    else if (expect == -1)              flag = (d >= 7.5) ? "✅ 密文" : "❌ 未加密";
-    else                                flag = (d >= 7.5) ? "密文（未解锁）" : "明文（本就不加密）";
+    else if (expect == 2)               flag = (dm < 7.0) ? "✅ 明文数据（本就不加密）" : "⚠️ 高熵异常";
+    else if (expect == -1)              flag = (dm >= 7.5) ? "✅ 密文" : "❌ 未加密";
+    else                                flag = (dm >= 7.5) ? "密文（未解锁）" : "明文（本就不加密）";
 
-    rp_fmt(c, "| `%s` | %s | %s | %s | %s | %s |\n",
-           name, szbuf, rp_perm(sg.flags), ebuf, is_vmp ? "✅" : "—", flag);
+    /* 锁箱有效性交叉校验：文件是密文、内存是明文 → 这才是生效。
+     * 两者都低 = 该段本就没加密（或锁箱漏了），在这里点出来。 */
+    if (expect == 1 && hf >= 0 && rp_fx2d(hf) < 7.5)
+        flag = "⚠️ 磁盘上就不是密文（锁箱可能没生效）";
+
+    rp_fmt(c, "| `%s` | %s | %s | %s | %s | %s | %s |\n",
+           name, szbuf, rp_perm(sg.flags), efbuf, embuf,
+           is_vmp ? "✅" : "—", flag);
 }
 
 /* ── 报告正文 ──────────────────────────────────────────────────────── */
@@ -471,23 +562,13 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
      *
      *      「这个熵到底是解锁后的，还是未解锁后的？我很难判断，
      *        因为你这个日志写得太让人误解」
-     *
-     *    实际情况：有 img_base 时读【内存】（解锁后的真实状态），
-     *    没有时读【文件】（磁盘上锁箱后的密文）。两者熵值完全不同
-     *    （密文 ≈8.0 / 明文代码 ≈6.5），但旧列名只写「熵」，
-     *    读日志的人无法判断眼前这个数字代表哪一边。
-     *
-     *    所以：列名改成「熵(内存)」或「熵(文件)」，并在表头下方
-     *    用一行引用说明这代表什么状态。宁可占两行，也不让人猜。 */
-    if (img_base)
-        rp_puts(&c, "\n> 熵读自**解锁后的内存**（6.x = 明文 / 8.0 = 仍是密文）。"
-                    "此处反映真实运行状态。\n");
-    else
-        rp_puts(&c, "\n> 熵读自**磁盘文件**（8.0 = 锁箱后的密文 / 6.x = 明文）。"
-                    "本次没有内存基址，反映的是锁箱后的状态。\n");
-    rp_puts(&c, "\n| 段名 | 大小 | 权限 | 熵");
-    rp_puts(&c, img_base ? "(内存) | VMP | 判定 |\n" : "(文件) | VMP | 判定 |\n");
-    rp_puts(&c, "|:---|--:|:---|--:|:-:|:---|\n");
+     *    所以：**两个熵都打** —— 熵(文件) 是逆向者看到的，熵(内存) 是
+     *    运行期实际状态。两列一对比，锁箱有没有生效一目了然。 */
+    rp_puts(&c, "\n> **熵(文件)** = 逆向者拿到的磁盘状态（8.0 = 密文 / 6.x = 明文）；"
+                "**熵(内存)** = 解锁后的运行状态。\n");
+    rp_puts(&c, "> 两列对照才有意义：文件密 + 内存明 = 锁箱生效；两列都明 = 该段本就不加密。\n");
+    rp_puts(&c, "\n| 段名 | 大小 | 权限 | 熵(文件) | 熵(内存) | VMP | 判定 |\n");
+    rp_puts(&c, "|:---|--:|:---|--:|--:|:-:|:---|\n");
     rp_seg(&c, so_path, img_base, NC_SEC_CODE, "业务代码+壳", 1, &unknown, 0);
     /* ⚠️ .nct 现在**不加密**（体积优先，见 so防护架构 §15.5），所以判据是
      * "应为明文"（2）而不是"应已解密"（1）。写成 1 会显示"OK 已解密"——

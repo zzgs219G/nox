@@ -798,8 +798,8 @@ rows = [l.rstrip('\n') for l in
 seg = [l for l in rows if l.startswith('| `')]
 if len(seg) < 3:
     sys.exit(1)                      # 段表行太少，结构不对
-# 每行必须是 7 列（首尾各一个空列 + 6 个字段）
-bad = [l for l in seg if l.count('|') != 7]
+# 每行必须是 8 列（首尾各一个空列 + 7 个字段，2026-11-14 加了熵(内存)）
+bad = [l for l in seg if l.count('|') != 8]
 sys.exit(0 if not bad else 1)
 PYALIGN
         then
@@ -809,12 +809,19 @@ PYALIGN
             grep '^| `' "$RLOG" | head -4
         fi
 
-        # ⑤ 小样本保护：.ncx 196B < 512B，必须显示"样本不足"而不是乱给判定
-        #    这条钉住的是"宁可不判，也不给错结论"。
-        if grep -qE '\| `\.ncx` \|.*样本不足' "$RLOG"; then
-            ok "V12e 小样本不下结论（.ncx 196B → 样本不足）"
+        # ⑤ 小样本：必须【按内容】给出明文/密文结论，而不是含糊的「样本不足」
+        #    ⚠️ 2026-11-14 用户反馈：「样本不足是什么意思？那到底是明文
+        #       还是密文？」—— 只说样本不足等于没回答。
+        #       现在小段走 rp_tiny_verdict（看连续零字节 / 可打印 ASCII），
+        #       必须给出明确判定，并注明判定依据是小段内容。
+        if grep -qE '\| `\.ncx` \|.*（小段，按内容判）' "$RLOG"; then
+            if grep -qE '\| `\.ncx` \|.*(✅ 明文|🔒 密文)' "$RLOG"; then
+                ok "V12e 小段按内容给出明确明文/密文结论"
+            else
+                bad "V12e 小段有标记但没给结论 —— 用户仍不知道是明是密"
+            fi
         else
-            bad "V12e 小样本给了熵判定 —— 会误导（曾把密文报成已解密）"
+            bad "V12e 小段没走内容判定 —— 只说「样本不足」等于没回答"
             grep '`\.ncx`' "$RLOG" | head -2
         fi
 
@@ -854,10 +861,11 @@ PYHEAD
         #    ⚠️ 真困惑：用户问「这个熵是解锁后的还是未解锁后的？」——
         #       两者数值天差地别（密文≈8.0 / 明文≈6.5），而旧列名只写
         #       「熵」，读者无从判断眼前这个数代表哪一边。
-        if grep -qE '熵\(内存\)|熵\(文件\)' "$RLOG"; then
-            ok "V12o 熵列标明来源（内存/文件）"
-            if grep -qE '熵读自\*\*(解锁后的内存|磁盘文件)\*\*' "$RLOG"; then
-                ok "V12p 有文字说明熵代表什么状态"
+        if grep -q '熵(文件)' "$RLOG" && grep -q '熵(内存)' "$RLOG"; then
+            ok "V12o 文件熵与内存熵两列都在"
+            if grep -qE '熵\(文件\)\*\*|熵\(文件\)' "$RLOG" \
+               && grep -q '两个熵\|逆向者拿到' "$RLOG"; then
+                ok "V12p 有文字说明两列熵各代表什么"
             else
                 bad "V12p 有来源标记但缺说明文字 —— 数字含义仍不明确"
             fi
