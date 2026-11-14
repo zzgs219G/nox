@@ -42,6 +42,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>   /* gettimeofday：阶段追踪的毫秒时间戳（2026-11-14） */
 #include <time.h>
 
 #include "nc_guard_layout.h"
