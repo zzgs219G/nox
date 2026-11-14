@@ -1143,39 +1143,55 @@ int ncg_head_unlock(const void *self_addr) {
     ncg_trace_s("U1 OK so_path", so_path);
 
     ncg_shdr_t sec, slot;
+    ncg_trace("U2 找 .ncx 段");
     if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) {
         ncg_trace_s("U2 FAIL 找不到段", NC_SEC_CODE);
         return -2;
     }
+    ncg_trace_i("U2 OK .ncx 大小", (long long)sec.size);
+
+    ncg_trace("U3 找 .nck 密钥槽");
     if (ncg_find_section(so_path, NC_SEC_SLOT, &slot) != 0) {
         ncg_trace_s("U3 FAIL 找不到段", NC_SEC_SLOT);
         return -3;
     }
+    ncg_trace_i("U3 OK .nck 大小", (long long)slot.size);
+
+    ncg_trace("U4 检查 .ncx 大小非零");
     if (sec.size == 0) {
         ncg_trace("U4 FAIL .ncx 段大小为 0");
         return -4;
     }
+    ncg_trace("U4 OK .ncx 非空");
+
+    ncg_trace("U5 检查 .ncx 可分配");
     if ((sec.flags & SHF_ALLOC) == 0) {
         ncg_trace_i("U5 FAIL .ncx 不可分配(flags)", (long long)sec.flags);
         return -5;
     }
+    ncg_trace("U5 OK .ncx 可分配");
 
     uint8_t slotdata[NC_SLOT_SIZE];
     /* scrbuf：probe（8B）与 dec（96B）共用的暂存区，两者作用域不重叠。
      * 合并后少一个 alloca（Amice 的 values 按 alloca 计）。 */
     uint8_t scrbuf[NC_SLOT_SIZE];
     memset(slotdata, 0, sizeof(slotdata));
+    ncg_trace_s("U6 打开 so 文件", so_path);
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) {
         ncg_trace("U6 FAIL open(so_path) 失败");
         return -6;
     }
+    ncg_trace_i("U6 OK 已打开 fd", (long long)fd);
+
+    ncg_trace("U7 读 .nck 密钥槽");
     ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.offset);
     close(fd);
     if (got < 32) {
         ncg_trace_i("U7 FAIL pread(.nck) 读到的字节数", (long long)got);
         return -7;
     }
+    ncg_trace_i("U7 OK 读到字节数", (long long)got);
 
     /* ── T4（2026-10-28）：.nck 已加密，先解密 ──────────────────────
      * .nck 整段（96 字节）在锁箱时被 boot_key 加密（见 _encrypt_slots）。
@@ -1202,6 +1218,7 @@ int ncg_head_unlock(const void *self_addr) {
             }
         }
     }
+    ncg_trace("U8 判定锁箱状态");
     ncg_trace_i("U8 锁箱状态(1=已锁 0=未锁)", (long long)so_locked);
     if (so_locked && slot.size >= NC_SLOT_SIZE) {
         /* 2026-11-12：原先这里再调一次 dladdr(&ncg_head_unlock) ——

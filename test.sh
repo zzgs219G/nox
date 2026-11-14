@@ -913,6 +913,22 @@ PYHEAD
             else
                 bad "V12l 追踪缺终态 —— 无法区分"没跑完"和"跑完但没记录""
             fi
+
+            # ⑨ 每个阶段都要有「进入/OK」记录，不能只在失败时打日志
+            #    ⚠️ 真 bug（2026-11-14 用户问「U2 哪去了 U7 哪去了」）：
+            #       第一版只给失败分支打了 trace —— 正常流程里 U2/U3/U4/
+            #       U5/U6/U7 一个字都不出现，读日志的人以为漏了步骤。
+            #       阶段追踪的价值在于「证明这一步走过了」，只记失败等于
+            #       只证明了「没失败的那些步看不见」。
+            _missing=""
+            for _u in U1 U2 U3 U4 U5 U6 U7 U8 U9 U10 U11 U12 U13 U14 U15; do
+                grep -q "NCG-TRACE.* $_u " "$RLOG" || _missing="$_missing $_u"
+            done
+            if [ -z "$_missing" ]; then
+                ok "V12q 每个阶段都有记录（U1~U15 全在）"
+            else
+                bad "V12q 缺阶段记录:$_missing —— 只记失败分支会让正常流程看起来缺步骤"
+            fi
             # 毫秒时间戳格式：HH:MM:SS.mmm
             if grep -qE 'NCG-TRACE\] [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}' "$RLOG"; then
                 ok "V12m 追踪带毫秒时间戳"
