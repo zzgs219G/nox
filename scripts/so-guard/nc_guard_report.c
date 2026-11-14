@@ -8,7 +8,7 @@
  *
  * 本文件在解锁完成后打一份【可对照的体检报告】到：
  *
- *     /storage/emulated/0/Android/data/<包名>/files/ncguard_log.txt
+ *     /storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
  *
  * 开关与 sig_check.c 共用同一个哨兵文件（用户只记一个）：
  *
@@ -660,7 +660,7 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *
  * 与 sig_check.c 完全同规则（用户只记一个开关）：
  *   哨兵   /storage/emulated/0/xixin_debug    存在 → 写日志
- *   输出   /storage/emulated/0/Android/data/<包名>/files/ncguard_log.txt
+ *   输出   /storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
  *
  * ⚠️ 哨兵只判存在性（access F_OK），建文件或目录都认。
  * ⚠️ 包名从 /proc/self/cmdline 取并截到第一个 ':'。子进程带 ":remote"
@@ -709,7 +709,7 @@ int ncg_debug_log_path(char *out, size_t cap) {
              "/storage/emulated/0/Android/data/%s/files", pkg);
     (void)mkdir(dir, 0771);
     snprintf(out, cap,
-             "/storage/emulated/0/Android/data/%s/files/ncguard_log.txt", pkg);
+             "/storage/emulated/0/Android/data/%s/files/ncguard_log.md", pkg);
     return 0;
 }
 

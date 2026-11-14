@@ -72,7 +72,7 @@
 产物里有自检报告，开关 `/storage/emulated/0/xixin_debug`：
 
 ```
-/storage/emulated/0/Android/data/<包名>/files/ncguard_log.txt
+/storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
 ```
 
 它会直接告诉你：解锁成功没、几套 VMP、每段多大、有没有解密、
@@ -874,7 +874,7 @@ boot_key = HKDF(ikm, SALT, "nc-boot-v1")
 产物里有自检报告（`nc_guard_report.c`），开关 `/storage/emulated/0/xixin_debug`：
 
 ```
-/storage/emulated/0/Android/data/<包名>/files/ncguard_log.txt
+/storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
 ```
 
 报告内容（v3）：
