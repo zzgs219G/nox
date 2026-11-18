@@ -156,8 +156,15 @@ guard_compile() {
         #    （2026-11-13 实测：改通配符后 CI 的 Ubuntu runner 上
         #      `fatal error: 'jni.h' file not found` → verify job 红。）
         _srcs=$(ls "$GUARD_DIR"/*.c | grep -v '/nc_guard_jni\.c$' | tr '\n' ' ')
+        # ⚠️ -DNCGUARD_DEBUG_REPORT 不可省（2026-11-19 加）：
+        #    调试报告在 release 构建里已被 #ifdef 编译掉（修 0 信息逆向报告
+        #    标 ★★★ 的 NCG_REPORT_PATH 弱点）。而本测试的 V12 全靠
+        #    NCG_REPORT_PATH 触发报告 —— 不定义该宏，报告永远不产出，
+        #    V12a 会报"报告未产出"。
+        #    这是刻意区分：宿主测试 = 调试形态，发出去的包 = 无报告形态。
         # shellcheck disable=SC2086
-        ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$W" \
+        ( cd "$W" && clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED \
+            -DNCGUARD_DEBUG_REPORT -I"$W" \
             $_srcs \
             "$@" -o "$out" )
     else
@@ -168,6 +175,9 @@ guard_compile() {
             return 1; }
         # --whole-archive 不能省：ncguard_unlock 是 constructor，无人引用
         # 会被链接器丢弃 → 加密段 5 个塌成 1 个。
+        # ⚠️ 静态库形态无法加 -DNCGUARD_DEBUG_REPORT（代码在 .a 里已编译）。
+        #    所以 .a 形态下 V12 会 skip —— 这是预期，不是失败。
+        #    （发出去的 .a 本来就是无报告形态，与 release 一致。）
         "$STATIC_CC" -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$GUARD_DIR" \
             "$@" -Wl,--whole-archive "$STATIC_LIB" -Wl,--no-whole-archive \
             -o "$out"

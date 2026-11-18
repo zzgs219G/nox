@@ -785,6 +785,7 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *    故拆成两段拼接。
  * ⚠️ 任何一步失败返回 -1，调用方静默跳过。 */
 int ncg_debug_log_path(char *out, size_t cap) {
+#ifdef NCGUARD_DEBUG_REPORT
     static const char kSentinel[] = "/storage/emulated/0/xixin_debug";
     char pkg[128];
     char dir[384];
@@ -826,6 +827,36 @@ int ncg_debug_log_path(char *out, size_t cap) {
     snprintf(out, cap,
              "/storage/emulated/0/Android/data/%s/files/ncguard_log.md", pkg);
     return 0;
+#else
+    /* ═══ 2026-11-18：release 构建里整段编译掉 ══════════════════════
+     *
+     * 为什么（0 信息逆向报告的实测结论）：
+     *   报告作者用 Unicorn 仿真执行 init_array，hook getenv/access，
+     *   5 秒就发现两个调试开关：
+     *     getenv("NCG_REPORT_PATH")           → 日志路径可被环境变量覆盖
+     *     access("/storage/emulated/0/xixin_debug") → 哨兵文件
+     *   而这两个字符串在 .rodata 是【明文】——`strings libnc.so | grep
+     *   xixin` 一条命令就能看到，不需要任何逆向技能。看到之后
+     *   `touch` 一下就能让壳把 12 步解密流水线写成中文报告，
+     *   等于把"逆向 12 个未知函数"降级成"读一份自述文档"。
+     *
+     * 为什么不能只改名：
+     *   用户明确反对（"改文件名那我以后怎么调试"）。名字必须可读，
+     *   否则自己都记不住。
+     *
+     * 为什么不用 Android 的 debuggable：
+     *   protect.sh:2560 已经强制 debuggable=false —— 那是安全要求
+     *   （debuggable=true 会让 run-as 进沙箱、调试器 attach，
+     *   绕过我们的反调试）。不能为调试把它改回去。
+     *
+     * 所以改成编译期开关：release 不定义 NCGUARD_DEBUG_REPORT，
+     * 这段代码【根本不存在】——strings 搜不到 kSentinel 路径，
+     * 也搜不到 getenv 调用。要调试时构建期加 -DNCGUARD_DEBUG_REPORT。
+     *
+     * 用法见 docs/调试包怎么出.md。 */
+    (void)out; (void)cap;
+    return -1;
+#endif
 }
 
 int ncg_report_flush(const char *buf, size_t len) {
