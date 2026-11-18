@@ -35,21 +35,25 @@
 | | 第一套 | 第二套 |
 |---|---|---|
 | 谁编译 | 本仓库（`make-zip-lib.sh`，预编译进 `libnox.a`） | 消费方（`artifact-pipeline` 的 `protect.sh`） |
-| 保护什么 | 解密链（`ncg_boot_key` / `ngc_stub_recover` 等 14 个函数） | 签名校验（`sig_check.c` 的 11 个函数） |
-| 解释器 | `.ncr`（142 KB，明文） | `.nct`（104 KB，明文） |
-| 字节码 | `.ncq`（95 KB，明文） | `.ncv`（128 KB，明文） |
-| 数据表 | `.ncs`（1.3 KB，明文） | `.ncw`（1.1 KB，明文） |
+| 保护什么 | 解密链（`nc_guard_crypto.c` 里的派生/解密函数） | 签名校验（`sig_check.c` 里带 `+vm_virtualize` 的函数） |
+| 解释器 | `.ncr`（明文） | `.nct`（明文） |
+| 字节码 | `.ncq`（明文） | `.ncv`（明文） |
+| 数据表 | `.ncs`（明文） | `.ncw`（明文） |
 | 现状 | **开启**（`_vmp=1`） | **开启**（`AMICE_VM_VIRTUALIZE=true`） |
+
+> **不写具体大小和函数数**：它们随 amice profile、模块组合、VMP 覆盖率变化。
+> 要查当前值，看产物 `readelf -SW` + 构建日志的 `skip function` 清单。
 
 ### 0.2 `.ncx` 不是 VMP 段
 
 新手最容易搞错的一点：
 
 ```
-.nc x  业务代码的加密段（39 KB，加密）
-       里面有：10 个 dex2c 业务方法（明文 ARM64）
-              + 8 个 VMP 壳（wrapper，只有 "bl 解释器"）
-       但【逻辑】已被抽到 .ncv 字节码里
+.nc x  业务代码的加密段（加密）
+       里面装的是：VMP 壳（wrapper，只有 "bl 解释器"）
+                 + stringenc 的算法函数（nc_strdec_*）
+       【逻辑】已被抽到 .ncv 字节码里，壳本身没有智力
+       ⚠️ dex2c 转译产物默认【不在】这里（见 §15.11）
 ```
 
 **所以：「VMP 保护的东西在 .ncx 里」是错的。**
@@ -69,10 +73,16 @@
 
 ### 0.5 怎么验证现状（不用反汇编）
 
-产物里有自检报告，开关 `/storage/emulated/0/xixin_debug`：
+**自检报告默认不存在** —— 2026-11-19 起它是**编译期开关**
+（`-DNCGUARD_DEBUG_REPORT`），release 构建里 `ncg_debug_log_path()`
+整段被编译掉，`strings` 搜不到 `xixin_debug` / `NCG_REPORT_PATH`。
 
-```
-/storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
+要跑带报告的调试包：
+
+```bash
+DEBUG_REPORT=1 python3 scripts/trigger_build.py app.apk --sigcheck --vmp
+adb shell 'touch /storage/emulated/0/xixin_debug'
+# 报告 → /storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
 ```
 
 它会直接告诉你：解锁成功没、几套 VMP、每段多大、有没有解密、
@@ -725,19 +735,34 @@ bundle NDK 校验）在下面的 `if` 里，删了分支将来恢复时会漏掉
 **两套 VMP，各有「解释器 + 字节码 + 数据表」三件套，放在六个段里。**
 `.ncx` 不是 VMP 段，是业务代码的加密段 —— 里面有 VMP 壳，但逻辑已被抽走。
 
-### 15.2 段对照表（实测，arm64 产物）
+### 15.2 段对照表
 
-| 段 | 大小 | 权限 | 加密 | 是什么 | 属于 |
-|---|---|---|---|---|---|
-| `.ncx` | 39 KB | `r-x` | ✅ | **代码**：业务函数 + 8 个 VMP 壳（wrapper） | 消费方 |
-| `.ncxr` | 96 B | `r--` | ✅ | 数据：签名表 `SIG_SALT` / `SIG_HASH_STORED` | 消费方 |
-| `.ncxh` | 3.8 KB | `r-x` | ✅ | **代码**：解锁器本体 | nox |
-| `.nct` | 104 KB | `r-x` | ❌ | **代码**：第二套**解释器**（dispatcher） | 第二套 |
-| `.ncv` | 128 KB | `r--` | ❌ | 数据：第二套**字节码** + 常量池 | 第二套 |
-| `.ncw` | 1.1 KB | `rw-` | ❌ | 数据：第二套 descriptor / native 表 | 第二套 |
-| `.ncr` | 142 KB | `r-x` | ❌ | **代码**：第一套**解释器** | 第一套 |
-| `.ncq` | 95 KB | `r--` | ❌ | 数据：第一套**字节码** | 第一套 |
-| `.ncs` | 1.3 KB | `rw-` | ❌ | 数据：第一套 descriptor / native 表 | 第一套 |
+> **⚠️ 大小是产物相关的，不要当常量记。**
+> 本节只保证【段名 / 权限 / 是否加密 / 语义】四项与源码一致；
+> 大小随样本、模块组合、VMP 覆盖度变化（同一配置重跑也可能不同）。
+> **要查当前产物的大小，用 `readelf -SW`，不要抄这里的数字。**
+
+| 段 | 权限（源码 `_Static_assert`/段属性决定）| 加密 | 是什么 | 属于 |
+|---|---|---|---|---|
+| `.ncx` | `r-x`（AXR）| ✅ | **代码**：业务函数 + VMP 壳（wrapper） | 消费方 |
+| `.ncxr` | `r--`（AWR）| ✅ | 数据：签名表 `SIG_SALT`(16B) + `SIG_HASH_STORED`(32B) **×2 份** | 消费方 |
+| `.ncxh` | `r-x`（AXR）| ✅ | **代码**：解锁器本体 | nox |
+| `.ncxhr` | `rw-`（AWR）| ✅ | 数据：master（32 B）| nox |
+| `.nck` | `r--`（AR）| ✅（T4 二次加密）| 一级密钥槽（96 B）| nox |
+| `.ncks` | `r--`（AR）| ✅（T4 二次加密）| 二级 stub 密钥槽（112 B）| nox |
+| `.ncr` | `r-x` | ❌ | **代码**：第一套**解释器** | 第一套 |
+| `.ncq` | `r--` | ❌ | 数据：第一套**字节码** | 第一套 |
+| `.ncs` | `rw-` | ❌ | 数据：第一套 descriptor / native 表 | 第一套 |
+| `.nct` | `r-x` | ❌ | **代码**：第二套**解释器**（dispatcher）| 第二套 |
+| `.ncv` | `r--` | ❌ | 数据：第二套**字节码** + 常量池 | 第二套 |
+| `.ncw` | `rw-` | ❌ | 数据：第二套 descriptor / native 表 | 第二套 |
+
+**`.ncxr` 的尺寸 = 签名表 × TU 数**（源码依据，不是 bug）：
+`sig_hash.h` 被 `sig_check.c` 和 `nc_link.c` **各自 include**，
+表是 `static const` + 段属性 `SIG_HASH_SECTION` → **每个 TU 生成一份**
+（`SIG_SALT` 16 B + `SIG_HASH_STORED` 32 B = 48 B/份）。
+存两份功能上无影响（读哪份都一样）；要瘦身可让 `nc_link.c` 改成
+`extern` 引用 `sig_check.c` 那份，而非各自 include。
 
 **判断「代码还是数据」的可靠方法**：`readelf -SW` 看权限列，
 带 `x` 的是代码，不带的是数据。**不要靠段名猜。**
@@ -801,12 +826,26 @@ bundle NDK 校验）在下面的 `if` 里，删了分支将来恢复时会漏掉
 
 | 段 | 加密 | 理由 |
 |---|---|---|
-| `.ncx` | ✅ | 里面有 10 个 dex2c 业务方法（明文 ARM64，解开就能读）+ 8 个壳的 descriptor token |
-| `.ncxr` | ✅ | 96 B 签名基准值 —— 解开它等于拿到「正确答案」 |
+| `.ncx` | ✅ | 装两类东西：**（a）VMP 壳**（wrapper，只有 `bl 解释器`，逻辑在 `.nct`/`.ncv`）+ **（b）stringenc 的算法函数**（`nc_strdec_*`，解密全部加密字符串的种子）。**dex2c 转译产物默认【不在】这里** —— 2026-11-18 起它们留 `.text` 明文 + `annotate("+no_obf")`（见 §15.11）|
+| `.ncxr` | ✅ | 签名基准值 `SIG_SALT`(16B)+`SIG_HASH_STORED`(32B)，**×2 份**（`sig_check.c` 与 `nc_link.c` 各 include 一次 `sig_hash.h`，`static const` 各自生成）—— 解开它等于拿到「正确答案」 |
 | `.ncxh` | ✅ | 解锁器本体，静态读它等于拿到算法 |
 | `.nct`/`.ncv` | ❌ | 解释器是公开 VM 规则（Amice 开源可抄）；字节码的强度来自 VMP 本身 |
 | `.ncr`/`.ncq` | ❌ | **结构性约束**：解 `.ncx` 的钥匙要执行第一套解释器，加密即自锁 |
 | `.ncs`/`.ncw` | ❌ | **结构性约束**：`R_AARCH64_RELATIVE` 重定位槽，加密会覆盖链接器填的指针 → SIGILL |
+
+**⚠️ `.nct`/`.ncv` 其实可以加密（文档此前误判为"结构性约束"）**
+
+代码注释（`nc_guard_crypto.c`）自己写了：
+
+> 那些函数在 `constructor(65535)` 才第一次执行，**远在解锁
+> （`constructor(50)`）之后，那时解释器已可解密，无循环依赖。**
+
+也就是说**第二套 VMP 不参与解锁链**，它的加密不会自锁。
+保留明文的真实理由是**体积**（`.ncv` 加密让 APK 压后 +91 KB、`.nct` +59 KB，
+熵 8.0 压不动），而不是"不能"。
+
+**这个取舍可以随时翻**：若某天判断"保护强度 > 体积"，把 `.nct`/`.ncv`
+加回 `protect.sh` 的锁箱段列表即可（`_KEY_BY_NAME` 里已有 `k_nct`/`k_bc2`）。
 
 ### 15.6 攻防成本模型（2026-11-13 修正）
 
@@ -846,32 +885,59 @@ boot_key = HKDF(ikm, SALT, "nc-boot-v1")
 
 **② 加密的量和收益不成比例**
 
-```
-加密 43 KB（.ncx/.ncxr/.ncxh）
-明文 470 KB（两套 VMP 的解释器+字节码）
-```
+加密的只有 `.ncx` / `.ncxr` / `.ncxh` 三个段，而两套 VMP 的
+**解释器 + 字节码（`.ncr`/`.ncq`/`.nct`/`.ncv`）全部明文**，
+体积上明文远大于密文。
+
+（具体比例随样本变。查当前值：`readelf -SW` 看段大小。）
 
 **③ 最强防护（VMP）依赖明文解释器**
 
 攻击者读一遍 `.ncr`/`.nct`（明文）就懂 VM 规则，然后按规则解 `.ncq`/`.ncv`。
 
-> **470 KB 的 VMP 数据，安全性等于 246 KB 明文解释器的安全性。**
+> **VMP 数据的体量再大，安全性也只等于「最薄弱的那个明文解释器」。**
 
 ### 15.8 若要提升强度，按性价比排序
 
 | 优先级 | 改什么 | 收益 | 代价 |
 |---|---|---|---|
-| P0 | `boot_key` 引入运行期秘密（设备指纹等） | 断掉整条链的静态起点 | 兼容性风险 |
+| P0 | `boot_key` 引入运行期秘密（设备指纹等） | 断掉整条链的静态起点 | **部分机型闪退风险** |
 | P1 | 解释器搬进加密段 + 私有映射执行 | 解释器不落盘明文 | 要改 Amice，工程量大 |
-| P2 | 加强反调试（frida/xposed 检测） | 挡住目前最有效的攻击 | `env_check.c` 有基础 |
+| ~~P2~~ | ~~加强反调试（frida/xposed 检测）~~ | **❌ 实测无效，不要做** | — |
 
 **⚠️ P0 的边界**：运行期秘密必然在内存，有 frida 就能拿。它把
 「静态 40 分钟」变成「动态 40 分钟 + 需要真机」—— 对批量工具是实质障碍，
 对有心人不是。不要高估。
 
+### 15.8.1 为什么"加强反调试"是无效方向（2026-11-18 实测）
+
+外部 0 信息逆向用 **Unicorn 仿真执行** + hook 系统调用，把下面这些
+全部一句话绕过：
+
+| 我们的检查 | 它怎么绕 |
+|---|---|
+| `getauxval(AT_HWCAP)` + `ro.arch` 判定 | 让 `getauxval` 返回 `0x100`、`ro.arch` 返回 `"exynos9810"` |
+| `/proc/self/maps` 校验 `base.apk` | **喂一份伪造的 maps 文本** |
+| `dli_fbase != 0` 检查 | 仿真基址给非零即可 |
+| `ptrace` / `TracerPid` | 仿真里这些系统调用不存在，hook 返回"干净"值 |
+| frida / xposed 检测 | 仿真环境本来就没有 |
+
+**根因**：所有"检查环境是否正常"的代码，都在**攻击者完全控制的环境**里
+执行。他能让任何检查返回任何值。
+
+**有效的只有两类**：
+
+1. **加密** —— 数学保证，与运行环境无关
+2. **VMP** —— 逻辑被编码，要读懂必须逆 VM
+
+**判据**：一个防护如果最终是一个 `if`，那它就能被 patch；
+只有当"输入错了密钥就不对"时，才真正不可绕过。
+
 ### 15.9 怎么验证（不需要反汇编）
 
-产物里有自检报告（`nc_guard_report.c`），开关 `/storage/emulated/0/xixin_debug`：
+产物里有自检报告（`nc_guard_report.c`）—— **但只在调试构建里**
+（构建期 `-DNCGUARD_DEBUG_REPORT`，见 §0.5）。运行期开关是
+`/storage/emulated/0/xixin_debug`：
 
 ```
 /storage/emulated/0/Android/data/<包名>/files/ncguard_log.md
@@ -918,3 +984,54 @@ Shannon；VMP 套数检查段是否存在；体积逐段累加。
 5. **新增 `.c` 文件要同步四处清单**（`test.sh` 通配符已自动、
    `make-zip-lib.sh` 的 `LIB_SRCS`、`nox` CLI 的 `_guard_sources()`、
    `protect.sh` 的拷贝）。V14 断言会检查。
+
+---
+
+### 15.11 dex2c 产物不进 `.ncx`（2026-11-18 决策）
+
+**这一节解释一件容易搞错的事**：`.ncx` 里现在**没有** dex2c 转译产物。
+
+#### 为什么撤掉
+
+dex2c 把 Java 方法翻成 C 再编译，产物是**明文可还原**的：
+
+```
+解开 .ncx 后，反汇编里直接读出：
+  adrp/add → "java/lang/Object"
+  adrp/add → "getClass"
+  adrp/add → "()Ljava/lang/Class;"
+```
+
+类名、方法名、签名全是 `.rodata` 里的明文常量。攻击者把 `blr` 序列
+翻译回 Java 调用，成本 ≈ 读 jadx 输出。
+
+**所以加密它能挡的只是"多一道解锁手续"，而代价是实打实的体积**
+（`.ncx` 是密文，熵 8.0，zlib 完全压不动，涨多少 APK 就涨多少）。
+
+实测这 4 个方法的转译产物约 31 KB —— 加密它 = APK 大 31 KB，
+换来的只是"攻击者多解一次锁"。
+
+#### 现在的做法
+
+| 项 | 做法 |
+|---|---|
+| 段属性 | **不打** section（留在 `.text`） |
+| 混淆 | 打 `annotate("+no_obf")`，amice 侧 `obf_skip::should_skip` 跳过 |
+| 为什么不用专属段名 | **段名本身就是情报** —— `readelf -S` 一眼看到额外段就知道"这里有东西" |
+| 体积 | `.text` 明文，能正常压缩（31 KB 压到约 10 KB） |
+
+#### 反悔成本
+
+想改回加密：`protect.sh` 里把 `so_section_mark.py` 的 `--section .text`
+改回不给 `--section`（默认 `.ncx`），并去掉 `--annotate "+no_obf"`。
+
+⚠️ 但要注意 `protect.sh` 的守卫会 fail-fast（它断言"dex2c 产物不得进 `.ncx`"）。
+改回时守卫也要一起改，否则构建红。
+
+#### 这条决策的边界（如实）
+
+这**降低了** dex2c 产物的保护等级。判断依据是：
+「明文可还原 → 加密收益仅为多一道手续 → 不抵 31 KB 不可压缩体积」。
+
+如果你的判断不同（比如觉得"多一道解锁"也值），改回去即可 —— 
+代码路径都在，只是配置。
