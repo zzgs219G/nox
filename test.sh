@@ -10,7 +10,8 @@
 # 为什么需要 APK：加密用的密钥从 APK 证书派生（这是设计，不是限制）。
 # 没有 APK 就无法验证"解密链路真的通"，只能验证"能编译"。
 #
-# 覆盖 6 项：
+# 覆盖 7 项：
+#   V0 maps 路径解析（纯函数，不需 APK）
 #   V1 能编译（零外部依赖）
 #   V2 五个段齐全
 #   V3 锁箱后 .ncx 确实是密文（熵值）
@@ -191,6 +192,77 @@ else
     [ "$CAN_EXEC" = "0" ] && \
         echo "  ℹ V5/V6/V7（依赖 dlopen 执行）将跳过 —— 静态库形态在 x86 宿主上跑不了 ARM 产物"
 fi
+
+# ── V0 maps 路径解析（纯函数，不需 APK / 不需 Android）──
+#
+# 回归 2026-11-24 真机 SIGBUS：旧实现从「第一个 '/'」截路径，遇到
+# dalvik 匿名映射行 `[anon:dalvik-classes.dex extracte...=/pkg/base.apk]`
+# 会取到 `/pkg/base.apk]`（缺前缀 + 尾部方括号）→ open 失败 →
+# k_so 派生返 -12 → .ncx 不解密 → 执行密文 → SIGBUS 0x89bcef3231。
+#
+# 该测试把判据钉死：anon 行必须拒绝，正常行必须接受，APK 内 zip 路径
+# （base.apk!/lib/...）必须拒绝。
+echo "── V0 maps 路径解析 ──"
+mkdir -p "$W/v0" && cd "$W/v0" || exit 2
+cat > v0.c <<'V0EOF'
+#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+
+/* ⚠️ 与 nc_guard_boot.c 的 ncg_path_from_maps_line 逐字一致。
+ *    改那边必须同步改这里（否则测试与生产脱节 = 假绿）。 */
+static size_t ncg_path_from_maps_line(const char *line, char *out, size_t cap) {
+    const char *p = strstr(line, "base.apk");
+    if (!p) return 0;
+    const char *after = p + 8;
+    if (*after == ']') return 0;
+    if (*after != '\0' && *after != '\n' && *after != ' ') return 0;
+    const char *start = p;
+    while (start > line && start[-1] != ' ' && start[-1] != '\t') start--;
+    if (*start != '/') return 0;
+    size_t l = (size_t)(after - start);
+    if (l == 0 || l >= cap) return 0;
+    for (const char *q = start; q < after; q++)
+        if (*q == '[' || *q == ']') return 0;
+    memcpy(out, start, l);
+    out[l] = '\0';
+    return l;
+}
+static int fails = 0;
+static void chk(const char *line, const char *want, const char *name) {
+    char buf[512];
+    size_t n = ncg_path_from_maps_line(line, buf, sizeof(buf));
+    const char *got = n ? buf : "(reject)";
+    if (strcmp(got, want) != 0) {
+        printf("FAIL %s\n  期望 %s 实得 %s\n", name, want, got);
+        fails++;
+    }
+}
+int main(void) {
+    /* 真机根因：dalvik anon 行（仅当包内有多个 dex 被映射时才出现，
+     * 所以「注入 classes2.dex」会触发，与签名毫无关系） */
+    chk("[anon:dalvik-classes.dex extracte...=/com.x.base.A==/base.apk]",
+        "(reject)", "anon(真机原始行)");
+    chk("7f0-7f1 r-- 0 0 0 [anon:dalvik-base.apk]", "(reject)", "anon方括号");
+    /* 正常行必须接受（含 '=' 的随机目录名是合法的） */
+    chk("6f0d-6f1 r-- 37b000 88000 /data/app/~~xp==/com.x.base.A==/base.apk",
+        "/data/app/~~xp==/com.x.base.A==/base.apk", "标准行(含==)");
+    chk("/data/app/x/base.apk", "/data/app/x/base.apk", "裸路径");
+    /* APK 内 zip 路径不是 APK 本体 */
+    chk("7f0-7f1 r-x 0 0 0 /data/app/x/base.apk!/lib/arm64-v8a/libnc.so",
+        "(reject)", "base.apk!/lib");
+    chk("/data/app/x/other.apk", "(reject)", "非base.apk");
+    chk("", "(reject)", "空行");
+    chk("6f0-6f1 r-- 0 0 0 abc/base.apk", "(reject)", "相对路径");
+    return fails ? 1 : 0;
+}
+V0EOF
+if ${CC:-clang} -O1 -o v0 v0.c 2>v0.log && ./v0; then
+    ok "V0 maps 路径解析（8 用例：anon 拒绝 / 正常接受 / zip 路径拒绝）"
+else
+    bad "V0 maps 路径解析失败"; head -5 v0.log 2>/dev/null
+fi
+cd "$ROOT" || exit 2
 
 # ── V1 编译（只拷本目录的源文件，不加任何外部代码）──
 echo "── V1 独立编译 ──"

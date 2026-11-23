@@ -1853,6 +1853,58 @@ static void ncg_boot_init(void) {
  * 拆出扫描循环后主函数只剩线性调度，压力大降。
  *
  * ⚠️ noinline 不可省（-Oz 会内联回去，拆分失效）。 */
+/* 从一行 maps 里提取可用的 base.apk 路径。返回长度，0 = 该行不可用。
+ *
+ * ==== 为什么不能"取第一个 '/'"（2026-11-24 真机 SIGBUS）====
+ * 旧实现是 `strchr(line, '/')`，把第一个斜杠到 "base.apk" 之间整段当路径。
+ * Android 12+ 的 dalvik 匿名映射行会撞上：
+ *
+ *   [anon:dalvik-classes.dex extracte...=/com.xixin.box-xxx==/base.apk]
+ *                                       ↑ 第一个 '/' 在这里
+ * 取出来是 `/com.xixin.box-xxx==/base.apk]` —— 缺前缀、带尾部 ']'，
+ * open() 必失败 → ncg_apk_first_cert_der 返 -1 → ncg_derive_kso_bound
+ * 返 -12 → 锁箱不解 → .ncx 保持密文 → 执行密文 → SIGBUS 0x89bcef3231。
+ *
+ * 该行只在**包内多个 dex 被 dalvik 映射**时才出现 —— 于是「去校验注入
+ * classes2.dex」这个无关操作会让加固包必崩，且崩溃地址每次相同
+ * （确定性路径错误，不是随机内存问题）。
+ *
+ * ==== 判据（全部满足才接受）====
+ *   ① 路径以 '/' 开头            ② 以 "base.apk" 结尾且后面无 ']' / '!' / '/'
+ *   ③ 不含 '[' ']' '='          ④ 能 open 打开（最终判据，在调用方做）
+ */
+__attribute__((noinline))
+static size_t ncg_path_from_maps_line(const char *line, char *out, size_t cap) {
+    /* 只认行尾就是 base.apk 的（排除 `base.apk!/lib/...` 这种 APK 内
+     * zip 路径 —— 那是加载 .so 用的，不是 APK 本体）。 */
+    const char *p = strstr(line, "base.apk");
+    if (!p) return 0;
+    const char *after = p + 8;                 /* strlen("base.apk") */
+    if (*after == ']') return 0;               /* anon 行，明确拒绝 */
+    if (*after != '\0' && *after != '\n' && *after != ' ') return 0;
+
+    /* 路径起点：maps 行 path 是最后一个字段，往前扫到空白。
+     * 起点必须是 '/'，否则这一行没有绝对路径（anon 行的 `[anon:` 就是这种）。 */
+    const char *start = p;
+    while (start > line && start[-1] != ' ' && start[-1] != '\t') start--;
+    if (*start != '/') return 0;
+
+    size_t l = (size_t)(after - start);
+    if (l == 0 || l >= cap) return 0;
+
+    /* 拒绝 anon 语法残留：路径里出现 '[' 或 ']' 一定不是真文件路径。
+     * ⚠️ 不能拒绝 '='：Android 的安装目录名常含 '='（如 `~~xp==`），
+     *    那是 base64 风格的随机目录，合法。判 anon 行靠上面"起点不是 /"
+     *    与"尾部不是 ]"两条已经足够。 */
+    for (const char *q = start; q < after; q++) {
+        if (*q == '[' || *q == ']') return 0;
+    }
+
+    memcpy(out, start, l);
+    out[l] = '\0';
+    return l;
+}
+
 __attribute__((noinline))
 int ncg_scan_maps_for_base_apk(const char *maps_path,
                                       char *out, size_t cap) {
@@ -1869,25 +1921,19 @@ int ncg_scan_maps_for_base_apk(const char *maps_path,
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         for (ssize_t i = 0; i < n; i++) {
             char c = buf[i];
-            if (c == '\n') {
+            if (c == '\n' || ll + 1 >= sizeof(line)) {
                 line[ll] = 0;
                 ll = 0;
-                const char *p = strstr(line, "base.apk");
-                if (p) {
-                    /* 行格式：addr perms offset dev inode  path
-                     * 路径从第一个 '/' 开始 */
-                    const char *sl = strchr(line, '/');
-                    if (sl && sl <= p) {
-                        size_t l = (size_t)(p - sl) + 8;   /* 含 "base.apk" */
-                        if (l < cap) {
-                            memcpy(out, sl, l);
-                            out[l] = 0;
-                            close(fd);
-                            return 0;
-                        }
+                if (ncg_path_from_maps_line(line, out, cap) > 0) {
+                    /* 最终判据：能打开才算数（防"格式合法但文件不存在"） */
+                    int t = open(out, O_RDONLY);
+                    if (t >= 0) {
+                        close(t);
+                        close(fd);
+                        return 0;
                     }
                 }
-            } else if (ll + 1 < sizeof(line)) {
+            } else {
                 line[ll++] = c;
             }
         }
