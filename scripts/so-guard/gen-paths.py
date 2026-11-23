@@ -24,11 +24,20 @@ import struct
 KEY = bytes([0x4F, 0x1C, 0x8A, 0x73, 0xD5, 0x26, 0xE9, 0x0B,
              0x37, 0xC4, 0x6F, 0x92, 0xA1, 0x58, 0xED, 0x30])
 
-# msg_id 做域分离：两条路径的密钥流互相独立，
+# msg_id 做域分离：每条路径的密钥流互相独立，
 # 避免"已知一条明文就能推另一条"（两段共用密钥流 = two-time pad）。
+#
+# 2026-11-24 追加 2~5（用户决策：开源阶段可维护性优先，报告模块进生产包，
+# 调试不再需要 DEBUG_REPORT=1 重打包 —— 原 #ifdef NCGUARD_DEBUG_REPORT
+# 删除，ncg_debug_log_path 无条件可用）。这些路径明文不落 .rodata，
+# 运行期 ncg_path_s 解码 —— 与 cmdline/maps 同一纪律（"藏一藏"）。
 PATHS = [
     (0, "cmdline", b"/proc/self/cmdline"),
     (1, "maps", b"/proc/self/maps"),
+    (2, "sentinel", b"/storage/emulated/0/xixin_debug"),
+    (3, "anddata", b"/storage/emulated/0/Android/data/"),
+    (4, "logname", b"/files/ncguard_log.md"),
+    (5, "envname", b"NCG_REPORT_PATH"),
 ]
 
 

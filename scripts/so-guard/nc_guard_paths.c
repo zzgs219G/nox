@@ -47,13 +47,46 @@ static const uint8_t ncg_path_blob_maps[] = {
     0x90, 0x6A, 0xBC,
 };
 
+/* msg_id=2  明文 "/storage/emulated/0/xixin_debug"（31 字节）
+ * 2026-11-24 追加：报告哨兵（原 nc_guard_report.c 里的明文字面量，
+ * 0 信息逆向 5 秒命中，现按 cmdline/maps 同款密文化 —— 用户决策：
+ * 开源阶段可维护性优先，日志常开 + 藏字符串）。 */
+static const uint8_t ncg_path_blob_sentinel[] = {
+    0x29, 0x2B, 0xE0, 0xAD, 0xAD, 0x85, 0xA8, 0x0B, 0x45, 0xD3, 0x20, 0x9E,
+    0xC0, 0x33, 0x45, 0xD6, 0xB8, 0x07, 0x4A, 0xC2, 0xA5, 0x39, 0x22, 0x7E,
+    0x20, 0x58, 0xD2, 0x54, 0x77, 0x4F, 0x86,
+};
+
+/* msg_id=3  明文 "/storage/emulated/0/Android/data/"（33 字节） */
+static const uint8_t ncg_path_blob_anddata[] = {
+    0x63, 0xE9, 0x78, 0xE5, 0x0E, 0x02, 0x75, 0x7B, 0x5D, 0x48, 0xEE, 0xF6,
+    0xA8, 0x0C, 0x00, 0xF6, 0xEE, 0x3E, 0xD4, 0xE4, 0xC7, 0x92, 0x52, 0xEE,
+    0x08, 0x40, 0x01, 0x32, 0x26, 0x69, 0x82, 0x7A, 0x70,
+};
+
+/* msg_id=4  明文 "/files/ncguard_log.md"（21 字节） */
+static const uint8_t ncg_path_blob_logname[] = {
+    0xA4, 0x9D, 0x2B, 0xD4, 0xF4, 0xC0, 0xF9, 0x6E, 0xF2, 0x6B, 0x30, 0xC4,
+    0x92, 0x9C, 0x1C, 0x06, 0x24, 0xBA, 0x7E, 0x47, 0xD6,
+};
+
+/* msg_id=5  明文 "NCG_REPORT_PATH"（15 字节） */
+static const uint8_t ncg_path_blob_envname[] = {
+    0xFE, 0xAB, 0xF0, 0xCB, 0x81, 0x8A, 0x73, 0x32, 0xA1, 0xBC, 0x42, 0x21,
+    0x35, 0x2E, 0x9C,
+};
+
 /* 表：与 ncg_path_id 一一对应。顺序必须与枚举一致。 */
 static const struct {
     const uint8_t *blob;
     uint8_t        len;
 } ncg_path_tab[NCG_PATH_COUNT] = {
-    { ncg_path_blob_cmdline, (uint8_t)sizeof(ncg_path_blob_cmdline) },
-    { ncg_path_blob_maps,    (uint8_t)sizeof(ncg_path_blob_maps) },
+    { ncg_path_blob_cmdline,  (uint8_t)sizeof(ncg_path_blob_cmdline) },
+    { ncg_path_blob_maps,     (uint8_t)sizeof(ncg_path_blob_maps) },
+    { ncg_path_blob_sentinel, (uint8_t)sizeof(ncg_path_blob_sentinel) },
+    { ncg_path_blob_anddata,  (uint8_t)sizeof(ncg_path_blob_anddata) },
+    { ncg_path_blob_logname,  (uint8_t)sizeof(ncg_path_blob_logname) },
+    { ncg_path_blob_envname,  (uint8_t)sizeof(ncg_path_blob_envname) },
 };
 
 /* ── 密钥流解密（就地写入调用方缓冲）───────────────────────────────

@@ -11,12 +11,20 @@
 
 #include <stddef.h>
 
-/* 路径 ID。数值即密钥流的 msg_id（域分离用），不要随便改数值 —— 
- * 改了要重跑 gen-paths.py 重新生成密文表。 */
+/* 路径 ID。数值即密钥流的 msg_id（域分离用），不要随便改数值 ——
+ * 改了要重跑 gen-paths.py 重新生成密文表。
+ *
+ * 2026-11-24 追加 2~5（用户决策：开源阶段可维护性优先，报告模块进
+ * 生产包，不再需要 DEBUG_REPORT=1 重打包）：哨兵/日志路径/环境变量名
+ * 全部走本表密文化，.rodata 零明文（test.sh V4 钉住）。 */
 typedef enum {
-    NCG_PATH_CMDLINE = 0,   /* "/proc/self/cmdline" —— 取进程名（包名）*/
-    NCG_PATH_MAPS    = 1,   /* "/proc/self/maps"    —— 定位自身 APK */
-    NCG_PATH_COUNT   = 2
+    NCG_PATH_CMDLINE  = 0,   /* "/proc/self/cmdline" —— 取进程名（包名）*/
+    NCG_PATH_MAPS     = 1,   /* "/proc/self/maps"    —— 定位自身 APK */
+    NCG_PATH_SENTINEL = 2,   /* "/storage/emulated/0/xixin_debug" —— 报告哨兵 */
+    NCG_PATH_ANDDATA  = 3,   /* "/storage/emulated/0/Android/data/" —— 日志目录前缀 */
+    NCG_PATH_LOGNAME  = 4,   /* "/files/ncguard_log.md" —— 日志文件后缀 */
+    NCG_PATH_ENVNAME  = 5,   /* "NCG_REPORT_PATH" —— 宿主测试重定向环境变量名 */
+    NCG_PATH_COUNT    = 6
 } ncg_path_id;
 
 /* 取第 id 条路径的明文写入 buf，返回 buf；失败返回 NULL。

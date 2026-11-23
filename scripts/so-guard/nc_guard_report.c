@@ -47,7 +47,8 @@
 
 #include "nc_guard_layout.h"
 #include "nc_guard_internal.h"
-#include "nc_guard_key.h"   /* ksha256：追踪文案解密用（2026-11-14）*/
+#include "nc_guard_key.h"    /* ksha256：追踪文案解密用（2026-11-14）*/
+#include "nc_guard_paths.h"  /* ncg_path_s：哨兵/env/日志路径密文解码（2026-11-24）*/
 
 /* ── 报告缓冲 ────────────────────────────────────────────────────────
  *
@@ -785,31 +786,53 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *    故拆成两段拼接。
  * ⚠️ 任何一步失败返回 -1，调用方静默跳过。 */
 int ncg_debug_log_path(char *out, size_t cap) {
-#ifdef NCGUARD_DEBUG_REPORT
-    static const char kSentinel[] = "/storage/emulated/0/xixin_debug";
+    /* ═══ 2026-11-24：编译期开关删除，报告模块无条件进入生产包 ════════
+     *
+     * 历史包袱交代（为什么这里曾有 #ifdef NCGUARD_DEBUG_REPORT）：
+     *   0 信息逆向报告（2026-11-18）用 Unicorn 仿真 hook getenv/access，
+     *   5 秒命中本函数的【明文】哨兵/env 字符串 → touch 哨兵即让壳吐出
+     *   12 步解密流水线。当时的修法是整段编译掉（release 不存在），
+     *   代价是排障必须用 DEBUG_REPORT=1 重打包 —— 线上问题无法这样查，
+     *   用户长期不满（"烦人"）。
+     *
+     * 2026-11-24 用户决策：开源阶段可维护性优先 —— 日志常开，字符串
+     * 按 cmdline/maps 同款密文化"藏一藏"。改动：
+     *   ① 哨兵/env/日志路径全部改走 nc_guard_paths 密文表（.rodata 零明文，
+     *      strings 扫不到 —— V4 钉住）；Unicorn 仿真的攻击面与 siglog 相同
+     *      （sig_check 的哨兵自 2026-10-16 起就是密文化+生产常开，先例在）。
+     *   ② boot.c 的 NCG_REPORT_ENABLE 默认本就是 1 —— 唯一闸门是本函数，
+     *      现已拆除。
+     *   ③ DEBUG_REPORT=1 / trigger_build.py --debug-report 不再需要
+     *      （保留参数兼容，传不传都一样）。
+     * 若将来闭源，再评估收紧（流水线追踪档恢复编译期开关是现成方案）。 */
     char pkg[128];
     char dir[384];
-    char cmdline_path[64];
+    char cmdline_path[48];
+    char sentinel[48];
+    char envname[24];
+    char anddata[48];
+    char logname[32];
     int fd;
     ssize_t n;
     size_t i;
+    const char *t;
 
     if (!out || cap < 64) return -1;
 
     /* 宿主测试逃生口：Android 11+ 分区存储禁止 Termux 在
      * /storage/emulated/0/Android/data/ 下建目录，test.sh 用它重定向。 */
-    {
-        const char *t = getenv("NCG_REPORT_PATH");
+    if (ncg_path_s(NCG_PATH_ENVNAME, envname, sizeof(envname))) {
+        t = getenv(envname);
         if (t && *t) { snprintf(out, cap, "%s", t); return 0; }
     }
 
-    if (access(kSentinel, F_OK) != 0) return -1;   /* 哨兵不存在 → 关 */
+    /* 哨兵不存在 → 关（运行期开关，与 siglog 同一个哨兵文件） */
+    if (!ncg_path_s(NCG_PATH_SENTINEL, sentinel, sizeof(sentinel))) return -1;
+    if (access(sentinel, F_OK) != 0) return -1;
 
-    {
-        static const char p1[] = "/proc/self/";
-        static const char p2[] = "cmdline";
-        snprintf(cmdline_path, sizeof(cmdline_path), "%s%s", p1, p2);
-    }
+    /* 包名：/proc/self/cmdline，截到第一个 ':'（子进程带 ":remote" 后缀） */
+    if (!ncg_path_s(NCG_PATH_CMDLINE, cmdline_path, sizeof(cmdline_path)))
+        return -1;
     fd = open(cmdline_path, O_RDONLY);
     if (fd < 0) return -1;
     n = read(fd, pkg, sizeof(pkg) - 1);
@@ -821,42 +844,12 @@ int ncg_debug_log_path(char *out, size_t cap) {
     }
     if (pkg[0] == '\0') return -1;
 
-    snprintf(dir, sizeof(dir),
-             "/storage/emulated/0/Android/data/%s/files", pkg);
+    if (!ncg_path_s(NCG_PATH_ANDDATA, anddata, sizeof(anddata))) return -1;
+    if (!ncg_path_s(NCG_PATH_LOGNAME, logname, sizeof(logname))) return -1;
+    snprintf(dir, sizeof(dir), "%s%s/files", anddata, pkg);
     (void)mkdir(dir, 0771);
-    snprintf(out, cap,
-             "/storage/emulated/0/Android/data/%s/files/ncguard_log.md", pkg);
+    snprintf(out, cap, "%s%s/files%s", anddata, pkg, logname);
     return 0;
-#else
-    /* ═══ 2026-11-18：release 构建里整段编译掉 ══════════════════════
-     *
-     * 为什么（0 信息逆向报告的实测结论）：
-     *   报告作者用 Unicorn 仿真执行 init_array，hook getenv/access，
-     *   5 秒就发现两个调试开关：
-     *     getenv("NCG_REPORT_PATH")           → 日志路径可被环境变量覆盖
-     *     access("/storage/emulated/0/xixin_debug") → 哨兵文件
-     *   而这两个字符串在 .rodata 是【明文】——`strings libnc.so | grep
-     *   xixin` 一条命令就能看到，不需要任何逆向技能。看到之后
-     *   `touch` 一下就能让壳把 12 步解密流水线写成中文报告，
-     *   等于把"逆向 12 个未知函数"降级成"读一份自述文档"。
-     *
-     * 为什么不能只改名：
-     *   用户明确反对（"改文件名那我以后怎么调试"）。名字必须可读，
-     *   否则自己都记不住。
-     *
-     * 为什么不用 Android 的 debuggable：
-     *   protect.sh:2560 已经强制 debuggable=false —— 那是安全要求
-     *   （debuggable=true 会让 run-as 进沙箱、调试器 attach，
-     *   绕过我们的反调试）。不能为调试把它改回去。
-     *
-     * 所以改成编译期开关：release 不定义 NCGUARD_DEBUG_REPORT，
-     * 这段代码【根本不存在】——strings 搜不到 kSentinel 路径，
-     * 也搜不到 getenv 调用。要调试时构建期加 -DNCGUARD_DEBUG_REPORT。
-     *
-     * 用法见 docs/调试包怎么出.md。 */
-    (void)out; (void)cap;
-    return -1;
-#endif
 }
 
 int ncg_report_flush(const char *buf, size_t len) {
