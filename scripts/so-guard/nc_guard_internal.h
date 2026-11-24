@@ -300,6 +300,11 @@ void ncg_trace_s(int id, const char *s);
 /* 计算日志文件路径（哨兵 /storage/emulated/0/xixin_debug 存在才算开）。 */
 int ncg_debug_log_path(char *out, size_t cap);
 
+/* APK 路径可读性检查（内联 svc，不经被 hook 的 libc access）。
+ * ⚠️ 实现在 nc_guard_paths.c（明文 .text）—— 不能放 nc_guard_crypto.c
+ *    （整文件 VMP，内联汇编在 VM 转换后语义不可靠，2026-11-24 实测）。 */
+int ncg_apk_readable(const char *path);
+
 /* 日志路径拼接（纯函数，2026-11-25 抽出供宿主测试直接断言；
  * boundary：v0.9.50 双写 /files 与 v0.9.51 counter 跨块错位
  * 都发生在这段生产拼接上，而 V12 逃生口从不经过）。 */

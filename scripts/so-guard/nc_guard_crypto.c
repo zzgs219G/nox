@@ -55,7 +55,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>               /* open/read：ncg_self_pkg / ncg_find_apk_path 用 */
-#include <sys/syscall.h>         /* __NR_faccessat：APK 定位的内联 svc 用（2026-11-24）*/
 #include <sys/mman.h>            /* mprotect：ncguard_stub_recover 用 */
 #include <dlfcn.h>               /* Dl_info：本文件已不直接用，保留以免
                                   * 调用方头文件顺序变化时踩空 */
@@ -497,64 +496,6 @@ int ncg_self_pkg(char *out, size_t cap) {
 
 /* 定位自身 APK 路径：先扫 /proc/self/maps，再按 so 路径反推。
  * ⚠️ 必须在 .text（明文）：stub 阶段就要用它读证书。 */
-/* ── 不经 libc 的可读性检查（2026-11-24）───────────────────────────
- *
- * 为什么不能直接用 access()：去签名校验类工具（本项目的 libusign.so）
- * 会把 17 个路径类 libc 函数 inline hook 到诱饵包。锁箱用 access() 验证
- * 候选 APK 路径时，hook 让 access 检查【origin.apk】并通过 → 候选被接受
- * → 随后 open 也被重定向 → 读到的是原开发者证书 → k_so 用错证书派生
- * → MAC 失败，或（本事故）路径本身拼错时根本读不到 → -12 → SIGILL。
- *
- * 契约（与 artifact-pipeline 的 sig_check.c 同纪律）：
- *   任何新增的"读自身 APK"路径都必须走内联 svc，不经 libc。
- * ⚠️ faccessat 在 arm64 是 __NR_faccessat（Linux 5.8+ 又有 faccessat2；
- *    这里用老接口即可，O_RDONLY 探测存在性 + 可读）。
- * ⚠️ armv7 的 r7 是保留寄存器（Thumb frame pointer），必须 push/pop。 */
-#if defined(__aarch64__) || defined(__arm__)
-/* ⚠️ 写法照抄 artifact-pipeline/scripts/guard/src/env_check.c 的
- *    env_raw_syscall —— 那个在真机上跑了两个月（2026-10 起），是仓库里
- *    唯一被验证过的内联 svc 形态。**不要"优化"成别的约束写法**：
- *    第一版我用了 `register long x2 __asm__("x2") = R_OK` 的独立约束，
- *    armv7 分支还要手工 mov r2/r3，容易漏掉参数传递（且无法在宿主验证
- *    ARM 汇编）。统一走"参数逐个进输入约束、r0/x0 作为读写输出"的形态。 */
-static long ncg_raw_svc6(long n, long a0, long a1, long a2, long a3) {
-#if defined(__aarch64__)
-    register long x8 __asm__("x8") = n;
-    register long x0 __asm__("x0") = a0;
-    register long x1 __asm__("x1") = a1;
-    register long x2 __asm__("x2") = a2;
-    register long x3 __asm__("x3") = a3;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
-                     : "memory");
-    return x0;
-#else
-    register long r0 __asm__("r0") = a0;
-    __asm__ volatile(
-        "push {r7}\n\t"
-        "mov  r7, %[nr]\n\t"
-        "svc  #0\n\t"
-        "pop  {r7}"
-        : "+r"(r0)
-        : [nr] "r"(n), "r"(a1), "r"(a2), "r"(a3)
-        : "memory");
-    return r0;
-#endif
-}
-
-__attribute__((noinline))
-static int ncg_raw_faccessat(const char *path) {
-    /* faccessat(AT_FDCWD, path, R_OK, 0) */
-    return (int)ncg_raw_svc6(__NR_faccessat, (long)AT_FDCWD,
-                             (long)path, (long)R_OK, 0L);
-}
-#else
-static int ncg_raw_faccessat(const char *path) {
-    return access(path, R_OK);   /* 非 ARM 平台（宿主测试）退回 libc */
-}
-#endif
-
 int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
     const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
@@ -593,7 +534,7 @@ int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
             memcpy(rootcand, kProcRoot, sizeof(kProcRoot) - 1);
             memcpy(rootcand + sizeof(kProcRoot) - 1, so_path, dirlen);
             memcpy(rootcand + sizeof(kProcRoot) - 1 + dirlen, kBase, bl + 1);
-            if (ncg_raw_faccessat(rootcand) == 0 && strlen(rootcand) + 1 <= cap) {
+            if (ncg_apk_readable(rootcand) == 0 && strlen(rootcand) + 1 <= cap) {
                 memcpy(out, rootcand, strlen(rootcand) + 1);
                 return 0;
             }
@@ -602,7 +543,7 @@ int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
         if (dirlen + bl + 1 <= sizeof(cand)) {
             memcpy(cand, so_path, dirlen);
             memcpy(cand + dirlen, kBase, bl + 1);
-            if (ncg_raw_faccessat(cand) == 0 && strlen(cand) + 1 <= cap) {
+            if (ncg_apk_readable(cand) == 0 && strlen(cand) + 1 <= cap) {
                 memcpy(out, cand, strlen(cand) + 1);
                 return 0;
             }

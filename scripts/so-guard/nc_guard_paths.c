@@ -22,6 +22,9 @@
  */
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>      /* access（非 ARM 分支）*/
+#include <fcntl.h>       /* AT_FDCWD */
+#include <sys/syscall.h> /* __NR_faccessat：内联 svc（2026-11-24）*/
 
 #include "nc_guard_paths.h"
 #include "nc_guard_key.h"    /* ksha256（已在 .text，且被 khmac 复用）*/
@@ -173,3 +176,68 @@ const char *ncg_path_s(int id, char *buf, size_t cap) {
     buf[n] = '\0';
     return buf;
 }
+
+/* ── APK 路径可读性检查（2026-11-24，从 nc_guard_crypto.c 移来）────────
+ *
+ * ⚠️⚠️ 为什么必须放在本文件、而不是 nc_guard_crypto.c：
+ *   后者是【整文件 VMP】的目标（make-zip-lib.sh 的 _vmp=1 名单）。
+ *   第一版把本函数写在那里 → 被 Amice 虚拟化进 .ncq 字节码 → 实测
+ *   .ncq 从 95,397 涨到 108,693 B，而内联 svc 在 VM 转换后语义不可靠
+ *   （svc 被当作普通操作码处理），于是修复【静默失效】：
+ *   真机上 ncg_find_apk_path 仍返回 -1，锁箱 U12 仍 -12，照样 SIGILL。
+ *   教训：**内联汇编/系统调用必须放在不被 VMP 的编译单元**。
+ *   本文件不在 VMP 名单 → 明文 .text，且被 ncg_boot_key 的 CRC 覆盖
+ *   （改这里会让 k_stub 变，属额外收益）。
+ *
+ * 为什么不直接用 access()：去签名校验类工具（本项目的 libusign.so）把
+ * 17 个路径类 libc 函数 inline hook 到诱饵包。锁箱用 access() 验证候选
+ * 路径时会被重定向，"检查通过"但读的是 origin.apk。
+ * 契约（与 artifact-pipeline 的 sig_check.c 同纪律）：任何新增的
+ * "读自身 APK" 路径都必须走内联 svc。
+ *
+ * ⚠️ armv7 的 r7 是保留寄存器（Thumb frame pointer），必须 push/pop。
+ * ⚠️ 返回 0 = 可读；非 0 = 不可读（-ENOENT / -EACCES / -ENOSYS 等）。 */
+#if defined(__aarch64__) || defined(__arm__)
+static long ncg_svc4(long n, long a0, long a1, long a2, long a3) {
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+                     : "memory");
+    return x0;
+#else
+    register long r0 __asm__("r0") = a0;
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %[nr]\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : [nr] "r"(n), "r"(a1), "r"(a2), "r"(a3)
+        : "memory");
+    return r0;
+#endif
+}
+
+__attribute__((noinline, used))
+int ncg_apk_readable(const char *path) {
+    if (!path || !*path) return -1;
+    /* faccessat(AT_FDCWD, path, R_OK, 0) */
+    return (int)ncg_svc4(__NR_faccessat, (long)AT_FDCWD, (long)path,
+                         (long)R_OK, 0L);
+}
+#else
+/* 非 ARM 平台（宿主测试）：没有 svc，退回 libc。
+ * ⚠️ 宿主测试不模拟 hook 场景，此处行为与真机不同是已知且可接受的
+ *    （真机路径由本条注释上方那个分支负责）。 */
+__attribute__((noinline, used))
+int ncg_apk_readable(const char *path) {
+    if (!path || !*path) return -1;
+    return access(path, R_OK);
+}
+#endif
