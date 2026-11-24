@@ -499,7 +499,14 @@ int ncg_self_pkg(char *out, size_t cap) {
 int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
     const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
-    if (_mp && ncg_scan_maps_for_base_apk(_mp, out, cap) == 0) return 0;
+    /* 诊断（2026-11-25）：每路结果进 ncguard_log，用于定位 -12 的真因。
+     * ⚠️ 用 NCG_TR_* 枚举（密文表），文案在 gen-trace.py 里。 */
+    ncg_trace(NCG_TR_U1_MAPS_TRY);
+    if (_mp && ncg_scan_maps_for_base_apk(_mp, out, cap) == 0) {
+        ncg_trace_s(NCG_TR_U1_MAPS_HIT, out);
+        return 0;
+    }
+    ncg_trace(NCG_TR_U1_MAPS_MISS);
 
     /* 回退：从 so 路径反推 .../lib/<abi>/libnc.so → .../base.apk
      *
@@ -524,7 +531,11 @@ int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
         size_t dirlen, bl;
         static const char kBase[] = "/base.apk";
 
-        if (!lib) return -1;
+        ncg_trace_s(NCG_TR_U1_SO_PATH, so_path);
+        if (!lib) {
+            ncg_trace(NCG_TR_U1_NO_LIB);
+            return -1;
+        }
         dirlen = (size_t)(lib - so_path);
         bl = sizeof(kBase) - 1;
 
@@ -534,18 +545,28 @@ int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
             memcpy(rootcand, kProcRoot, sizeof(kProcRoot) - 1);
             memcpy(rootcand + sizeof(kProcRoot) - 1, so_path, dirlen);
             memcpy(rootcand + sizeof(kProcRoot) - 1 + dirlen, kBase, bl + 1);
-            if (ncg_apk_readable(rootcand) == 0 && strlen(rootcand) + 1 <= cap) {
-                memcpy(out, rootcand, strlen(rootcand) + 1);
-                return 0;
+            {
+                int _r = ncg_apk_readable(rootcand);
+                ncg_trace_i(NCG_TR_U1_ROOTCAND, (long long)_r);
+                if (_r == 0 && strlen(rootcand) + 1 <= cap) {
+                    memcpy(out, rootcand, strlen(rootcand) + 1);
+                    ncg_trace_s(NCG_TR_U1_ROOTCAND_OK, rootcand);
+                    return 0;
+                }
             }
         }
         /* ② 原路径 */
         if (dirlen + bl + 1 <= sizeof(cand)) {
             memcpy(cand, so_path, dirlen);
             memcpy(cand + dirlen, kBase, bl + 1);
-            if (ncg_apk_readable(cand) == 0 && strlen(cand) + 1 <= cap) {
-                memcpy(out, cand, strlen(cand) + 1);
-                return 0;
+            {
+                int _r = ncg_apk_readable(cand);
+                ncg_trace_i(NCG_TR_U1_PLAINCAND, (long long)_r);
+                if (_r == 0 && strlen(cand) + 1 <= cap) {
+                    memcpy(out, cand, strlen(cand) + 1);
+                    ncg_trace_s(NCG_TR_U1_PLAINCAND_OK, cand);
+                    return 0;
+                }
             }
         }
     }
