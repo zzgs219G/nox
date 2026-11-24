@@ -119,19 +119,27 @@ static void ncg_path_ctr_xor(const uint8_t *blob, uint8_t msg_id, uint8_t n,
         uint32_t blk = i / 32;          /* 块号 = counter */
         uint32_t off = i % 32;          /* 块内偏移 */
 
-        /* 消息 = key[16] || msg_id_be32 || counter_be64 */
+        /* 消息 = key[16] || msg_id_be32 || counter_be64
+         * ⚠️ counter 是 be64（8 字节）：[20..23] 高 32 位恒 0、[24..27] 低 32 位。
+         *    2026-11-24 修：首版写 msg[20..23]=blk、msg[24..27]=0 —— 那是
+         *    be32 在低位 + 高位置零，与 gen-paths.py 的 struct.pack('>Q', ctr)
+         *    （be64，[20..23]=0、[24..27]=blk）【块内一致、跨块错位】。
+         *    单块（≤32B，cmdline/maps/哨兵）侥幸全对；**跨块（anddata 33B）
+         *    第 2 块密钥流不同 → 尾字节解成 0x90（应为 '/'）** → 拼出非法
+         *    目录 → mkdir/fopen 全部静默失败 → 报告黑洞（真机首验暴露）。
+         *    修后与 gen-paths.py 逐字节一致（36 字节明文对拍验证）。 */
         msg[16] = 0;
         msg[17] = 0;
         msg[18] = 0;
         msg[19] = msg_id;
-        msg[20] = (uint8_t)(blk >> 24);
-        msg[21] = (uint8_t)(blk >> 16);
-        msg[22] = (uint8_t)(blk >> 8);
-        msg[23] = (uint8_t)blk;
-        msg[24] = 0;
-        msg[25] = 0;
-        msg[26] = 0;
-        msg[27] = 0;
+        msg[20] = 0;
+        msg[21] = 0;
+        msg[22] = 0;
+        msg[23] = 0;
+        msg[24] = (uint8_t)(blk >> 24);
+        msg[25] = (uint8_t)(blk >> 16);
+        msg[26] = (uint8_t)(blk >> 8);
+        msg[27] = (uint8_t)blk;
         ksha256(msg, sizeof(msg), ks);
 
         for (; off < 32 && i < n; off++, i++)
