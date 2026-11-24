@@ -2018,3 +2018,44 @@ int ncg_scan_maps_for_base_apk(const char *maps_path,
     return -1;
 }
 
+/* ── 证书读取诊断的桥接（2026-11-25）────────────────────────────────
+ *
+ * 为什么放在【文件末尾】而不是开头：需要 nc_guard_internal.h 的
+ * NCG_TR_CERT_* 枚举与 ncg_trace/ncg_trace_i 声明，而那个头在本文件
+ * 中段才 include（开头放会编译失败：undeclared identifier）。
+ *
+ * 为什么用弱符号桥接：nc_guard_key.c 被 test.sh 的 V11a/V13c 跨语言
+ * 对拍驱动【单独链接】，它不能引 internal.h（否则拖进 ncg_trace 的
+ * 实现 → 链接失败）。所以那边声明 `__attribute__((weak))` 的回调，
+ * 本文件（生产构建）提供实现；对拍驱动不提供 → NULL → 判空跳过。
+ *
+ * id 映射：key.c 用自己的 0x70xx 局部编号，这里翻译成真正的 NCG_TR_*。
+ * 两边一一对应，改一处必须改另一处（注释里已互相指向）。 */
+enum {
+    NCG_KT_ID_CERT_OPEN_NG   = 0x7001,
+    NCG_KT_ID_CERT_FD        = 0x7002,
+    NCG_KT_ID_CERT_FSIZE     = 0x7003,
+    NCG_KT_ID_CERT_NO_EOCD   = 0x7004,
+    NCG_KT_ID_CERT_CDOFF     = 0x7005,
+    NCG_KT_ID_CERT_NO_FOOTER = 0x7006,
+    NCG_KT_ID_CERT_NO_MAGIC  = 0x7007,
+    NCG_KT_ID_CERT_BLKSZ     = 0x7008
+};
+void ncg_key_trace_i(int id, long long v) {
+    switch (id) {
+        case NCG_KT_ID_CERT_OPEN_NG: ncg_trace_i(NCG_TR_CERT_OPEN_NG, v); break;
+        case NCG_KT_ID_CERT_FD:      ncg_trace_i(NCG_TR_CERT_FD, v); break;
+        case NCG_KT_ID_CERT_FSIZE:   ncg_trace_i(NCG_TR_CERT_FSIZE, v); break;
+        case NCG_KT_ID_CERT_CDOFF:   ncg_trace_i(NCG_TR_CERT_CDOFF, v); break;
+        case NCG_KT_ID_CERT_BLKSZ:   ncg_trace_i(NCG_TR_CERT_BLKSZ, v); break;
+        default: break;
+    }
+}
+void ncg_key_trace(int id) {
+    switch (id) {
+        case NCG_KT_ID_CERT_NO_EOCD:   ncg_trace(NCG_TR_CERT_NO_EOCD); break;
+        case NCG_KT_ID_CERT_NO_FOOTER: ncg_trace(NCG_TR_CERT_NO_FOOTER); break;
+        case NCG_KT_ID_CERT_NO_MAGIC:  ncg_trace(NCG_TR_CERT_NO_MAGIC); break;
+        default: break;
+    }
+}

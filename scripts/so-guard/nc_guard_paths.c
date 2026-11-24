@@ -241,3 +241,61 @@ int ncg_apk_readable(const char *path) {
     return access(path, R_OK);
 }
 #endif
+
+/* ── APK 读取：内联 svc 的 open/close/pread/fstat（2026-11-25）─────────
+ *
+ * ⚠️⚠️ 为什么连 open/fstat/pread 都要自己走 svc：
+ *   真机事故（Nivii，加固+去校验组合）：
+ *     ① 构建期用最终签名证书 d82e48da 派生 k_so；
+ *     ② 运行期 SigFix 的 libusign 把 open(base.apk) 重定向到 origin.apk
+ *        （内含原开发者证书 3c81b429）——这是去校验的**本职工作**；
+ *     ③ 锁箱的 ncg_apk_first_cert_der 也走 open → 被一并重定向 →
+ *        读到 3c81b429 ≠ d82e48da → k_so 不匹配 → -13 → 密文 SIGILL。
+ *   两个模块**都在 hook 同一批函数**，锁箱被"误伤"。
+ *
+ * 契约（AGENTS §2）：任何读自身 APK 的路径都必须内联 svc。
+ * 本组函数把 open/fstat/pread 也包起来，与 ncg_apk_readable 同一纪律。
+ *
+ * 返回语义与 libc 一致（失败返回负 errno）。 */
+#if defined(__aarch64__) || defined(__arm__)
+__attribute__((noinline, used))
+int ncg_apk_open_ro(const char *path) {
+    /* openat(AT_FDCWD, path, O_RDONLY, 0) */
+    return (int)ncg_svc4(__NR_openat, (long)AT_FDCWD, (long)path,
+                         (long)O_RDONLY, 0L);
+}
+
+__attribute__((noinline, used))
+long ncg_apk_pread(int fd, void *buf, size_t n, long off) {
+    /* pread64(fd, buf, n, off)：4 个参数，用 ncg_svc4（双 ABI 已处理）。
+     * ⚠️ armv7 不支持 64 位偏移的 pread64 一次传参（ABI 差异）；
+     *    这里按 32 位截断使用 —— 本设施只用 32 位以内的包（>4GB 的 APK
+     *    不存在），并加断言防越界。 */
+    if (off < 0 || off > 0x7FFFFFFFL) return -1;
+    return (long)ncg_svc4(__NR_pread64, (long)fd, (long)buf, (long)n, off);
+}
+
+__attribute__((noinline, used))
+long ncg_apk_fsize(int fd) {
+    /* lseek(fd, 0, SEEK_END) */
+    return (long)ncg_svc4(__NR_lseek, (long)fd, 0L, 2L /* SEEK_END */, 0L);
+}
+
+__attribute__((noinline, used))
+int ncg_apk_close(int fd) {
+    /* close(fd) */
+    return (int)ncg_svc4(__NR_close, (long)fd, 0L, 0L, 0L);
+}
+#else
+/* 宿主测试：退回 libc（不模拟 hook 场景） */
+__attribute__((noinline, used))
+int ncg_apk_open_ro(const char *path) { return open(path, O_RDONLY); }
+__attribute__((noinline, used))
+long ncg_apk_pread(int fd, void *buf, size_t n, long off) {
+    return (long)pread(fd, buf, n, (off_t)off);
+}
+__attribute__((noinline, used))
+long ncg_apk_fsize(int fd) { return (long)lseek(fd, 0, SEEK_END); }
+__attribute__((noinline, used))
+int ncg_apk_close(int fd) { return close(fd); }
+#endif

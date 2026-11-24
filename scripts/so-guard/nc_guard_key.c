@@ -45,6 +45,66 @@
  *    不再需要任何外部函数。 */
 #include "nc_guard_layout.h"
 
+/* ⚠️ 2026-11-25：用 ncg_apk_open_ro / ncg_apk_pread / ncg_apk_fsize /
+ * ncg_apk_close（内联 svc 的 APK I/O 封装，实现在 nc_guard_paths.c）。
+ * 不能用 libc 的 open/pread —— 去签名校验工具 hook 它们，会把锁箱的
+ * 读 APK 重定向到诱饵包。见 nc_guard_paths.c 里那组函数的注释。
+ * ⚠️ 只声明需要的四个，不整体引 internal.h（T32 对拍驱动单独链接本文件，
+ *    多引一个头就多一份跨 TU 依赖 —— 与上方"只引 layout.h"同一理由）。 */
+/* APK I/O 的内联 svc 封装：声明为 weak ——
+ * 实现只在 nc_guard_paths.c（生产构建/整包编译时提供）。
+ * test.sh 的 V11a/V13c 跨语言对拍驱动【只链 nc_guard_key.c】，
+ * 不链 paths.c → 弱符号为 NULL → 下面的 fallback 用 libc。
+ * 真机构建里 paths.c 的实现存在 → 走内联 svc（hook 拦不住）。
+ * ⚠️ 这样既保持 key.c 的独立可链接性，又让生产路径不受 hook 影响。 */
+extern int  ncg_apk_open_ro(const char *path) __attribute__((weak));
+extern long ncg_apk_pread(int fd, void *buf, size_t n, long off) __attribute__((weak));
+extern long ncg_apk_fsize(int fd) __attribute__((weak));
+extern int  ncg_apk_close(int fd) __attribute__((weak));
+
+/* 对拍驱动（无 paths.c）下的回退：直接用 libc。
+ * ⚠️ 只在弱符号缺失时生效 —— 那条路径只用于宿主跨语言对拍，
+ *    不模拟 hook 场景，所以用 libc 是正确的。 */
+static int  k_open_ro_fb(const char *p) { return open(p, O_RDONLY); }
+static long k_pread_fb(int fd, void *b, size_t n, long off) {
+    return (long)pread(fd, b, n, (off_t)off);
+}
+static long k_fsize_fb(int fd) { return (long)lseek(fd, 0, SEEK_END); }
+static int  k_close_fb(int fd) { return close(fd); }
+
+#define K_OPEN(p)  (ncg_apk_open_ro ? ncg_apk_open_ro(p) : k_open_ro_fb(p))
+#define K_PREAD(fd,b,n,off) \
+    (ncg_apk_pread ? ncg_apk_pread(fd,b,n,off) : k_pread_fb(fd,b,n,off))
+#define K_FSIZE(fd) (ncg_apk_fsize ? ncg_apk_fsize(fd) : k_fsize_fb(fd))
+#define K_CLOSE(fd) (ncg_apk_close ? ncg_apk_close(fd) : k_close_fb(fd))
+/* 诊断追踪（2026-11-25）：-13 排查需要知道证书读取走到哪一步。
+ *
+ * ⚠️⚠️ 不能 include "nc_guard_internal.h"：本文件被 test.sh 的 V11a/V13c
+ *    跨语言对拍驱动【单独链接】（只链 nc_guard_key.c + 驱动），引 internal.h
+ *    会拖进 ncg_trace/ncg_wipe 等实现在其他 .c 的符号 → 链接失败
+ *    （实测：V11a/V13c 立刻红，报 ncg_apk_first_cert_der 里的未定义引用）。
+ *    也不手抄 ncg_tr 枚举 —— 那份表 40+ 条，别人插入条目就会错位。
+ *
+ * 做法：用一个**弱符号回调**。boot.c（生产构建）提供实现，
+ * 对拍驱动不提供 → 弱符号为 NULL → 本文件判空跳过，零依赖。 */
+extern void ncg_key_trace_i(int id, long long v) __attribute__((weak));
+extern void ncg_key_trace(int id) __attribute__((weak));
+
+/* 追踪 ID。**只在本文件语义内使用**，不与 ncg_tr 枚举共享编号空间：
+ * 生产构建里 boot.c 的实现会把这些 id 映射到真正的 NCG_TR_* 条目。
+ * 值从 0x7000 起，远离 ncg_tr 的 0..N 与 RPT 的 0x80 域。 */
+#define NCG_KT_CERT_OPEN_NG  0x7001
+#define NCG_KT_CERT_FD       0x7002
+#define NCG_KT_CERT_FSIZE    0x7003
+#define NCG_KT_CERT_NO_EOCD  0x7004
+#define NCG_KT_CERT_CDOFF    0x7005
+#define NCG_KT_CERT_NO_FOOTER 0x7006
+#define NCG_KT_CERT_NO_MAGIC 0x7007
+#define NCG_KT_CERT_BLKSZ    0x7008
+
+#define KT_TRACE_I(id, v) do { if (ncg_key_trace_i) ncg_key_trace_i((id), (v)); } while (0)
+#define KT_TRACE(id)      do { if (ncg_key_trace)   ncg_key_trace((id)); } while (0)
+
 /* ── HKDF 域 label 的密文存储（2026-11-06，P0）────────────────────
  *
  * 问题：label 是 HKDF 的 info 参数，运行期必须参与运算，所以它必然
@@ -446,7 +506,9 @@ void khkdf_sha256(const uint8_t *ikm,size_t ikm_len,
  * Block，不读整个 APK（4.6MB → 几十 KB）。v3 优先，回退 v2。
  * 与 sig_guard2.c 的 g2_extract_cert 同逻辑，但此处自带以免依赖 static 符号。 */
 static int rd_at(int fd,uint64_t off,void *buf,size_t n){
-    return pread(fd,buf,n,(off_t)off)==(ssize_t)n?0:-1;
+    /* ⚠️ 2026-11-25：改走 ncg_apk_pread（内联 svc）——去签名校验工具会
+     * hook libc 的 pread，把锁箱读 APK 重定向到诱饵包。见 paths.c 的注释。 */
+    return K_PREAD(fd,buf,n,(long)off)==(long)n?0:-1;
 }
 static uint32_t le32(const uint8_t*p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 static uint64_t le64(const uint8_t*p){uint64_t v=0;int i;for(i=7;i>=0;i--)v=v<<8|p[i];return v;}
@@ -515,10 +577,31 @@ static int apk_first_cert_der_from_scheme(const uint8_t *s,size_t sn,
 }
 
 int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size_t *der_len){
-    int fd=open(apk_path,O_RDONLY);
-    if(fd<0) return -1;
-    struct stat st; if(fstat(fd,&st)!=0||st.st_size<64){close(fd);return -1;}
-    uint64_t fsize=(uint64_t)st.st_size;
+    /* ⚠️⚠️ 2026-11-25 真机事故（Nivii，加固+去校验组合）：
+     *   这里原本是 `int fd = open(apk_path, O_RDONLY); fstat(...)`。
+     *   而 open/fstat/pread 全是「去签名校验」工具（libusign.so）hook 的
+     *   目标 —— 它把 open(base.apk) 重定向到 origin.apk（原开发者证书）。
+     *   于是锁箱读到的是 origin.apk 的证书（3c81b429），与构建期用的
+     *   最终签名证书（d82e48da）不符 → k_so 错 → -13 → 密文 SIGILL。
+     *   症状伪装得极像"证书/包名不匹配"，实际是两模块抢同一批 hook。
+     *
+     *   修法：全部走内联 svc（ncg_apk_open_ro / ncg_apk_fsize /
+     *   ncg_apk_pread / ncg_apk_close），hook 拦不住内核直投。
+     *   与 ncg_find_apk_path 同一纪律（AGENTS §2：读自身 APK 必须内联 svc）。 */
+    int fd=K_OPEN(apk_path);
+    if(fd<0){
+        /* 诊断（2026-11-25）：区分"打不开"与"打开但解析失败"。
+         * 真机 -13 排查时这两个方向完全不同：
+         *   打不开 → 路径/权限/hook 重定向目标不存在
+         *   解析失败 → 签名块结构问题 */
+        KT_TRACE_I(NCG_KT_CERT_OPEN_NG, (long long)fd);
+        return -1;
+    }
+    KT_TRACE_I(NCG_KT_CERT_FD, (long long)fd);
+    long _fs=K_FSIZE(fd);
+    if(_fs<64){K_CLOSE(fd);return -1;}
+    KT_TRACE_I(NCG_KT_CERT_FSIZE, _fs);
+    uint64_t fsize=(uint64_t)_fs;
     uint8_t eocd[22];
 
     /* 1) EOCD：尾部前 64KB 内反向找 PK\x05\x06
@@ -536,10 +619,10 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
      * 区间内的 3 条均已补 free（下方三处）。 */
     {
         uint8_t *tail=(uint8_t*)malloc(65557);
-        if(!tail){close(fd);return -1;}
+        if(!tail){K_CLOSE(fd);return -1;}
         uint64_t start=fsize>65557?fsize-65557:0;
         size_t len=(size_t)(fsize-start);
-        if(rd_at(fd,start,tail,len)!=0){free(tail);close(fd);return -1;}
+        if(rd_at(fd,start,tail,len)!=0){free(tail);K_CLOSE(fd);return -1;}
         long eo=-1;
         if(len>=22){
             for(size_t i=len-22+1;i-->0;)
@@ -547,12 +630,14 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
                     eo=(long)i;break;
                 }
         }
-        if(eo<0){free(tail);close(fd);return -1;}
+        if(eo<0){free(tail);K_CLOSE(fd);
+            KT_TRACE(NCG_KT_CERT_NO_EOCD);return -1;}
         memcpy(eocd,tail+eo,22);
         free(tail);
     }
     uint64_t cd_off=le32(eocd+16);
-    if(cd_off<32||cd_off>=fsize){close(fd);return -1;}
+    KT_TRACE_I(NCG_KT_CERT_CDOFF, (long long)cd_off);
+    if(cd_off<32||cd_off>=fsize){K_CLOSE(fd);return -1;}
 
     /* 2) Signing Block footer：cd_off-24 处 size+magic
      * 照抄 XopProtector crypto/apk_sign.cpp:21-22：
@@ -561,14 +646,19 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
      * ⚠️ 我第一版凭印象编了 0x342e726f6e6f632e / 0x2e706f6f6c，小端解出来是
      * ".conor.4" / "loop." —— magic 永不匹配，真 APK 提取必失败。 */
     uint8_t footer[24];
-    if(rd_at(fd,cd_off-24,footer,24)!=0){close(fd);return -1;}
+    if(rd_at(fd,cd_off-24,footer,24)!=0){K_CLOSE(fd);
+        KT_TRACE(NCG_KT_CERT_NO_FOOTER);return -1;}
     if(le64(footer+8)!=0x20676953204b5041ULL||le64(footer+16)!=0x3234206b636f6c42ULL){
-        close(fd);return -1;
+        /* 诊断：footer magic 不是 "APK Sig Block 42" —— 说明这个 APK
+         * 没有 v2/v3 签名块，或 CD offset 指错了位置。 */
+        KT_TRACE(NCG_KT_CERT_NO_MAGIC);
+        K_CLOSE(fd);return -1;
     }
     uint64_t block_size=le64(footer);
-    if(block_size<24||block_size+8>cd_off){close(fd);return -1;}
+    KT_TRACE_I(NCG_KT_CERT_BLKSZ, (long long)block_size);
+    if(block_size<24||block_size+8>cd_off){K_CLOSE(fd);return -1;}
     uint64_t total=block_size+8, block_off=cd_off-total;
-    if(total>der_cap+4096){close(fd);return -1;}     /* 防御性上限 */
+    if(total>der_cap+4096){K_CLOSE(fd);return -1;}     /* 防御性上限 */
 
     /* 3) 只把 block 读进缓冲，再在其中找 v3/v2 的 id-value 对
      *
@@ -578,10 +668,10 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
      *   返回的 der 也指向 blk 内），提前 free = use-after-free。
      *   下方每条提前 return 的路径都补了 free(blk)。 */
     uint8_t *blk=(uint8_t*)malloc(65536);
-    if(!blk){close(fd);return -1;}
-    if(total>65536){free(blk);close(fd);return -1;}
-    if(rd_at(fd,block_off,blk,(size_t)total)!=0){free(blk);close(fd);return -1;}
-    if(le64(blk)!=block_size){free(blk);close(fd);return -1;}
+    if(!blk){K_CLOSE(fd);return -1;}
+    if(total>65536){free(blk);K_CLOSE(fd);return -1;}
+    if(rd_at(fd,block_off,blk,(size_t)total)!=0){free(blk);K_CLOSE(fd);return -1;}
+    if(le64(blk)!=block_size){free(blk);K_CLOSE(fd);return -1;}
 
     /* id-value 对遍历：APK Sig Block v2=0x7109871a, v3=0xf05368c0 */
     const uint8_t *v3=NULL,*v2=NULL; size_t v3n=0,v2n=0;
@@ -599,11 +689,11 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
     const uint8_t *cd=NULL; uint32_t cl=0;
     if(v3&&apk_first_cert_der_from_scheme(v3,v3n,&cd,&cl)==0) ;
     else if(v2&&apk_first_cert_der_from_scheme(v2,v2n,&cd,&cl)==0) ;
-    else {free(blk);close(fd);return -1;}
-    if((size_t)cl>der_cap){free(blk);close(fd);return -1;}
+    else {free(blk);K_CLOSE(fd);return -1;}
+    if((size_t)cl>der_cap){free(blk);K_CLOSE(fd);return -1;}
     memcpy(der,cd,cl); *der_len=cl;
     free(blk);
-    close(fd);
+    K_CLOSE(fd);
     return 0;
 }
 

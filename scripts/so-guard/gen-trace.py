@@ -106,6 +106,16 @@ STAGES = [
     ("U12_OK_KSO", "U12 OK k_so 已派生"),
     ("U12_FAIL_RC", "U12 FAIL rc 值"),
     ("U12_FAIL", "U12 FAIL k_so 派生失败 —— 证书/包名不匹配（fail-closed -12）"),
+    # 证书读取的细分诊断（2026-11-25，-13 排查）：open/fsize/cdoff/magic
+    # 四个节点各自能区分不同根因（打不开 vs 签名块缺失 vs offset 错）。
+    ("CERT_OPEN_NG", "CERT 打开 APK 失败 rc"),
+    ("CERT_FD", "CERT fd"),
+    ("CERT_FSIZE", "CERT 文件大小"),
+    ("CERT_NO_EOCD", "CERT FAIL 找不到 EOCD"),
+    ("CERT_CDOFF", "CERT CD offset"),
+    ("CERT_NO_FOOTER", "CERT FAIL 读不到 Signing Block footer"),
+    ("CERT_NO_MAGIC", "CERT FAIL footer magic 不匹配（无 v2/v3 签名块）"),
+    ("CERT_BLKSZ", "CERT 签名块大小"),
     ("U13_NSEG", "U13 待校验段数"),
     ("U14_OK", "U14 OK 段完整性校验通过（MAC 一致）"),
     ("U14_FAIL", "U14 FAIL 段完整性校验 rc"),

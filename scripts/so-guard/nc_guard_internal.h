@@ -224,6 +224,14 @@ typedef enum {
     NCG_TR_U12_OK_KSO,
     NCG_TR_U12_FAIL_RC,
     NCG_TR_U12_FAIL,
+    NCG_TR_CERT_OPEN_NG,
+    NCG_TR_CERT_FD,
+    NCG_TR_CERT_FSIZE,
+    NCG_TR_CERT_NO_EOCD,
+    NCG_TR_CERT_CDOFF,
+    NCG_TR_CERT_NO_FOOTER,
+    NCG_TR_CERT_NO_MAGIC,
+    NCG_TR_CERT_BLKSZ,
     NCG_TR_U13_NSEG,
     NCG_TR_U14_OK,
     NCG_TR_U14_FAIL,
@@ -315,6 +323,14 @@ int ncg_debug_log_path(char *out, size_t cap);
  * ⚠️ 实现在 nc_guard_paths.c（明文 .text）—— 不能放 nc_guard_crypto.c
  *    （整文件 VMP，内联汇编在 VM 转换后语义不可靠，2026-11-24 实测）。 */
 int ncg_apk_readable(const char *path);
+
+/* APK 读取的内联 svc 封装（2026-11-25）：open/fstat/pread 也会被
+ * 去签名校验工具 hook —— 锁箱读证书必须绕开。实现在 nc_guard_paths.c
+ * （非 VMP 编译单元）。语义同 libc，失败返回负 errno。 */
+int ncg_apk_open_ro(const char *path);
+long ncg_apk_pread(int fd, void *buf, size_t n, long off);
+long ncg_apk_fsize(int fd);
+int ncg_apk_close(int fd);
 
 /* 日志路径拼接（纯函数，2026-11-25 抽出供宿主测试直接断言；
  * boundary：v0.9.50 双写 /files 与 v0.9.51 counter 跨块错位
