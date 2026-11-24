@@ -848,7 +848,13 @@ int ncg_debug_log_path(char *out, size_t cap) {
     if (!ncg_path_s(NCG_PATH_LOGNAME, logname, sizeof(logname))) return -1;
     snprintf(dir, sizeof(dir), "%s%s/files", anddata, pkg);
     (void)mkdir(dir, 0771);
-    snprintf(out, cap, "%s%s/files%s", anddata, pkg, logname);
+    /* ⚠️ out = anddata + pkg + logname。logname 已含 "/files/" 前缀
+     * （gen-paths.py PATHS[4] = "/files/ncguard_log.md"）—— 这里**不能**
+     * 再拼一次 "/files"：首版写成 "%s%s/files%s" 会落到不存在的
+     * files/files/ 二级目录 → fopen 静默失败 → 整个报告黑洞。
+     * 宿主 test.sh 抓不到它：V12 走 NCG_REPORT_PATH 逃生口提前 return，
+     * 根本不经过这段拼接（2026-11-24 真机首验踩中，ncguard_log.md 为空）。 */
+    snprintf(out, cap, "%s%s%s", anddata, pkg, logname);
     return 0;
 }
 
