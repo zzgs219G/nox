@@ -95,9 +95,15 @@ jobs:
             || { echo "✗ 产物缺 .ncx 段"; exit 1; }
           echo "✔ 产物含 .ncx 段"
 
-  # ── 第二关：打包 ────────────────────────────────────────────────
+  # ── 第二关：打包（与 verify 并行）────────────────────────────────
+  # 2026-11-25：去掉 `needs: verify`。依据：
+  #   ① build 不消费 verify 的任何产物（无 download-artifact / needs.verify.outputs）；
+  #   ② build 自己会「解压产物 → 跑 ./test.sh → 真实加密链路验证」，
+  #      所以 verify 挂了也不会漏过验收；
+  #   ③ release 仍是 needs: [verify, build] —— 两个都绿才发，双保险不变。
+  # 收益：max(verify, build) 而非 verify + build，省约 50s。
+  # 代价：verify 失败时 build 白跑（不花钱，只占机器时间）。
   build:
-    needs: verify
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
