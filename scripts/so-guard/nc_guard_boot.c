@@ -43,6 +43,39 @@
 #  define NCG_REPORT_ENABLE 1
 #endif
 
+/* 死亡/结果通告（2026-11-24）：解锁 rc 的 logcat 短报。
+ *
+ * 为什么需要：ncg_report_flush 写 sdcard 文件，而 ncguard_unlock 跑在
+ * constructor(50) —— 进程最早的阶段，/storage 的 FUSE 经常未就绪 →
+ * open 失败被"静默"纪律吞掉 → 锁箱失败的报告整个丢失（真机 2026-11-24
+ * 实测：闪退场景 ncguard_log.md 不存在，而晚期的 siglog 能写 —— 同一次
+ * 启动里"早期失败、晚期成功"的 FUSE 竞态）。
+ * logcat 走 /dev/log socket，不依赖 FUSE，constructor 早期必然可用。
+ * 对逆向者的暴露：只有 rc 码与防线标识，不含任何密钥/结构信息；
+ * 读 logd 需要 adb/root —— 与读 tombstone 同级，不新增泄露面。 */
+#if NCG_REPORT_ENABLE
+/* ⚠️ 用 weak symbol 而不是 #ifdef __ANDROID__：Termux 的 clang 同样定义
+ * __ANDROID__，宿主测试 so 会引用 __android_log_print 且无 liblog 可链
+ * → dlopen 失败（2026-11-24 实测 V6/V7/V12a 三连红）。weak 缺失时指针
+ * 为 NULL，运行期判空跳过 —— 真机（链 -llog）打 logcat，宿主自动降级。 */
+extern int __android_log_print(int prio, const char *tag, const char *fmt, ...)
+    __attribute__((weak));
+static void ncg_death_notice(int rc) {
+    const char *why =
+        (rc == 0)   ? "解锁成功" :
+        (rc == -11) ? "MAC 校验失败(产物被篡改或段表不符)" :
+        (rc == -12) ? "证书/包名派生失败(换证书重签?)" :
+        (rc == -8 || rc == -10) ? "内存保护操作失败" :
+        (rc == -3)  ? "密钥槽缺失/不完整" :
+        (rc == -9)  ? "内存分配失败" : "其他错误";
+    if (__android_log_print)
+        __android_log_print(4 /* ANDROID_LOG_ERROR */, "nc",
+                            "【防线0·锁箱】解锁 rc=%d: %s", rc, why);
+}
+#else
+static void ncg_death_notice(int rc) { (void)rc; }
+#endif
+
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -1835,6 +1868,9 @@ int ncguard_unlock(void) {
             }
         }
     }
+    /* 死亡/结果通告（2026-11-24）：无论成败，logcat 必有一条锁箱结论。
+     * 失败时这是唯一的可靠通道（文件日志撞 FUSE 竞态，见 ncg_death_notice）。 */
+    ncg_death_notice(rc);
     return rc;
 }
 
