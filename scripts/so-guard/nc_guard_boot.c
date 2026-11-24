@@ -1973,13 +1973,32 @@ int ncg_scan_maps_for_base_apk(const char *maps_path,
                 line[ll] = 0;
                 ll = 0;
                 if (ncg_path_from_maps_line(line, out, cap) > 0) {
-                    /* 最终判据：能打开才算数（防"格式合法但文件不存在"） */
-                    int t = open(out, O_RDONLY);
-                    if (t >= 0) {
-                        close(t);
+                    /* 最终判据：能读才算数（防"格式合法但文件不存在"）。
+                     *
+                     * ⚠️⚠️ 2026-11-25 真机事故（Nivii）：这里原本是
+                     *   `int t = open(out, O_RDONLY); if (t >= 0) ...`
+                     *   而 open 正是「去签名校验」工具（本项目的 libusign.so）
+                     *   会 inline hook 的 17 个函数之一 —— 它把这个 open
+                     *   重定向到诱饵包 code_cache/sigfix-origin.apk。
+                     *   而锁箱跑在 constructor(50)（进程最早），此时 SigFix
+                     *   还没释放 origin.apk → 重定向目标不存在 → open 失败
+                     *   → maps 路判失败 → 回退路也失败 → -12 → 密文 SIGILL。
+                     *
+                     *   诊断日志铁证（v0.9.57）：
+                     *     U1-A OK maps 命中 =/data/app/.../base.apk
+                     *     U1-RC rc = -12        ← 路径正确但 open 失败
+                     *
+                     * 修法：改用 ncg_apk_readable()（内联 faccessat，不经
+                     * libc）。与 ncg_find_apk_path 的回退路同一纪律：
+                     * **任何读自身 APK 的路径都必须内联 svc**。
+                     * （AGENTS.md 早写明这条；本次是漏改的第二处。） */
+                    if (ncg_apk_readable(out) == 0) {
                         close(fd);
                         return 0;
                     }
+                    /*LSG 诊断：命中但不可读的 rc（v0.9.58）*/
+                    ncg_trace_i(NCG_TR_U1_MAPS_NG_RC,
+                                (long long)ncg_apk_readable(out));
                 }
             } else {
                 line[ll++] = c;

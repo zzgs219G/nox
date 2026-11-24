@@ -68,6 +68,7 @@ STAGES = [
     ("U1_MAPS_TRY", "U1-A 尝试 maps 路"),
     ("U1_MAPS_HIT", "U1-A OK maps 命中"),
     ("U1_MAPS_MISS", "U1-A maps 未命中，试 so 路径反推"),
+    ("U1_MAPS_NG_RC", "U1-A maps 命中但路径不可读 rc"),
     ("U1_SO_PATH", "U1-B so_path"),
     ("U1_NO_LIB", "U1-B FAIL so_path 里没有 /lib/"),
     ("U1_ROOTCAND", "U1-B /proc/self/root 候选 rc"),
