@@ -300,4 +300,9 @@ void ncg_trace_s(int id, const char *s);
 /* 计算日志文件路径（哨兵 /storage/emulated/0/xixin_debug 存在才算开）。 */
 int ncg_debug_log_path(char *out, size_t cap);
 
+/* 日志路径拼接（纯函数，2026-11-25 抽出供宿主测试直接断言；
+ * boundary：v0.9.50 双写 /files 与 v0.9.51 counter 跨块错位
+ * 都发生在这段生产拼接上，而 V12 逃生口从不经过）。 */
+int ncg_report_log_path(char *out, size_t cap, const char *pkg);
+
 #endif /* _NC_GUARD_INTERNAL_H_ */

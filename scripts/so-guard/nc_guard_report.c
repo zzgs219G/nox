@@ -786,6 +786,31 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *    /proc/self/cmdline，命中即失败（那条断言守的是"别把意图写进二进制"）。
  *    故拆成两段拼接。
  * ⚠️ 任何一步失败返回 -1，调用方静默跳过。 */
+/* ── 日志路径拼接（纯函数，2026-11-25 从 ncg_debug_log_path 抽出）──
+ *
+ * 为什么抽出来：拼接逻辑是 v0.9.50/v0.9.51 两个真机 bug 的所在
+ * （双写 /files、counter 位宽跨块错位），但宿主 test.sh 的 V12 走
+ * NCG_REPORT_PATH 逃生口提前 return，**这段生产拼接在宿主上从未被
+ * 任何测试踩过**（2026-11-25 教训：逃生口与生产路径不同源）。
+ * 抽成纯函数后 test.sh 的 V17 直接喂 pkg 断言输出形态。
+ *
+ * out = anddata(密文) + pkg + logname(密文)。
+ * ⚠️ logname 已含 "/files/" 前缀（gen-paths.py PATHS[4]）—— 这里**不能**
+ *    再拼一次 "/files"：双写 = 落到不存在的 files/files/ → fopen 静默
+ *    失败 → 整个报告黑洞（v0.9.50 真机首验，ncguard_log.md 为空）。
+ * ⚠️ 密文解码失败一律 return -1（不猜、不拼半条路径）。 */
+int ncg_report_log_path(char *out, size_t cap, const char *pkg) {
+    char anddata[48];
+    char logname[32];
+
+    if (!out || !pkg || !*pkg || cap < 64) return -1;
+    if (!ncg_path_s(NCG_PATH_ANDDATA, anddata, sizeof(anddata))) return -1;
+    if (!ncg_path_s(NCG_PATH_LOGNAME, logname, sizeof(logname))) return -1;
+    if (strlen(anddata) + strlen(pkg) + strlen(logname) + 1 > cap) return -1;
+    snprintf(out, cap, "%s%s%s", anddata, pkg, logname);
+    return 0;
+}
+
 int ncg_debug_log_path(char *out, size_t cap) {
     /* ═══ 2026-11-24：编译期开关删除，报告模块无条件进入生产包 ════════
      *
@@ -845,17 +870,10 @@ int ncg_debug_log_path(char *out, size_t cap) {
     }
     if (pkg[0] == '\0') return -1;
 
+    if (ncg_report_log_path(out, cap, pkg) != 0) return -1;
     if (!ncg_path_s(NCG_PATH_ANDDATA, anddata, sizeof(anddata))) return -1;
-    if (!ncg_path_s(NCG_PATH_LOGNAME, logname, sizeof(logname))) return -1;
     snprintf(dir, sizeof(dir), "%s%s/files", anddata, pkg);
     (void)mkdir(dir, 0771);
-    /* ⚠️ out = anddata + pkg + logname。logname 已含 "/files/" 前缀
-     * （gen-paths.py PATHS[4] = "/files/ncguard_log.md"）—— 这里**不能**
-     * 再拼一次 "/files"：首版写成 "%s%s/files%s" 会落到不存在的
-     * files/files/ 二级目录 → fopen 静默失败 → 整个报告黑洞。
-     * 宿主 test.sh 抓不到它：V12 走 NCG_REPORT_PATH 逃生口提前 return，
-     * 根本不经过这段拼接（2026-11-24 真机首验踩中，ncguard_log.md 为空）。 */
-    snprintf(out, cap, "%s%s%s", anddata, pkg, logname);
     return 0;
 }
 

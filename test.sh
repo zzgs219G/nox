@@ -1198,6 +1198,72 @@ else
     fi
 fi
 
+# ── V17 路径密文 × 生产拼接同源断言（2026-11-25 新增）──────────────────
+# 为什么单独一组且不走逃生口：
+#   v0.9.50（拼接双写 /files）与 v0.9.51（counter 位宽跨块错位）两个
+#   真机 bug，宿主测试全绿 —— V12 走 NCG_REPORT_PATH 逃生口提前 return，
+#   而两个 bug 都只在生产拼接段里。教训：逃生口逻辑与生产路径不同源，
+#   本组直接踩【生产路径的两个函数】：
+#     V17a ncg_path_s 六条解码对拍（含 33B 跨块 anddata）← counter 位宽
+#     V17b ncg_report_log_path 拼接形态断言             ← 双写 /files
+echo "── V17 路径 × 生产拼接同源断言 ──"
+if [ "$HAS_SRC" != "1" ]; then
+    skip "V17 需要源码形态（dlsym 未锁箱产物取两个生产函数）"
+elif [ "$CAN_EXEC" != "1" ]; then
+    skip "V17 需要可执行产物"
+else
+    # 驱动：dlsym 源码形态产物（未锁箱，符号可见）直接调两个生产函数
+    cat > "$W/v17drv.c" <<'V17DRV'
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+typedef const char *(*path_s_fn)(int, char *, size_t);
+typedef int (*logpath_fn)(char *, size_t, const char *);
+static const char *expect[6] = {
+    "/proc/self/cmdline", "/proc/self/maps",
+    "/storage/emulated/0/xixin_debug",
+    "/storage/emulated/0/Android/data/",   /* 33 字节：跨块，位宽 bug 只在这里现形 */
+    "/files/ncguard_log.md", "NCG_REPORT_PATH"
+};
+int main(int c, char **v) {
+    char buf[64], out[192];
+    int i, bad = 0;
+    void *h = dlopen(v[1], RTLD_NOW);
+    if (!h) { printf("NOOPEN\n"); return 2; }
+    path_s_fn ps = (path_s_fn)dlsym(h, "ncg_path_s");
+    logpath_fn lp = (logpath_fn)dlsym(h, "ncg_report_log_path");
+    if (!ps)  { printf("NOSYM_PATH\n"); return 3; }
+    for (i = 0; i < 6; i++) {
+        buf[0] = '\0';
+        if (!ps(i, buf, sizeof(buf)) || strcmp(buf, expect[i]) != 0) {
+            printf("PATH_MISMATCH id=%d got=%s\n", i, buf);
+            bad = 1;
+        }
+    }
+    if (!lp) { printf("NOSYM_LOGPATH\n"); return 4; }
+    if (lp(out, sizeof(out), "com.test.app") != 0
+        || strcmp(out, "/storage/emulated/0/Android/data/com.test.app/files/ncguard_log.md") != 0) {
+        printf("LOGPATH_MISMATCH got=%s\n", out);
+        bad = 1;
+    }
+    printf(bad ? "V17_FAIL\n" : "V17_OK\n");
+    return bad;
+}
+V17DRV
+    if clang "$W/v17drv.c" -o "$W/v17drv" -ldl 2>"$W/v17drv.log"; then
+        R17="$("$W/v17drv" "$W/raw.so" 2>&1 || true)"
+        if [ "$R17" = "V17_OK" ]; then
+            ok "V17a 路径六条解码对拍全部一致（含 33B 跨块 counter 位宽）"
+            ok "V17b 生产拼接形态正确（anddata+pkg+logname，无双写 /files）"
+        else
+            bad "V17 生产路径断言失败: $R17"
+            echo "     → 若 PATH_MISMATCH: ncg_path_ctr_xor counter 位宽与 gen-paths.py 漂移" >&2
+            echo "     → 若 LOGPATH_MISMATCH: 拼接又双写了（v0.9.50 同型复发）" >&2
+        fi
+    else
+        bad "V17 驱动编译失败"; head -3 "$W/v17drv.log" >&2
+    fi
+fi
+
 echo ""
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="
-[ "$FAIL" -eq 0 ] || exit 1
