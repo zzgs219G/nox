@@ -55,6 +55,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>               /* open/read：ncg_self_pkg / ncg_find_apk_path 用 */
+#include <sys/syscall.h>         /* __NR_faccessat：APK 定位的内联 svc 用（2026-11-24）*/
 #include <sys/mman.h>            /* mprotect：ncguard_stub_recover 用 */
 #include <dlfcn.h>               /* Dl_info：本文件已不直接用，保留以免
                                   * 调用方头文件顺序变化时踩空 */
@@ -496,21 +497,111 @@ int ncg_self_pkg(char *out, size_t cap) {
 
 /* 定位自身 APK 路径：先扫 /proc/self/maps，再按 so 路径反推。
  * ⚠️ 必须在 .text（明文）：stub 阶段就要用它读证书。 */
+/* ── 不经 libc 的可读性检查（2026-11-24）───────────────────────────
+ *
+ * 为什么不能直接用 access()：去签名校验类工具（本项目的 libusign.so）
+ * 会把 17 个路径类 libc 函数 inline hook 到诱饵包。锁箱用 access() 验证
+ * 候选 APK 路径时，hook 让 access 检查【origin.apk】并通过 → 候选被接受
+ * → 随后 open 也被重定向 → 读到的是原开发者证书 → k_so 用错证书派生
+ * → MAC 失败，或（本事故）路径本身拼错时根本读不到 → -12 → SIGILL。
+ *
+ * 契约（与 artifact-pipeline 的 sig_check.c 同纪律）：
+ *   任何新增的"读自身 APK"路径都必须走内联 svc，不经 libc。
+ * ⚠️ faccessat 在 arm64 是 __NR_faccessat（Linux 5.8+ 又有 faccessat2；
+ *    这里用老接口即可，O_RDONLY 探测存在性 + 可读）。
+ * ⚠️ armv7 的 r7 是保留寄存器（Thumb frame pointer），必须 push/pop。 */
+#if defined(__aarch64__) || defined(__arm__)
+__attribute__((noinline))
+static int ncg_raw_faccessat(const char *path) {
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = __NR_faccessat;
+    register long x0 __asm__("x0") = (long)AT_FDCWD;
+    register long x1 __asm__("x1") = (long)path;
+    register long x2 __asm__("x2") = (long)R_OK;
+    register long x3 __asm__("x3") = 0L;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+                     : "memory");
+    return (int)x0;
+#else
+    register long r0 __asm__("r0") = (long)AT_FDCWD;
+    register long r1 __asm__("r1") = (long)path;
+    long r;
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %[nr]\n\t"
+        "mov  r2, %[mode]\n\t"
+        "mov  r3, #0\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : [nr] "r"((long)__NR_faccessat), [mode] "r"((long)R_OK), "r"(r1)
+        : "memory");
+    r = r0;
+    return (int)r;
+#endif
+}
+#else
+static int ncg_raw_faccessat(const char *path) {
+    return access(path, R_OK);   /* 非 ARM 平台（宿主测试）退回 libc */
+}
+#endif
+
 int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
     const char *_mp = ncg_path_s(NCG_PATH_MAPS, _mb, sizeof(_mb));
     if (_mp && ncg_scan_maps_for_base_apk(_mp, out, cap) == 0) return 0;
 
-    /* 回退：从 so 路径反推 .../lib/<abi>/libnc.so → .../base.apk */
-    const char *lib = strstr(so_path, "/lib/");
-    if (!lib) return -1;
-    size_t dirlen = (size_t)(lib - so_path);
-    static const char kBase[] = "/base.apk";
-    size_t bl = sizeof(kBase) - 1;
-    if (dirlen + bl >= cap) return -1;
-    memcpy(out, so_path, dirlen);
-    memcpy(out + dirlen, kBase, bl + 1);
-    return 0;
+    /* 回退：从 so 路径反推 .../lib/<abi>/libnc.so → .../base.apk
+     *
+     * ⚠️⚠️ 2026-11-24 真机事故（Nivii，extractNativeLibs=true）：
+     *   旧实现【只拼字符串、从不验证】，直接 return 0。
+     *   extractNativeLibs=true 时 so 解压到 lib/<abi>/，maps 里【没有】
+     *   base.apk 映射行 → maps 路必失败 → 落到本分支 → 拼出
+     *   ".../com.x-xxx==/base.apk" → 后续读证书 open 失败 → -12 →
+     *   .ncx 不解 → 执行密文 → SIGILL（pc 在 libnc.so constructor 内）。
+     *   症状是"锁箱 U1~U10 全成功、卡在 U12"，极易误判成证书不匹配。
+     *
+     *   第一线 sig_check.c 的 apk_locate_so_dir 早就有 access(R_OK) 校验
+     *   + /proc/self/root 前缀（SELinux 可读路径），两条线不同步。
+     *
+     * 现在与第一线对齐：候选按"有 /proc/self/root 前缀 → 原路径"顺序
+     * 逐个 access(R_OK)，**全失败返回 -1**（让调用方 fail-closed 走
+     * 明确的 -12，而不是拿死路径去读到 -12 掩盖真因）。 */
+    {
+        const char *lib = strstr(so_path, "/lib/");
+        char cand[512];
+        char rootcand[544];
+        size_t dirlen, bl;
+        static const char kBase[] = "/base.apk";
+
+        if (!lib) return -1;
+        dirlen = (size_t)(lib - so_path);
+        bl = sizeof(kBase) - 1;
+
+        /* ① /proc/self/root 前缀：SELinux 下对 /data/app 更稳（同第一线） */
+        if (dirlen + 10 + bl + 1 < sizeof(rootcand)) {
+            static const char kProcRoot[] = "/proc/self/root";
+            memcpy(rootcand, kProcRoot, sizeof(kProcRoot) - 1);
+            memcpy(rootcand + sizeof(kProcRoot) - 1, so_path, dirlen);
+            memcpy(rootcand + sizeof(kProcRoot) - 1 + dirlen, kBase, bl + 1);
+            if (ncg_raw_faccessat(rootcand) == 0 && strlen(rootcand) + 1 <= cap) {
+                memcpy(out, rootcand, strlen(rootcand) + 1);
+                return 0;
+            }
+        }
+        /* ② 原路径 */
+        if (dirlen + bl + 1 <= sizeof(cand)) {
+            memcpy(cand, so_path, dirlen);
+            memcpy(cand + dirlen, kBase, bl + 1);
+            if (ncg_raw_faccessat(cand) == 0 && strlen(cand) + 1 <= cap) {
+                memcpy(out, cand, strlen(cand) + 1);
+                return 0;
+            }
+        }
+    }
+    return -1;
 }
 void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
                           uint8_t fault[8]) {
