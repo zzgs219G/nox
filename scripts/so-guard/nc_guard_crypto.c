@@ -511,36 +511,43 @@ int ncg_self_pkg(char *out, size_t cap) {
  *    这里用老接口即可，O_RDONLY 探测存在性 + 可读）。
  * ⚠️ armv7 的 r7 是保留寄存器（Thumb frame pointer），必须 push/pop。 */
 #if defined(__aarch64__) || defined(__arm__)
-__attribute__((noinline))
-static int ncg_raw_faccessat(const char *path) {
+/* ⚠️ 写法照抄 artifact-pipeline/scripts/guard/src/env_check.c 的
+ *    env_raw_syscall —— 那个在真机上跑了两个月（2026-10 起），是仓库里
+ *    唯一被验证过的内联 svc 形态。**不要"优化"成别的约束写法**：
+ *    第一版我用了 `register long x2 __asm__("x2") = R_OK` 的独立约束，
+ *    armv7 分支还要手工 mov r2/r3，容易漏掉参数传递（且无法在宿主验证
+ *    ARM 汇编）。统一走"参数逐个进输入约束、r0/x0 作为读写输出"的形态。 */
+static long ncg_raw_svc6(long n, long a0, long a1, long a2, long a3) {
 #if defined(__aarch64__)
-    register long x8 __asm__("x8") = __NR_faccessat;
-    register long x0 __asm__("x0") = (long)AT_FDCWD;
-    register long x1 __asm__("x1") = (long)path;
-    register long x2 __asm__("x2") = (long)R_OK;
-    register long x3 __asm__("x3") = 0L;
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
     __asm__ volatile("svc #0"
                      : "+r"(x0)
                      : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
                      : "memory");
-    return (int)x0;
+    return x0;
 #else
-    register long r0 __asm__("r0") = (long)AT_FDCWD;
-    register long r1 __asm__("r1") = (long)path;
-    long r;
+    register long r0 __asm__("r0") = a0;
     __asm__ volatile(
         "push {r7}\n\t"
         "mov  r7, %[nr]\n\t"
-        "mov  r2, %[mode]\n\t"
-        "mov  r3, #0\n\t"
         "svc  #0\n\t"
         "pop  {r7}"
         : "+r"(r0)
-        : [nr] "r"((long)__NR_faccessat), [mode] "r"((long)R_OK), "r"(r1)
+        : [nr] "r"(n), "r"(a1), "r"(a2), "r"(a3)
         : "memory");
-    r = r0;
-    return (int)r;
+    return r0;
 #endif
+}
+
+__attribute__((noinline))
+static int ncg_raw_faccessat(const char *path) {
+    /* faccessat(AT_FDCWD, path, R_OK, 0) */
+    return (int)ncg_raw_svc6(__NR_faccessat, (long)AT_FDCWD,
+                             (long)path, (long)R_OK, 0L);
 }
 #else
 static int ncg_raw_faccessat(const char *path) {
