@@ -565,7 +565,8 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
         bad++;
         rp_fmtc(&c, RPT_UNLOCK_FAIL, rc, nseg);
         if (rc == -11) rp_putc(&c, RPT_FAIL_MAC);
-        else if (rc == -12) rp_putc(&c, RPT_FAIL_KSO);
+        else if (rc == -12 || rc == -13 || rc == -14)
+            rp_putc(&c, RPT_FAIL_KSO);   /* -13/-14 细分见 logcat 死亡通告（2026-11-24） */
         else if (rc == -8 || rc == -10) rp_putc(&c, RPT_FAIL_MPROT);
         else if (rc == -3) rp_putc(&c, RPT_FAIL_SLOT);
         else if (rc == -9) rp_putc(&c, RPT_FAIL_NOMEM);

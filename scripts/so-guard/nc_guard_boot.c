@@ -61,10 +61,15 @@
 extern int __android_log_print(int prio, const char *tag, const char *fmt, ...)
     __attribute__((weak));
 static void ncg_death_notice(int rc) {
+    /* rc 细分（2026-11-24）：-12/-13/-14 的修法完全不同，不再混成一类。
+     * -12 定位不到 APK（抽壳/改包结构）/ -13 证书读不出（Signing Block
+     * 被破坏或换证书重签）/ -14 包名对不上（applicationId 改名/双开）。 */
     const char *why =
         (rc == 0)   ? "解锁成功" :
         (rc == -11) ? "MAC 校验失败(产物被篡改或段表不符)" :
-        (rc == -12) ? "证书/包名派生失败(换证书重签?)" :
+        (rc == -12) ? "定位不到自身 APK(抽壳或改包结构?)" :
+        (rc == -13) ? "证书读不出(Signing Block 被破坏或换证书重签?)" :
+        (rc == -14) ? "包名对不上(applicationId 改名/双开/虚拟空间?)" :
         (rc == -8 || rc == -10) ? "内存保护操作失败" :
         (rc == -3)  ? "密钥槽缺失/不完整" :
         (rc == -9)  ? "内存分配失败" : "其他错误";
@@ -848,11 +853,18 @@ static int ncg_derive_kso_bound(const char *so_path,
     char apk_path[512];
 
     apk_path[0] = '\0';
+    /* ⚠️ 2026-11-24 细分 fail-closed 码（原三个 return -12 混成一类）：
+     *   -12 = 定位不到 APK（maps/so反推全失败 —— 抽壳/改包结构）
+     *   -13 = APK 找到了但证书读不出（Signing Block 被破坏/剥离）
+     *   -14 = 包名对不上（applicationId 改名 / 双开 / 虚拟空间）
+     * 三者修法完全不同，混用让排障只能靠猜（2026-11-24 用户需求：
+     * "日志要直接定位关键地方"）。消费方兼容：report 的 RPT_FAIL_KSO
+     * 仍覆盖 -12~-14（"证书/包名"大类文案），logcat 侧细分。 */
     if (ncg_find_apk_path(so_path, apk_path, sizeof(apk_path)) != 0) return -12;
-    if (ncg_apk_first_cert_der(apk_path, der, 1536, der_len) != 0) return -12;
-    if (ncg_self_pkg(pkg, pkgcap) != 0) return -12;
+    if (ncg_apk_first_cert_der(apk_path, der, 1536, der_len) != 0) return -13;
+    if (ncg_self_pkg(pkg, pkgcap) != 0) return -14;
     if (ncg_derive_k_so_from_der(master, der, *der_len, pkg, k_out) != 0)
-        return -12;
+        return -13;   /* 派生失败 = DER 内容异常，归入"证书读不出"类 */
 
     /* 污染一：包名（详见 ncg_pkg_fault 的注释） */
     {
