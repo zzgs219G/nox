@@ -222,6 +222,7 @@ typedef enum {
     NCG_TR_U11_NONZERO,
     NCG_TR_U12_ENTER,
     NCG_TR_U12_OK_KSO,
+    NCG_TR_U12_FAIL_RC,
     NCG_TR_U12_FAIL,
     NCG_TR_U13_NSEG,
     NCG_TR_U14_OK,

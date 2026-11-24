@@ -104,6 +104,7 @@ STAGES = [
     ("U11_NONZERO", "U11 master 非零，继续派生"),
     ("U12_ENTER", "U12 派生 k_so 进入（读证书+包名）"),
     ("U12_OK_KSO", "U12 OK k_so 已派生"),
+    ("U12_FAIL_RC", "U12 FAIL rc 值"),
     ("U12_FAIL", "U12 FAIL k_so 派生失败 —— 证书/包名不匹配（fail-closed -12）"),
     ("U13_NSEG", "U13 待校验段数"),
     ("U14_OK", "U14 OK 段完整性校验通过（MAC 一致）"),

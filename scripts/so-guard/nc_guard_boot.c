@@ -1366,16 +1366,25 @@ int ncg_head_unlock(const void *self_addr) {
     /* 2026-11-12：拆成独立函数（降寄存器压力）。两条污染纪律不变。 */
     {
         uint8_t k_cert[16];
+        int krc;
         ncg_trace(NCG_TR_U12_ENTER);
-        if (ncg_derive_kso_bound(so_path, master, der_buf, &der_len,
-                                 pkg_buf, sizeof(pkg_buf), slotdata, k_cert) != 0) {
+        krc = ncg_derive_kso_bound(so_path, master, der_buf, &der_len,
+                                   pkg_buf, sizeof(pkg_buf), slotdata, k_cert);
+        if (krc != 0) {
             ncg_wipe(k_cert, sizeof(k_cert));
             ncg_wipe(key, sizeof(key));
             memset(slotdata, 0, sizeof(slotdata));
             /* 最常撞见的失败：证书与产物不匹配（换 key 重签）、
-             * 包名不匹配（改了 applicationId） */
-            ncg_trace(NCG_TR_U12_FAIL);
-            return -12;   /* fail-closed：证书/包名任一不可得 */
+             * 包名不匹配（改了 applicationId）
+             *
+             * ⚠️⚠️ 2026-11-25 修（Nivii 排查三天才定位）：
+             *   这里原本写死 `return -12`，把 ncg_derive_kso_bound 的
+             *   -13（证书读不出）/ -14（包名对不上）**全部吞成 -12**。
+             *   于是 v0.9.53 加的 rc 细分形同虚设，诊断日志一直误导排查
+             *   方向（"定位不到 APK"实为"证书读不出"）。
+             *   现改为透传 krc —— 上层 death_notice 才能给出准确人话。 */
+            ncg_trace_i(NCG_TR_U12_FAIL_RC, (long long)krc);
+            return krc;
         }
         memcpy(key, k_cert, 16);
         ncg_wipe(k_cert, sizeof(k_cert));
