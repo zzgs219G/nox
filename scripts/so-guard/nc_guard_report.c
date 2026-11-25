@@ -804,13 +804,54 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *    再拼一次 "/files"：双写 = 落到不存在的 files/files/ → fopen 静默
  *    失败 → 整个报告黑洞（v0.9.50 真机首验，ncguard_log.md 为空）。
  * ⚠️ 密文解码失败一律 return -1（不猜、不拼半条路径）。 */
+/* 外部存储根路径（2026-11-25：不再信任写死的 /storage/emulated/0）。
+ *
+ * 为什么：多用户（Android 4.2+）/ 工作资料（Android 5+）下真实路径是
+ * /storage/emulated/<userId>/，写死会写到别的用户的空间（通常直接不可写）。
+ *
+ * 探测顺序：
+ *   ① /storage/self/primary —— Android 的"当前用户主存储"符号链接。
+ *      真机实测（小米 Android 17）指向 /storage/emulated/0；多用户下自动
+ *      指向对应用户。
+ *   ② 密文表里的 /storage/emulated/0 —— 兜底（老系统可能没有 /storage/self）
+ * ⚠️ 两条路径都密文化（①新增一条，②沿用），.rodata 零明文。
+ * ⚠️ 返回的字符串不含末尾 '/'，调用方自己拼。 */
+static int ncg_ext_root(char *out, size_t cap) {
+    char primary[32];
+    char emulated[48];
+    if (ncg_path_s(NCG_PATH_PRIMARY, primary, sizeof(primary))
+        && access(primary, F_OK) == 0) {
+        snprintf(out, cap, "%s", primary);
+        return 0;
+    }
+    if (ncg_path_s(NCG_PATH_ANDDATA, emulated, sizeof(emulated))) {
+        /* ANDDATA 形如 "/storage/emulated/0/Android/data/" —— 砍掉后半段 */
+        char *p = strstr(emulated, "/Android/");
+        if (p) {
+            *p = '\0';
+            snprintf(out, cap, "%s", emulated);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 int ncg_report_log_path(char *out, size_t cap, const char *pkg) {
     char logname[32];
     char anddata[48];
+    char root[64];
 
     if (!out || !pkg || !*pkg || cap < 64) return -1;
     if (!ncg_path_s(NCG_PATH_ANDDATA, anddata, sizeof(anddata))) return -1;
     if (!ncg_path_s(NCG_PATH_LOGNAME, logname, sizeof(logname))) return -1;
+    /* 根路径动态化（2026-11-25）：把 anddata 里的写死根换成实测的那一个 */
+    if (ncg_ext_root(root, sizeof(root)) == 0) {
+        char dynamic[512];
+        snprintf(dynamic, sizeof(dynamic), "%s/Android/data/", root);
+        if (strlen(dynamic) + strlen(pkg) + strlen(logname) + 1 > cap) return -1;
+        snprintf(out, cap, "%s%s%s", dynamic, pkg, logname);
+        return 0;
+    }
     if (strlen(anddata) + strlen(pkg) + strlen(logname) + 1 > cap) return -1;
     snprintf(out, cap, "%s%s%s", anddata, pkg, logname);
     return 0;

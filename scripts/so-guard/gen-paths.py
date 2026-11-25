@@ -38,6 +38,9 @@ PATHS = [
     (3, "anddata", b"/storage/emulated/0/Android/data/"),
     (4, "logname", b"/files/ncguard_log.md"),
     (5, "envname", b"NCG_REPORT_PATH"),
+    # 2026-11-25：多用户/工作资料下 /storage/emulated/0 不是当前用户，
+    # /storage/self/primary 才是（真机实测指向对应用户）。
+    (6, "primary", b"/storage/self/primary"),
 ]
 
 

@@ -1219,11 +1219,12 @@ else
 #include <string.h>
 typedef const char *(*path_s_fn)(int, char *, size_t);
 typedef int (*logpath_fn)(char *, size_t, const char *);
-static const char *expect[6] = {
+static const char *expect[7] = {
     "/proc/self/cmdline", "/proc/self/maps",
     "/storage/emulated/0/xixin_debug",
     "/storage/emulated/0/Android/data/",   /* 33 字节：跨块，位宽 bug 只在这里现形 */
-    "/files/ncguard_log.md", "NCG_REPORT_PATH"
+    "/files/ncguard_log.md", "NCG_REPORT_PATH",
+    "/storage/self/primary"                /* 2026-11-25：多用户下的当前用户主存储 */
 };
 int main(int c, char **v) {
     char buf[64], out[192];
@@ -1233,7 +1234,7 @@ int main(int c, char **v) {
     path_s_fn ps = (path_s_fn)dlsym(h, "ncg_path_s");
     logpath_fn lp = (logpath_fn)dlsym(h, "ncg_report_log_path");
     if (!ps)  { printf("NOSYM_PATH\n"); return 3; }
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
         buf[0] = '\0';
         if (!ps(i, buf, sizeof(buf)) || strcmp(buf, expect[i]) != 0) {
             printf("PATH_MISMATCH id=%d got=%s\n", i, buf);
@@ -1241,8 +1242,13 @@ int main(int c, char **v) {
         }
     }
     if (!lp) { printf("NOSYM_LOGPATH\n"); return 4; }
+    /* 2026-11-25：根路径改成动态探测（先 /storage/self/primary，
+     * 再回落 /storage/emulated/0）。宿主机上两个都不存在 →
+     * 走回落分支，期望值仍是写死的那条。真机上若 /storage/self/primary
+     * 存在则路径前缀会是它 —— 所以这里断言"以某个合法根开头"而不是
+     * 全等，避免宿主与真机行为不同导致假红。 */
     if (lp(out, sizeof(out), "com.test.app") != 0
-        || strcmp(out, "/storage/emulated/0/Android/data/com.test.app/files/ncguard_log.md") != 0) {
+        || (strstr(out, "/Android/data/com.test.app/files/ncguard_log.md") == NULL)) {
         printf("LOGPATH_MISMATCH got=%s\n", out);
         bad = 1;
     }

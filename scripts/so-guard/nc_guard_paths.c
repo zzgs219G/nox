@@ -79,6 +79,15 @@ static const uint8_t ncg_path_blob_envname[] = {
     0x35, 0x2E, 0x9C,
 };
 
+/* msg_id=6  明文 "/storage/self/primary"（21 字节）
+ * 2026-11-25：多用户/工作资料下 /storage/emulated/0 不是当前用户的空间，
+ * /storage/self/primary 才是指向"当前用户主存储"的符号链接（真机实测
+ * 指向 /storage/emulated/0，多用户下自动指向对应用户）。 */
+static const uint8_t ncg_path_blob_primary[] = {
+    0x80, 0x2A, 0x1A, 0x4F, 0x1F, 0xE3, 0xC9, 0x26, 0x80, 0x39, 0x50, 0xEE,
+    0x68, 0x43, 0x4A, 0xDF, 0x5F, 0xF8, 0x93, 0x16, 0x3B,
+};
+
 /* 表：与 ncg_path_id 一一对应。顺序必须与枚举一致。 */
 static const struct {
     const uint8_t *blob;
@@ -90,6 +99,7 @@ static const struct {
     { ncg_path_blob_anddata,  (uint8_t)sizeof(ncg_path_blob_anddata) },
     { ncg_path_blob_logname,  (uint8_t)sizeof(ncg_path_blob_logname) },
     { ncg_path_blob_envname,  (uint8_t)sizeof(ncg_path_blob_envname) },
+    { ncg_path_blob_primary,  (uint8_t)sizeof(ncg_path_blob_primary) },
 };
 
 /* ── 密钥流解密（就地写入调用方缓冲）───────────────────────────────

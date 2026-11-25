@@ -24,7 +24,9 @@ typedef enum {
     NCG_PATH_ANDDATA  = 3,   /* "/storage/emulated/0/Android/data/" —— 日志目录前缀 */
     NCG_PATH_LOGNAME  = 4,   /* "/files/ncguard_log.md" —— 日志文件后缀 */
     NCG_PATH_ENVNAME  = 5,   /* "NCG_REPORT_PATH" —— 宿主测试重定向环境变量名 */
-    NCG_PATH_COUNT    = 6
+    NCG_PATH_PRIMARY  = 6,   /* "/storage/self/primary" —— 当前用户主存储（多用户下
+                              * 与 emulated/0 不同，2026-11-25 加）*/
+    NCG_PATH_COUNT    = 7
 } ncg_path_id;
 
 /* 取第 id 条路径的明文写入 buf，返回 buf；失败返回 NULL。
