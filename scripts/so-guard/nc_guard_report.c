@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/time.h>   /* gettimeofday：阶段追踪的毫秒时间戳（2026-11-14） */
 #include <time.h>
@@ -804,8 +805,8 @@ void ncg_report_build(char *buf, size_t cap, const char *so_path,
  *    失败 → 整个报告黑洞（v0.9.50 真机首验，ncguard_log.md 为空）。
  * ⚠️ 密文解码失败一律 return -1（不猜、不拼半条路径）。 */
 int ncg_report_log_path(char *out, size_t cap, const char *pkg) {
-    char anddata[48];
     char logname[32];
+    char anddata[48];
 
     if (!out || !pkg || !*pkg || cap < 64) return -1;
     if (!ncg_path_s(NCG_PATH_ANDDATA, anddata, sizeof(anddata))) return -1;
@@ -836,12 +837,11 @@ int ncg_debug_log_path(char *out, size_t cap) {
      *      （保留参数兼容，传不传都一样）。
      * 若将来闭源，再评估收紧（流水线追踪档恢复编译期开关是现成方案）。 */
     char pkg[128];
-    char dir[384];
     char cmdline_path[48];
     char sentinel[48];
     char envname[24];
     char anddata[48];
-    char logname[32];
+    char dir[384];
     int fd;
     ssize_t n;
     size_t i;
@@ -881,6 +881,48 @@ int ncg_debug_log_path(char *out, size_t cap) {
     return 0;
 }
 
+/* 过 2 秒再写（2026-11-25）。照抄消费方 nc_log 的逻辑：
+ *   目录没建 → 后台线程等 2 秒 → 再写一次。
+ * 必须在后台线程：本函数由 ncguard_unlock 调用，跑在 constructor /
+ * 主线程上，睡 2 秒会把 App 启动卡住。
+ * 失败静默：日志写不上不影响解锁。 */
+static void *ncg_report_retry_thread(void *arg)
+{
+    char *p = (char *)arg;
+    char path[512];
+    FILE *fp;
+
+    sleep(2);
+    if (p && ncg_debug_log_path(path, sizeof(path)) == 0) {
+        fp = fopen(path, "a");
+        if (fp) {
+            (void)fchmod(fileno(fp), 0644);
+            fwrite(p, 1, strlen(p), fp);
+            fclose(fp);
+        }
+    }
+    free(p);
+    return NULL;
+}
+
+static void ncg_report_retry(const char *buf, size_t len)
+{
+    char *p;
+    pthread_t t;
+    pthread_attr_t attr;
+
+    if (buf == NULL || len == 0) return;
+    p = (char *)malloc(len + 1);
+    if (p == NULL) return;
+    memcpy(p, buf, len);
+    p[len] = '\0';
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &attr, ncg_report_retry_thread, p) != 0)
+        free(p);
+    pthread_attr_destroy(&attr);
+}
+
 int ncg_report_flush(const char *buf, size_t len) {
     char path[512];
     FILE *fp;
@@ -890,8 +932,15 @@ int ncg_report_flush(const char *buf, size_t len) {
 
     if (!buf || len == 0) return -1;
     if (ncg_debug_log_path(path, sizeof(path)) != 0) return -1;
+
     fp = fopen(path, "a");
-    if (!fp) return -1;
+    if (!fp) {
+        /* 目录还没建（第一次启动常见）→ 过 2 秒再写。
+         * 与消费方 nc_log 同一套逻辑：存在就写，不存在过 2 秒再写。
+         * 必须放后台线程 —— 本函数在 constructor 里跑，主线程睡会卡启动。 */
+        ncg_report_retry(buf, len);
+        return -1;
+    }
     /* 显式改成 0644（2026-11-14）：fopen 只在新创建时按 umask 设权限，
      * 已存在的 -rw------- 文件会一直是私有 —— 上一版追踪用 0600 创建过，
      * 用户因此打不开日志。这里每次追加都纠一次，升级后自动修好旧文件。 */
