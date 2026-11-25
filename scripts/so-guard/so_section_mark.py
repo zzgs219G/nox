@@ -173,6 +173,15 @@ def _is_definition(lines, i):
             continue
         # 去掉行尾注释再看结构
         code = stripped.split('//')[0].rstrip()
+        # ⚠️ 2026-11-26 修：块注释 /* */ 尾巴会让 endswith(';') 失效 ——
+        #    `return nc_jni_fail(...);  /* 说明 */` 剥完 // 后仍带 /* */
+        #    尾巴 → 判不出";" → 继续向后扫 12 行 → 撞上别的函数的 '{'
+        #    → 调用语句被误判为函数定义 → attribute 插进函数体 → 编译炸。
+        #    实测：nc_strdec_jni.c 的 nc_jni_fail 调用行（带 /* */ 注释）
+        #    就是这么被误标的。先剥块注释再判。
+        while '/*' in code and '*/' in code:
+            code = code[:code.index('/*')].rstrip() + code[code.index('*/') + 2:]
+        code = code.replace('/*', '').replace('*/', '').rstrip()
         if code.endswith(';'):
             return False          # 声明（原型）
         if code.endswith('{'):
