@@ -47,6 +47,16 @@
  * ⚠️ 这不是加密数据，是隐藏字符串。攻击者能 hook `ncguard_str` 或
  *    dump 解密后的栈，仍拿得到明文。它挡的是「静态 strings 一条命令」。
  */
+/* ⚠️ _GNU_SOURCE 必须在【所有 #include 之前】定义（2026-11-28 CI 实测）：
+ *    Dl_info / dladdr 在 glibc 下只有定义了它才可见。
+ *    Termux（bionic）默认暴露，Ubuntu CI 的 glibc 不暴露 →
+ *    `error: use of undeclared identifier 'Dl_info'`，V1 编译失败。
+ *    这是本项目第三次踩同一个坑（AGENTS.md §6 第 2 条）。
+ *    ⚠️ 放在任何 #include 之后都无效 —— 预处理器已经处理完头文件了。 */
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE 1
+#endif
+
 #include <dlfcn.h>
 #include <elf.h>
 #include <fcntl.h>
