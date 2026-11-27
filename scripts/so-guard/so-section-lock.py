@@ -1726,24 +1726,61 @@ def _is_prologue_at(text: bytes, off: int) -> bool:
 
 
 def _pick_code_region(text: bytes, want: int, seed: int) -> bytes:
-    """从 .text 里挑一段【以真实函数序言开头】的 want 字节。
+    """从 .text 里挑一段【由真实函数体拼成】的 want 字节。
 
-    找不到合格序言时退化为按 seed 取样并给出警告（调用方应 fail-fast，
-    这里只保证不返回垃圾）。返回长度恒为 want。
+    ⚠️⚠️ 这里踩过一个真实的坑（2026-11-27，云端产物暴露）：
+
+    早先的实现是「找到任一函数序言，从那里往后取 want 字节」。本地
+    example 的真 .ncx 只有 184B，取出来的确实全是代码，一切正常。
+    但云端真实包的 .ncx 有 11344B —— 从某个序言往后取 11KB 必然
+    跨出函数体、越过字面量池和跳转表，解出来后攻击者一反汇编就看到
+    大段非法指令 → 立刻识别为诱饵。
+
+    实测：诱饵 .ncx 明文前 16 字节 = 5a92292a...（非法），
+    而真段 = ff0301d1 = sub sp,sp,#0x40（合法）。
+    这种段只要存在一组，诱饵的全部价值就归零。
+
+    现在的做法：**按函数体拼接** —— 从 seed 指定的序言开始，逐个函数
+    追加，直到凑够 want 字节。每个片段都从序言开始，拼起来仍是一串
+    合法指令（虽然控制流是拼接的，但静态反汇编看到的全是真代码）。
+    这样不论 want 多大都不会跨进数据区。
+
+    返回长度恒为 want。找不到足够候选时退化为整段 .text 循环填充
+    （此时调用方应视为降级，但至少不是随机字节）。
     """
     if want <= 0:
         return b''
+
     cands = [o for o in range(0, max(1, len(text) - 16), 4)
              if _is_prologue_at(text, o)]
     if not cands:
+        # 没有任何序言签名（异常情况）：整段循环填充，至少是真实指令字节
+        if len(text) >= want:
+            return text[:want]
+        return (text * (want // max(1, len(text)) + 1))[:want]
+
+    # 每个函数体的长度 = 到下一个序言的距离（最后一个到 .text 末尾）。
+    # 这样切片天然落在函数边界内，不会跨进字面量池。
+    bounds = cands + [len(text)]
+    out = bytearray()
+    n = len(cands)
+    # 从 seed 指定的位置开始，循环往后取，直到凑够 want
+    idx = seed % n
+    guard = 0
+    while len(out) < want and guard <= n * 2:
+        start = cands[idx % n]
+        end = bounds[(idx % n) + 1]
+        seg = text[start:end]
+        if seg:
+            out += seg
+        idx += 1
+        guard += 1
+    if not out:
         return text[:want] if len(text) >= want else (text * (want // max(1, len(text)) + 1))[:want]
-    # 用 seed 决定挑第几个，保证每组取到不同位置（避免诱饵之间明文相同 ——
-    # 三组 head 明文一样会立刻暴露「这是复制粘贴的诱饵」）
-    off = cands[seed % len(cands)]
-    if off + want <= len(text):
-        return text[off:off + want]
-    # 尾部不够长，拼一圈（仍以序言开头，前 want 字节内都是真实指令）
-    return (text[off:] + text[:want])[:want]
+    # 循环填充到 want（若函数总量不足）；循环点是 32B 对齐的函数边界，
+    # 所以重复拼接仍是合法指令序列
+    reps = want // len(out) + 1
+    return bytes(out * reps)[:want]
 
 
 def _detect_bait_groups(elf: 'Elf') -> int:

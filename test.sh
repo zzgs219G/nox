@@ -1213,12 +1213,33 @@ fi
 #    诱饵等于没做。这条断言直接模拟攻击者的校验动作。
 echo "── V18 诱饵组完整性 ──"
 _V18D=$(mktemp -d)
-cat > "$_V18D/d.c" <<'V18SRC'
-__attribute__((section(".ncx"), used, retain))
-int v18_secret(int a) { return (a ^ 0x5A) * 3 + a; }
-__attribute__((visibility("default")))
-int v18_call(int a) { return v18_secret(a); }
-V18SRC
+# ⚠️ 必须造出【足够大的 .ncx】（2026-11-27 教训）：
+#    单函数用例的 .ncx 只有 ~100B，诱饵取样怎么取都在代码里 →
+#    V18d 恒真，抓不到「取样跨进字面量池」这个真实 bug（云端 11344B
+#    才暴露）。所以这里生成 400 个函数，把 .ncx 撑到几十 KB，
+#    与真实业务包（dex2c + VMP 壳）同量级。
+python3 - "$_V18D/d.c" <<'V18GEN'
+import sys
+out = []
+# 400 个进 .ncx（要加密的资产）
+for i in range(400):
+    out.append(
+        '__attribute__((section(".ncx"), used, retain, noinline))\n'
+        'int v18_secret_%d(int a) {\n'
+        '    int r = a ^ %d; r = (r * 3 + %d) & 0xFFFF;\n'
+        '    r ^= r >> 3; return r + %d;\n'
+        '}' % (i, i, i * 7, i))
+# ⚠️ 关键：再造 3000 个 **不进 .ncx** 的普通函数，把 .text 撑大。
+#    真实云端产物里 .ncx 只占 .text 的 12%（11344 / 93284），
+#    诱饵取样从序言往后取 .ncx 长度，必然跨进字面量池/其它函数的数据区。
+#    若测试里 .ncx 占了 .text 的 70%（400 函数时实测 12800/17976），
+#    怎么取都在代码里 → V18d 恒真、抓不到 bug（2026-11-27 实测踩过）。
+for i in range(3000):
+    out.append('int v18_pad_%d(int a) { return (a + %d) * 7; }' % (i, i))
+out.append('__attribute__((visibility("default")))\n'
+           'int v18_call(int a) { return v18_secret_0(a) + v18_secret_1(a); }')
+open(sys.argv[1], 'w').write('\n'.join(out))
+V18GEN
 if [ "$HAS_SRC" = "1" ] && python3 "$ROOT/nox" protect "$_V18D/d.c" --apk "$APK" \
         --package "$PKG_FIX" -o "$_V18D/v18.so" >"$_V18D/v18.log" 2>&1; then
     # V18b：诱饵组数
@@ -1311,6 +1332,80 @@ PY
         bad "V18c 未检查到任何诱饵槽 —— 断言无效（不许当通过）"
     else
         bad "V18c 诱饵 HMAC 不自洽: $_v18mac → 攻击者第一步就能排除诱饵"
+    fi
+    # V18d：诱饵 head / .ncx 明文必须能反汇编成合法 ARM64。
+    # ⚠️ 这条是 2026-11-27 云端产物暴露后补的缺口：V18a/b/c 都通过，
+    #    但诱饵 .ncx 解出来是乱码（取样跨进了字面量池）。
+    #    攻击者一反汇编就知道是假的 —— 而三条既有断言一条都没抓到。
+    #    教训：断言只验"结构"不够，必须验"攻击者实际会看的那个判据"。
+    _v18code=$(python3 - "$_V18D/v18.so" "$LOCK" "$APK" "$PKG_FIX" <<'PY'
+import sys, struct, zlib, importlib.util
+spec = importlib.util.spec_from_file_location('lk', sys.argv[2])
+lk = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lk)
+so = open(sys.argv[1], 'rb').read()
+elf = lk.Elf(so)
+S = {s['name']: so[s['offset']:s['offset'] + s['size']] for s in elf.sections}
+bk = lk._derive_boot_key(elf)
+TAB = lk._LAYOUT['NC_XOR_FRAG_INIT']
+# 用【真证书 + 真包名】派生 k_so —— 与诱饵生成时一致。
+# 不这么做的话解出来是乱码，会把正确的诱饵误判成 bug。
+cert = lk.apk_first_signer_cert_sha256(sys.argv[3])
+pkg = sys.argv[4]
+
+def prologue_ok(b):
+    if len(b) < 4:
+        return False
+    w = struct.unpack('<I', b[:4])[0]
+    # stp x29,x30,[sp,#-N]!  或  sub sp,sp,#N
+    return ((w & 0xFFC07FFF) == 0xA9807BFD
+            or (w & 0xFF8003FF) == 0xD10003FF)
+
+def junk_ratio(b):
+    """全 0 / 全 F 块占比 —— 高说明是填充区，不是代码。"""
+    n = len(b) // 4
+    if not n:
+        return 1.0
+    bad = sum(1 for i in range(0, n * 4, 4)
+              if b[i:i+4] in (b'\x00\x00\x00\x00', b'\xff\xff\xff\xff'))
+    return bad / n
+
+bad = []
+i = 0
+while '.ncxh%d' % i in S:
+    sn, rn = '.ncks%d' % i, '.ncxhr%d' % i
+    nd = S[sn][:8] + lk.rc4(bk, S[sn][8:])
+    f16 = struct.unpack('<4H', nd[104:112])
+    xk = bytes(((f16[TAB[k]] & 0xFF) if k < 4 else ((f16[TAB[k]] >> 8) & 0xFF))
+               for k in range(8))
+    kstub = bytes(a ^ b for a, b in zip(nd[8:24], xk * 2))
+    code_crc = zlib.crc32(S['.text']) & 0xFFFFFFFF
+    keff = bytes(kstub[j] ^ ((code_crc >> ((j & 3) * 8)) & 0xFF)
+                 for j in range(16))
+    head = lk.ctr_xor(keff, lk.CTR_DOM_HEAD, S['.ncxh%d' % i])
+    if not prologue_ok(head):
+        bad.append('.ncxh%d 明文首条不是函数序言' % i)
+    if junk_ratio(head) > 0.05:
+        bad.append('.ncxh%d 明文含 %.0f%% 全0/全F 块'
+                   % (i, junk_ratio(head) * 100))
+    # ⚠️ .ncx 才是 2026-11-27 真实出问题的那一段（11344B，取样跨进字面量池）。
+    #    head 只有 4KB 所以侥幸没暴露 —— 必须两段都验。
+    master = lk.ctr_xor(keff, lk.CTR_DOM_HEADRO, S['.ncxhr%d' % i])
+    keys = lk.derive_app_keys(master, cert, pkg)
+    ncx = lk.rc4(keys['so'], S['.ncx%d' % i])
+    if not prologue_ok(ncx):
+        bad.append('.ncx%d 明文首条不是函数序言' % i)
+    if junk_ratio(ncx) > 0.05:
+        bad.append('.ncx%d 明文含 %.0f%% 全0/全F 块'
+                   % (i, junk_ratio(ncx) * 100))
+    i += 1
+print('|'.join(bad) if bad else 'OK')
+PY
+)
+    if [ "$_v18code" = "OK" ]; then
+        ok "V18d 诱饵 head 明文是合法 ARM64（反汇编不会暴露）"
+    else
+        bad "V18d 诱饵明文不可信: $_v18code → 攻击者反汇编即识破"
     fi
 else
     skip "V18 需要源码形态且可执行（.a 形态/交叉产物跳过）"
