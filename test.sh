@@ -1243,7 +1243,41 @@ V18GEN
 if [ "$HAS_SRC" = "1" ] && python3 "$ROOT/nox" protect "$_V18D/d.c" --apk "$APK" \
         --package "$PKG_FIX" -o "$_V18D/v18.so" >"$_V18D/v18.log" 2>&1; then
     # V18b：诱饵组数
-    _v18n=$(readelf -SW "$_V18D/v18.so" 2>/dev/null | grep -cE '\.ncxh[0-9]+ ')
+    # ⚠️ 不能用 `.ncxh[0-9]` 找诱饵了（2026-11-28 段名随机化后失效）。
+    #    改为按【属性特征】数：诱饵 head 与真 .ncxh 同为 AXR，
+    #    AXR 段数 - 1（真 .ncxh）- 1（真 .ncx）- 1（真 .ncxr，若在）
+    #    = 诱饵 head + 诱饵 code 段数。
+    _v18n=$(python3 - "$_V18D/v18.so" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+sh = struct.unpack_from('<Q', d, 0x28)[0]
+es = struct.unpack_from('<H', d, 0x3a)[0]
+en = struct.unpack_from('<H', d, 0x3c)[0]
+si = struct.unpack_from('<H', d, 0x3e)[0]
+def hdr(i): return struct.unpack_from('<IIQQQQ', d, sh + i * es)
+so = hdr(si)[4]
+names = []
+for i in range(en):
+    f = hdr(i)
+    n = d[so + f[0]: d.index(b'\0', so + f[0])].decode('latin1')
+    names.append((n, f[2], f[5]))          # (name, flags, size)
+AXR = 0x4      # SHF_EXECINSTR
+real = {'.ncx', '.ncxh', '.ncxr'}
+axr = [(n, sz) for n, fl, sz in names if (fl & AXR) and n not in real]
+# 诱饵 seg 分两类：head（与真 .ncxh 同量级）与 code（与真 .ncx 同量级）。
+# 判据用【与真段的尺寸比】而不是"除以 2" —— 后者假设两类数量相等，
+# 一旦哪天只加 head 不加 code 就会算错（2026-11-28 实测踩过：
+# 除法公式报「3 组」而实际是 2 组，属假绿）。
+real_sz = {n: sz for n, fl, sz in names if n in real}
+h_ref = real_sz.get('.ncxh', 0)
+c_ref = real_sz.get('.ncx', 0)
+heads = 0
+for n, sz in axr:
+    if h_ref and abs(sz - h_ref) <= h_ref * 0.15:
+        heads += 1
+print(heads)
+PY
+)
     if [ "$_v18n" -ge 2 ]; then
         ok "V18b 诱饵组存在（$_v18n 组 head 段）"
     else
@@ -1340,11 +1374,28 @@ bk = lk._derive_boot_key(elf)
 TAB = lk._LAYOUT['NC_XOR_FRAG_INIT']
 bad = []
 checked = 0
+# ⚠️ 段名随机化后（2026-11-28）不能再按 .ncks0/.ncxh0 找诱饵。
+#    改为：诱饵槽 = 所有 size==112 且非真 .ncks 的 AR 段；
+#          诱饵 head = 所有 AXR 且非真的段，按大小与槽配对（同组）。
+#    这里只验「每个诱饵槽的 HMAC 都自洽」，不关心它属于哪一组 ——
+#    配对关系由锁箱器保证，测试只需确认没有自相矛盾的槽存在。
+bait_slots = [n for n in S if n != '.ncks' and len(S[n]) == 112]
+bait_heads = [n for n in S if n not in ('.ncx', '.ncxh', '.ncxr')
+              and len(S[n]) > 512]
 i = 0
-while '.ncxh%d' % i in S:
-    sn, hn = '.ncks%d' % i, '.ncxh%d' % i
-    if sn not in S:
-        break
+for sn in bait_slots:
+    hn = None
+    # 用槽里的 head_sh_addr 字段直接定位对应的 head 段（这才是真配对依据）
+    nd_probe = S[sn][:8] + lk.rc4(bk, S[sn][8:])
+    if len(nd_probe) >= 32:
+        hsh = struct.unpack_from('<I', nd_probe, 28)[0]
+        for cand in bait_heads:
+            sh_ = elf.find(cand)
+            if sh_ is not None and sh_['addr'] == hsh:
+                hn = cand
+                break
+    if hn is None:
+        continue
     nd = S[sn][:8] + lk.rc4(bk, S[sn][8:])
     f16 = struct.unpack('<4H', nd[104:112])
     xk = bytes(((f16[TAB[k]] & 0xFF) if k < 4 else ((f16[TAB[k]] >> 8) & 0xFF))
@@ -1353,7 +1404,6 @@ while '.ncxh%d' % i in S:
     checked += 1
     if lk.hmac_sha256(kmac, S[hn]) != nd[64:96]:
         bad.append(hn)
-    i += 1
 # ⚠️ checked==0 必须单独报错：脚本没找到诱饵段时输出空串，
 #    shell 侧 `[ -z ]` 会判定通过 = 假绿（2026-11-27 实测踩过）。
 if checked == 0:
@@ -1447,6 +1497,155 @@ else
     skip "V18 需要源码形态且可执行（.a 形态/交叉产物跳过）"
 fi
 rm -rf "$_V18D"
+
+# ── V19 .ncxs 字符串段（2026-11-28 新增）──────────────────────────────
+# 为什么必须独立一组：
+#   字符串解密错位【不会崩】—— 只会解出乱码，表现为"某个配置项读不到"
+#   "URL 拼错"这类功能异常，排障时完全想不到是加密偏移错了。
+#   而且它跨 C/Python 两侧实现，任何一侧改动都可能静默漂移。
+#
+#   V19a  C/Python ctr_xor_off 逐字节对拍（含非对齐偏移）
+#   V19b  段存在时：锁箱后明文串必须零命中（strings 扫不到）
+#   V19c  段不存在时：不报错（向后兼容，不用字符串加密的产物合法）
+echo "── V19 .ncxs 字符串段 ──"
+
+# V19a：跨语言对拍。
+# ⚠️ 刻意让 Python 侧【独立实现】C 的 counter 推进逻辑，而不是复用
+#    lk.ctr_xor_off —— 后者会变成"同一份实现测自己"，测不出跨语言漂移。
+_v19a=$(python3 - "$LOCK" <<'PY'
+import importlib.util, hashlib, struct, sys
+spec = importlib.util.spec_from_file_location('lk', sys.argv[1])
+lk = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lk)
+KEY = bytes(range(16)); DOM = 0x03
+parts = [b"SHARED_PREF_TOKEN_V1\x00",
+         b"https://api.example.com/v2/verify\x00",
+         b"com.example.secret.Callback\x00"]
+seg = b"".join(parts)
+offs = []; o = 0
+for p in parts:
+    offs.append(o); o += len(p)
+cipher = lk.ctr_xor_off(KEY, DOM, 0, seg)   # 构建期：整段从 0 起
+def c_dec(key, dom, seg_off, data):        # 运行期：C 侧规则，独立写一遍
+    out = bytearray(); ctr = seg_off // 32; skip = seg_off % 32; i = 0
+    while i < len(data):
+        ks = hashlib.sha256(key + bytes([dom]) + struct.pack('<I', ctr)).digest()
+        j = skip
+        while j < 32 and i < len(data):
+            out.append(data[i] ^ ks[j]); i += 1; j += 1
+        skip = 0; ctr += 1
+    return bytes(out)
+bad = []
+# ① 从整段密文里按各自偏移解（主路径）
+for k, (off, want) in enumerate(zip(offs, parts)):
+    n = len(want) - 1
+    if c_dec(KEY, DOM, off, cipher[off:off+n]) != want[:n]:
+        bad.append('串%d(off=%d)' % (k, off))
+# ② 【关键】非零起点加密 → 同起点解密。这一条专门抓"忽略 seg_off"
+#    的实现——主路径从 0 起加密，忽略偏移的 bug 也能过；只有从非零
+#    偏移【加密】才暴露。2026-11-28 实测：初版对拍漏了这条，
+#    注入"ctr=0 忽略偏移"的 bug 时 V19a 仍绿（假绿）。
+for start in (17, 21, 55):
+    if start >= len(seg):
+        continue
+    tail_plain = seg[start:]
+    tail_cipher = lk.ctr_xor_off(KEY, DOM, start, tail_plain)
+    if c_dec(KEY, DOM, start, tail_cipher) != tail_plain:
+        bad.append('非零起点(off=%d)' % start)
+print('|'.join(bad) if bad else 'OK')
+PY
+)
+if [ "$_v19a" = "OK" ]; then
+    ok "V19a C/Python ctr_xor_off 对拍一致（含非对齐偏移 21/55）"
+else
+    bad "V19a 对拍失败: $_v19a —— 两侧 counter 规则不一致，解出必乱码"
+fi
+
+# V19b/V19c：产物侧（需要源码形态才能编出带 .ncxs 的 so）
+_V19D=$(mktemp -d)
+cat > "$_V19D/s.c" <<'V19SRC'
+#include "nc_guard_layout.h"
+static const char s_a[] __attribute__((section(NC_SEC_STR), used, retain))
+    = "SHARED_PREF_TOKEN_V1";
+static const char s_b[] __attribute__((section(NC_SEC_STR), used, retain))
+    = "https://api.example.com/v2/verify";
+int v19_sum(void) { return (int)(s_a[0] + s_b[0]); }
+V19SRC
+if [ "$HAS_SRC" = "1" ] && [ "$CAN_EXEC" = "1" ]; then
+    _srcs=$(ls "$GUARD_DIR"/*.c | grep -v '/nc_guard_jni\.c$' | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    if clang -fPIC -shared -Oz -DNC_GUARD_SECTIONED -I"$GUARD_DIR" \
+            "$_V19D/s.c" $_srcs -o "$_V19D/v19.so" >"$_V19D/b.log" 2>&1; then
+        # 未锁箱时必须能 strings 到明文（前置事实，否则后面的断言没意义）
+        _pre=$(strings -a "$_V19D/v19.so" | grep -c 'SHARED_PREF_TOKEN_V1' || true)
+        if [ "$_pre" -lt 1 ]; then
+            bad "V19b 未锁箱时明文串就搜不到 —— 用例写错了？"
+        else
+            # 完整锁箱：一级（加密 .ncx）→ strsec（加密 .ncxs）
+            # ⚠️ master 由 lock() 写进 .ncxhr，--strsec 必须用同一个，
+            #    否则密钥对不上 → 运行期解出乱码。这里从产物里读回来，
+            #    不靠解析日志（日志格式会变，读了迟早失效）。
+            if python3 "$LOCK" "$_V19D/v19.so" "$_V19D/a.so" --section .ncx \
+                    --from-apk "$APK" --package "$PKG_FIX" >"$_V19D/a.log" 2>&1; then
+                _m=$(python3 - "$_V19D/a.so" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+sh = struct.unpack_from('<Q', d, 0x28)[0]
+es = struct.unpack_from('<H', d, 0x3a)[0]
+en = struct.unpack_from('<H', d, 0x3c)[0]
+si = struct.unpack_from('<H', d, 0x3e)[0]
+def hdr(i): return struct.unpack_from('<IIQQQQ', d, sh + i * es)
+so = hdr(si)[4]
+for i in range(en):
+    s = hdr(i)
+    n = d[so + s[0]: d.index(b'\0', so + s[0])].decode('latin1')
+    if n == '.ncxhr':
+        print(d[s[4]:s[4]+32].hex()); break
+PY
+)
+                if [ -n "$_m" ] && python3 "$LOCK" "$_V19D/a.so" "$_V19D/b.so" \
+                        --strsec --master-hex "$_m" --from-apk "$APK" \
+                        --package "$PKG_FIX" >"$_V19D/b.log" 2>&1; then
+                    _post=$(strings -a "$_V19D/b.so" | grep -c 'SHARED_PREF_TOKEN_V1' || true)
+                    if [ "$_post" = "0" ]; then
+                        ok "V19b 锁箱后 .ncxs 已是密文（明文串零命中）"
+                    else
+                        bad "V19b 锁箱后仍能 strings 出明文串（$_post 次）—— 加密未生效"
+                    fi
+                else
+                    bad "V19b --strsec 失败"; tail -5 "$_V19D/b.log" >&2
+                fi
+            else
+                bad "V19b 一级锁箱失败"; tail -5 "$_V19D/a.log" >&2
+            fi
+        fi
+    else
+        bad "V19b 带 .ncxs 的用例编译失败"; tail -5 "$_V19D/b.log" >&2
+    fi
+else
+    skip "V19b 需要源码形态且可执行（.a 形态/X86 交叉产物跳过）"
+fi
+rm -rf "$_V19D"
+
+# V19c：向后兼容 —— 段不存在时 --strsec 不能报错
+if [ "$HAS_SRC" = "1" ] && [ -f "$ROOT/example/build/locked.so" ]; then
+    if readelf -SW "$ROOT/example/build/locked.so" 2>/dev/null | grep -q '\.ncxs'; then
+        skip "V19c 参考产物已含 .ncxs"
+    else
+        _v19c=$(mktemp -d)
+        if python3 "$LOCK" "$ROOT/example/build/locked.so" "$_v19c/x.so" \
+                --strsec --master-hex "$(printf '0%.0s' {1..64})" \
+                --cert-hex "$(printf '1%.0s' {1..64})" --package t \
+                >"$_v19c/log" 2>&1; then
+            ok "V19c 无 .ncxs 段时 --strsec 正常跳过（向后兼容）"
+        else
+            bad "V19c 无 .ncxs 段时 --strsec 报错了 —— 会拦住所有老产物"
+        fi
+        rm -rf "$_v19c"
+    fi
+else
+    skip "V19c 需要源码形态与参考产物"
+fi
 
 # ── V17 路径密文 × 生产拼接同源断言（2026-11-25 新增）──────────────────
 # 为什么单独一组且不走逃生口：

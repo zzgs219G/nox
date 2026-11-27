@@ -613,3 +613,66 @@ void ncg_ctr_xor(const uint8_t k[16], uint8_t dom,
     ncg_wipe(msg, sizeof msg);
     ncg_wipe(ks, sizeof ks);
 }
+
+
+/* 带【段内偏移】的 SHA-256-CTR：从 src 解到 dst（两者可不同）。
+ *
+ * ═══ 为什么需要这个变体，而不是复用 ncg_ctr_xor ═══════════════════════
+ *
+ * `ncg_ctr_xor` 是【整段原地】解密：counter 从 0 起，长度 = 整个缓冲区。
+ * 而字符串段（.ncxs）的用法是「从段里某一条字符串开始解 N 字节」：
+ *
+ *     .ncxs: [串A ][串B ][串C ]...
+ *     ncguard_str(串B, buf, cap) → 要从 counter = offsetof(串B) 起算
+ *
+ * 若 counter 从 0 起算，解出来的 keystream 与锁箱期加密时用的不一致
+ * → 乱码。所以必须把「段内偏移」折进 counter。
+ *
+ * ═══ counter 的取法（锁箱侧必须逐字节同规则）═══════════════════════
+ *
+ *   ctr = (seg_off + i) / 32        —— 按 32 字节块推进
+ *   ks  = SHA256(k || dom || LE32(ctr))
+ *   out[j] = in[j] ^ ks[(seg_off + j) % 32]
+ *
+ * 即：把整个段当成一条连续的 CTR 流，字符串解密只是从中间某点开始取。
+ * 这样锁箱侧只需对整段做一次流加密，运行期能任意位置单独解密。
+ *
+ * ⚠️ seg_off 必须 32 对齐才能保证两边一致 —— 由生成器保证（见
+ *    so-section-lock.py 的 --strsec：段内每条字符串都按 32 对齐填充）。
+ *    不对齐时下面的取模运算仍然正确，只是不能靠"整段一次加密"来
+ *    验证，必须逐条算。生成器选择对齐是为了简单可靠。
+ *
+ * ⚠️ 返回值：0 成功 / -1 参数非法。不加 -2 之类的细分码 —— 调用方
+ *    只有"成/败"两种处理，多码值只会让上层诊断文案错位。
+ */
+int ncg_ctr_xor_off(const uint8_t k[16], uint8_t dom, uint32_t seg_off,
+                    const uint8_t *src, uint8_t *dst, uint32_t len) {
+    if (!k || !src || !dst) return -1;
+    if (len == 0) return 0;
+
+    uint8_t msg[21], ks[32];
+    memcpy(msg, k, 16);
+    msg[16] = dom;
+
+    uint32_t ctr = seg_off / 32;
+    uint32_t skip = seg_off % 32;
+    for (uint32_t i = 0; i < len; ) {
+        msg[17] = (uint8_t)ctr;
+        msg[18] = (uint8_t)(ctr >> 8);
+        msg[19] = (uint8_t)(ctr >> 16);
+        msg[20] = (uint8_t)(ctr >> 24);
+        ksha256(msg, 21, ks);
+
+        for (uint32_t j = skip; j < 32 && i < len; j++, i++) {
+            dst[i] = (uint8_t)(src[i] ^ ks[j]);
+        }
+        skip = 0;
+        ctr++;
+    }
+
+    /* ⚠️ 必须在这里擦：ks 是本条字符串的完整 keystream，留着等于
+     *    把明文送到下一次调用。同 ncg_ctr_xor 的纪律。 */
+    ncg_wipe(msg, sizeof msg);
+    ncg_wipe(ks, sizeof ks);
+    return 0;
+}

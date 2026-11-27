@@ -88,7 +88,7 @@ fi
 #
 #    与 test.sh 的 guard_compile 不同：那边要【排除】nc_guard_jni.c
 #    （宿主未必有 jni.h），这边是 NDK 交叉编译，jni.h 必在，所以要包含。
-LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni nc_guard_xor nc_guard_crypto nc_guard_report nc_guard_decoy"
+LIB_SRCS="nc_guard_boot nc_guard_probe nc_guard_key nc_guard_paths nc_guard_jni nc_guard_xor nc_guard_crypto nc_guard_report nc_guard_decoy nc_guard_strdec"
 
 : "${ANDROID_NDK_HOME:?双 ABI 交叉编译需要 ANDROID_NDK_HOME（指向 NDK 根目录）}"
 _prebuilt="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"

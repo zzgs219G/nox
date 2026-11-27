@@ -380,7 +380,7 @@ uint32_t ncg_boot_crc32(const uint8_t *p, size_t n) {
 }
 
 /* 读 ELF 头，把差异抹平。返回 0 成功。 */
-static int ncg_elf_hdr(int fd, uint8_t *cls_out, uint64_t *shoff,
+int ncg_elf_hdr(int fd, uint8_t *cls_out, uint64_t *shoff,
                        uint16_t *shnum, uint16_t *shstrndx,
                        uint16_t *shentsize) {
     unsigned char id[EI_NIDENT];
@@ -415,7 +415,7 @@ static int ncg_elf_hdr(int fd, uint8_t *cls_out, uint64_t *shoff,
 }
 
 /* 读第 i 个段头（统一成 ncg_shdr_t）。返回 0 成功。 */
-static int ncg_elf_shdr(int fd, uint8_t cls, uint64_t shoff,
+int ncg_elf_shdr(int fd, uint8_t cls, uint64_t shoff,
                         uint16_t shentsize, int i, ncg_shdr_t *out) {
     off_t at = (off_t)shoff + (off_t)i * (off_t)shentsize;
     if (cls == 64) {

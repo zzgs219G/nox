@@ -789,6 +789,28 @@ int ncg_derive_k_so_r(const uint8_t master[32],const uint8_t cert_sha256[32],
 /* 便捷版：吃 certDER，内部 SHA256 再派生。存在的理由与
  * ncg_derive_k_so_from_der 完全相同（ksha_ctx 是不透明句柄，密文段里的
  * 调用方开不出栈对象）。 */
+/* 字符串段（.ncxs）的密钥。
+ *
+ * ⚠️ 为什么【复用 k_so 而不是新增 label】：
+ *    新增 label 要动 ncg_label_key 的 7 个基值（已被 so/mac/so_r/boot/
+ *    insn/bc/bc2 占满）、新增第 8 张密文表、同步 gen-label-tables.py 与
+ *    跨语言对拍 —— 为一把"只加密字符串"的钥匙付这个代价不值。
+ *
+ *    复用 k_so + 【不同 CTR 域】(0x03) 已足够：SHA-256-CTR 的 dom 参与
+ *    每个密钥块的哈希输入，两段用不同 dom ⇒ keystream 完全不相关，
+ *    不构成 two-time pad。这与 .ncxh(0x01) / .ncxhr(0x02) 的隔离方式
+ *    完全一致（它们也共用 k_stub_eff，只靠 dom 分离）。
+ *
+ * 攻击面影响：拿到 k_so 的攻击者本来就能解 .ncx（业务代码），
+ * 字符串只是同一份资产的另一部分，不额外泄露。
+ */
+int ncg_derive_k_str_from_cert(const uint8_t master[32],
+                               const uint8_t cert_sha256[32],
+                               const char *pkg, uint8_t out[16]) {
+    return ncg_derive_k_so(master, cert_sha256, pkg, out);
+}
+
+
 int ncg_derive_k_so_r_from_der(const uint8_t master[32],
                                const uint8_t *cert_der,size_t der_len,
                                const char *pkg,uint8_t out[16]){

@@ -79,6 +79,14 @@ int ncg_derive_k_so_r(const uint8_t master[32], const uint8_t cert_sha256[32],
                       const char *pkg, uint8_t out[16]);
 
 /* 便捷版：吃 certDER，内部 SHA256 再 HKDF。与 ncg_derive_k_so_from_der 同构。 */
+/* 字符串段（.ncxs）密钥。复用 k_so（它本来就是"业务资产"的钥匙），
+ * 靠 CTR dom=0x03 与 .ncx 的 keystream 隔离。
+ * ⚠️ 不复用 ncg_derive_k_so_from_der 是因为那个吃 certDER 并内部 SHA，
+ *    这里已有 SHA256 好的证书指纹，避免重复算。 */
+int ncg_derive_k_str_from_cert(const uint8_t master[32],
+                               const uint8_t cert_sha256[32],
+                               const char *pkg, uint8_t out[16]);
+
 int ncg_derive_k_so_r_from_der(const uint8_t master[32],
                                const uint8_t *cert_der, size_t der_len,
                                const char *pkg, uint8_t out[16]);

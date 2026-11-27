@@ -46,6 +46,21 @@ void ncg_wipe(void *p, size_t n);
  * 与 so-section-lock.py 的 _derive_boot_key() 逐字节同规则。 */
 int ncg_boot_key(const char *so_path, uintptr_t base, uint8_t out[16]);
 
+/* ELF 头/段头解析（ELF32/ELF64 双支持）。
+ *
+ * ⚠️ 2026-11-28 从 nc_guard_boot.c 的 static 改为外部可见：
+ *    .ncxs（字符串段）解密需要自己查段，而它【不能】调 .ncxh 里的
+ *    ncg_find_section（那是密文，解锁前调用 = SIGILL）。
+ *    这两个函数本来就在 .text，导出它们比复制一份 ELF 解析逻辑安全得多
+ *    —— 后者迟早会漂移（本项目已有 ELF32 那段血的教训，见 AGENTS §5.6）。
+ *
+ * ⚠️ 仍必须在 .text：ncg_boot_key 在 .ncxh 未解时就要用它。
+ */
+int ncg_elf_hdr(int fd, uint8_t *cls_out, uint64_t *shoff,
+                uint16_t *shnum, uint16_t *shstrndx, uint16_t *shentsize);
+int ncg_elf_shdr(int fd, uint8_t cls, uint64_t shoff, uint16_t shentsize,
+                 int idx, ncg_shdr_t *out);
+
 
 /* ── 以下为 ncg_stub_recover 的依赖，定义仍在 nc_guard_boot.c ────────
  * 2026-11-06 拆 ncg_stub_recover 到 crypto.c 时上移到此处。
@@ -64,6 +79,13 @@ uint32_t ncg_rd32(const volatile unsigned char *p);
 /* SHA-256-CTR 加解密（head 与 master 两段，用 dom 分域）。
  * 与 so-section-lock.py 的 ctr_xor() 逐字节一致。 */
 void ncg_ctr_xor(const uint8_t k[16], uint8_t dom, uint8_t *buf, uint32_t len);
+
+/* 带【段内偏移】的 CTR 变体：从 src 解到 dst，counter 从 seg_off/32 起。
+ * 供 .ncxs（字符串段）单独解密一条字符串用 —— 那一段是"整段一条流，
+ * 运行期从任意位置取"，不能用 ncg_ctr_xor 的"从 0 起、整段原地"。
+ * 与 so-section-lock.py 的 ctr_xor_off() 逐字节一致。 */
+int ncg_ctr_xor_off(const uint8_t k[16], uint8_t dom, uint32_t seg_off,
+                    const uint8_t *src, uint8_t *dst, uint32_t len);
 
 /* 自身代码 CRC（由 ncguard_unlock 在调用 stub 前算好，stub 折进 k_stub）。 */
 extern uint32_t ncg_self_crc;

@@ -20,6 +20,18 @@
 #define NC_SEC_HEADRO    ".ncxhr"  /* master 数据段（AWR，32B）*/
 #define NC_SEC_SLOT      ".nck"    /* 一级密钥槽*/
 #define NC_SEC_STUBSLOT  ".ncks"   /* 二级 stub 密钥槽*/
+/* 字符串段（2026-11-28 新增）—— 只放【显式标记】的敏感字符串，
+ * 构建期整段 SHA-256-CTR 加密，运行期 ncguard_str() 按需解到栈。
+ *
+ * ⚠️ 为什么单独一段而不是加密整个 .rodata：
+ *    实测云端产物 .rodata 134KB，整段加密后 zlib 从 39KB 涨到 134KB
+ *    （+242%，加密数据压不动）。而其中真正敏感的字符串只有 4.7KB，
+ *    只加密它们 APK 仅 +1.7KB（+4.3%）。
+ *    `.rodata` 剩下 115KB 是低熵的表/索引（熵≈3，本来也压不动），
+ *    加密它们零收益。
+ * ⚠️ 这是【新增】段，不改任何现有段名/偏移 → 历史产物不受影响。
+ * ⚠️ 段为空（没人标记字符串）时不产生该段，锁箱器自会跳过。 */
+#define NC_SEC_STR       ".ncxs"
 
 /* ── VMP 段（Amice 生成，本仓库 C 代码不标记它们）
  *   第一套（nox 解密链）      .ncr 解释器  .ncq 字节码  .ncs 表

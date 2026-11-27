@@ -216,6 +216,9 @@ SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
 HEAD_NAME = _LAYOUT['NC_SEC_HEAD']      # 装 unlock 本体的段
 HEAD_RO_NAME = _LAYOUT['NC_SEC_HEADRO']  # 存 master（2026-10-19 随机化）
+# 字符串段（2026-11-28）：只放显式标记的敏感字符串，构建期整段加密。
+# 与 .ncx/.ncxr 完全独立 —— 不改任何现有段名/偏移，历史产物不受影响。
+NC_SEC_STR = _LAYOUT['NC_SEC_STR']
 STUB_SLOT = _LAYOUT['NC_SEC_STUBSLOT']  # stub 的密钥槽
 STUB_MAGIC = STUB_MAGIC_SEED
 
@@ -752,6 +755,137 @@ def shannon_entropy(data: bytes) -> float:
 # 因此段长低于 ENTROPY_MIN_BYTES 时直接跳过安检，不做判断。
 ENTROPY_MIN = 7.0
 ENTROPY_MIN_BYTES = 256
+
+
+def ctr_xor_off(key: bytes, dom: int, seg_off: int, data: bytes) -> bytes:
+    """带【段内偏移】的 SHA-256-CTR —— 与 C 侧 ncg_ctr_xor_off 逐字节一致。
+
+    用途：.ncxs（字符串段）是"整段一条流，运行期从任意偏移取一条串"。
+    加密时整段从 0 起算；解密某条串时 counter 从 seg_off//32 起、
+    并在首块跳过 seg_off%32 字节 —— 两侧必须完全同规则，否则乱码。
+
+    与 ctr_xor() 的差别：那个是"从 0 起、整段原地"，这个是"可任意起点"。
+    ctr_xor_off(key, dom, 0, data) 与 ctr_xor(key, dom, data) 结果相同。
+    """
+    out = bytearray()
+    ctr = seg_off // 32
+    skip = seg_off % 32
+    i = 0
+    n = len(data)
+    while i < n:
+        ks = hashlib.sha256(
+            key + bytes([dom]) + struct.pack('<I', ctr)).digest()
+        for j in range(skip, 32):
+            if i >= n:
+                break
+            out.append(data[i] ^ ks[j])
+            i += 1
+        skip = 0
+        ctr += 1
+    return bytes(out)
+
+
+def strsec(so_path: str, out_path: str, master_hex: str,
+           cert_hex: str, package: str) -> int:
+    """加密 .ncxs 段（size-preserving）：只加密字符串，不碰 .rodata。
+
+    ═══ 为什么只加密字符串，不加密整个 .rodata ═══════════════════════
+    用户约束：「不能大量加密（否则无法利用压缩）」。
+
+    实测（云端真实产物，arm64）：
+        .rodata 134,644 B，zlib 压缩后 39,346 B
+        整段 RC4 后压缩 134,695 B  → +95,349 B（+242%）
+        只加密其中 4,734 B 字符串 → 41,034 B（+1,688 B，+4.3%）
+
+    原因：加密把数据变高熵，zlib 完全失效。而 .rodata 里 115KB 是
+    低熵的表/索引（熵≈3，本来也压不动）、14KB 高熵数据。加密它们
+    只会让 APK 暴涨，收益接近零 —— 看不出含义的字节不需要加密。
+
+    ═══ 为什么是 .ncxs 新段而不是原地改 .rodata ═══════════════════════
+    ① .rodata 里字符串与跳转表混排，原地改需要精确识别边界，
+       任何误判都会改坏常量 → 运行期崩溃且症状难定位。
+    ② 新段可以让业务代码【显式选择】哪些字符串要加密（标注即生效），
+       而不是全量扫描（那正是用户反对的"大量加密"）。
+    ③ 新段不影响任何现有段名/偏移 → 历史产物兼容。
+
+    ═══ 密钥 ═════════════════════════════════════════════════════════
+    k_so（复用）+ CTR dom=0x03。不新增 HKDF label：7 个基值已占满，
+    加一个要动 ncg_label_key + 第 8 张密文表 + 跨语言对拍，代价不值。
+    复用 k_so 不降级安全性：拿到 k_so 的攻击者本来就能解 .ncx 业务
+    代码，字符串是同一份资产的另一部分，不额外泄露。
+
+    ═══ 时序 ═════════════════════════════════════════════════════════
+    ⚠️ 必须在 lock() 【之后】：需要 master（lock 写入 .ncxhr）与证书。
+       与 lock_head() 先后无所谓（改的是不同段）。
+
+    ═══ fail-closed ══════════════════════════════════════════════════
+    · 段不存在 → 跳过（本产物不启用字符串加密，合法）
+    · 段存在但长度 0 → 报错（标记了却没内容，多半是 C 侧写错）
+    · 加密后熵 < 7.0 → 报错（说明加密未生效）
+    """
+    with open(so_path, 'rb') as f:
+        raw = f.read()
+    elf = Elf(raw)
+
+    sec = elf.find(NC_SEC_STR)
+    if sec is None:
+        print('   [strsec] 无 %s 段 —— 本产物不启用字符串加密（跳过）'
+              % NC_SEC_STR)
+        return 0
+    if sec['size'] == 0:
+        print('❌ %s 段长度为 0 —— 是否只写了 __attribute__ 却没有初值？'
+              % NC_SEC_STR, file=sys.stderr)
+        return 1
+    if not (sec['flags'] & 0x2):          # SHF_ALLOC
+        print('❌ %s 段不是 SHF_ALLOC，运行期无法定位' % NC_SEC_STR,
+              file=sys.stderr)
+        return 1
+
+    master = bytes.fromhex(master_hex)
+    cert = bytes.fromhex(cert_hex)
+    if len(master) != 32 or len(cert) != 32:
+        print('❌ --strsec 需要 32 字节 master hex 与 32 字节证书指纹 hex',
+              file=sys.stderr)
+        return 1
+
+    key = hkdf_sha256(master, cert, ('nc-so-v1' + package).encode(), 16)
+
+    plain = bytes(elf.data[sec['offset']:sec['offset'] + sec['size']])
+    cipher = ctr_xor_off(key, 0x03, 0, plain)
+    assert len(cipher) == len(plain)
+
+    elf.data[sec['offset']:sec['offset'] + sec['size']] = cipher
+
+    # 熵值安检：加密后必须高熵。低于 7.0 说明没真加密（例如段内容
+    # 本身就是重复字节，或换错了 key —— 后者会静默产出"看起来加密了"
+    # 但运行期解不开的产物）。
+    ent = _entropy(cipher)
+    if len(cipher) >= 256 and ent < 7.0:
+        print('❌ [strsec] 加密后熵仅 %.2f —— 加密未生效' % ent,
+              file=sys.stderr)
+        return 1
+    print('   [strsec] %s: %d 字节已加密（熵 %.2f）'
+          % (NC_SEC_STR, sec['size'], ent))
+
+    with open(out_path, 'wb') as f:
+        f.write(bytes(elf.data))
+    return 0
+
+
+def _entropy(b: bytes) -> float:
+    """香农熵（bit/byte）。用于判定"是否真加密"。"""
+    if not b:
+        return 0.0
+    cnt = [0] * 256
+    for x in b:
+        cnt[x] += 1
+    n = len(b)
+    e = 0.0
+    for c in cnt:
+        if c:
+            p = c / n
+            e -= p * math.log2(p)
+    return e
 
 
 def check_entropy_or_fail(elf: 'Elf', sec_name: str) -> float:
@@ -1390,6 +1524,93 @@ def _bait_specs(n):
             for i in range(n)]
 
 
+# 诱饵段基名 → 真段名。用于让随机名与真段【同名长】。
+# ⚠️ 长度一致很重要：若 .ncx(4字符) 旁边混着 4 字符和 5 字符的诱饵名，
+#    "长度参差"本身就是比原方案更明显的痕迹。
+_REAL_NAME_FOR_LEN = {
+    '.ncx': '.ncx', '.ncxh': '.ncxh', '.ncks': '.ncks', '.ncxhr': '.ncxhr',
+}
+
+
+def _rename_section_inplace(elf: 'Elf', sec, new_name: str) -> bool:
+    """原地改段名（只改 shstrtab 里的字符串，不重写 ELF 结构）。
+
+    ═══ 为什么需要这个 ═══════════════════════════════════════════════
+    用户指出的破绽：`.ncx` 无后缀、`.ncx0/.ncx1` 带数字 ——
+    任何逆向者 2 秒内就知道"无后缀的是原件"。这是段表白送的答案。
+
+    只改【诱饵】的名字就能消除它：诱饵不被任何代码引用，叫什么都可以。
+    真段必须保留 `.ncx`（解锁链按名字查），但改完后段表长这样：
+
+        .ncx    ← 真的
+        .k3f9   ← 诱饵（随机名，与 .ncx 无任何命名规律）
+        .q7f2   ← 诱饵
+
+    攻击者再也无法靠"有没有数字后缀"定位真段。
+
+    ═══ 为什么不用 objcopy --rename-section ══════════════════════════
+    实测它会重写 ELF，而 `AGENTS.md §5.4` 明确警告：lock/lock-head 已把
+    链接期 sh_addr 写进 .nck/.ncks，任何段挪动都会让运行期基址计算全错，
+    且崩溃点是 .ncxh 里的 SIGILL —— 症状完全不指向 objcopy。
+
+    本函数只改 shstrtab 里的几个字节，实测段地址/偏移【完全不变】
+    （验证：改名前 .ncx addr=0x630，改名后仍 0x630）。
+
+    ═══ 关键约束 ═══════════════════════════════════════════════════
+    ⚠️ 新名长度必须 <= 原名长度，且剩余字节补 NUL。
+       段名在 shstrtab 里是 NUL 结尾的紧凑字符串，写超长会覆盖下一个段名。
+       诱饵原名如 `.ncxh0`(6B)，所以随机名也必须 <= 6B。
+    ⚠️ 新名不能与现有任何段名冲突（否则 readelf 显示重复，反而更可疑）。
+    ⚠️ 新名不能用 `.` 结尾或含空格/非打印字符 —— readelf 会显示乱码。
+    """
+    raw = new_name.encode('ascii')
+    if len(raw) > len(sec['name']):
+        return False                      # 超长会覆盖相邻字符串
+    strh = elf.sections[elf.e_shstrndx]
+    base = strh['offset'] + sec['name_off']
+    # 原位置总占用 = 名字长度 + 1（NUL 终止符）
+    span = len(sec['name'])
+    elf.data[base:base + span] = raw + b'\x00' * (span - len(raw))
+    sec['name'] = new_name
+    return True
+
+
+def _random_section_name(elf: 'Elf', maxlen: int, taken: set,
+                         want_len: int = 0) -> str:
+    """生成与真实段名同风格、且不冲突的随机名。
+
+    ⚠️ 三条「不能做」，都是 2026-11-28 实测段表后修出来的：
+      ① 不能叫 .decoy0 / .bait0 —— 等于写「我是假的」
+      ② 不能以数字开头（如 .1ln）—— 真实段名都是字母开头
+         （.text/.rodata/.data/.bss/.got/.plt 无一例外）
+      ③ 不能长短不一（.1ln 与 .rerq 混排）—— 同一批段名长度参差，
+         比原方案（统一的 .ncx0/.ncx1）更可疑
+
+    策略：`点 + 字母开头 + 字母数字`，总长固定 want_len（= 对应真段名
+    长度）。这样段表里看起来像"同一套命名体系下的不同成员"，
+    而不是"有人随机生成的名字"。
+
+    want_len 为 0 时退化为 maxlen。
+    """
+    import string
+    import random
+    alpha = string.ascii_lowercase
+    alnum = string.ascii_lowercase + string.digits
+    want = want_len if want_len else maxlen
+    if want > maxlen or want < 3:
+        want = maxlen
+    for _ in range(200):
+        body = random.choice(alpha)                     # 首字符必须是字母
+        body += ''.join(random.choice(alnum) for _ in range(want - 2))
+        new = '.' + body
+        if len(new) != want or len(new) > maxlen:
+            continue
+        if new in taken or elf.find(new) is not None:
+            continue
+        return new
+    return ''
+
+
 def _resize_section(elf: 'Elf', sec, new_size: int) -> bool:
     """把段的 sh_size 改成 new_size（只改段表，不挪数据）。
 
@@ -1577,6 +1798,42 @@ def bait_groups(so_path: str, out_path: str, n_groups: int,
             return 1
     print('   诱饵尺寸: 真 head=%dB code=%dB；诱饵在 ±4%% 内浮动（不同值）'
           % (real_head_sz, real_code_sz))
+
+    # ── 段名随机化：消除「无后缀 = 原件」这个白送的答案 ──────────────
+    #
+    # 用户指出的破绽（2026-11-28）：`.ncx` 无后缀、`.ncx0/.ncx1` 带数字，
+    # 任何逆向者 2 秒就知道哪个是真的 —— 段表白送答案。
+    #
+    # 只改【诱饵】的名字即可：它们不被任何代码引用，叫什么都可以。
+    # 真段必须保留 `.ncx`（解锁链 ncg_find_section 按名字查），
+    # 但改完后段表变成：
+    #     .ncx    ← 真的
+    #     .k3f9   ← 诱饵，随机名，与 .ncx 无命名规律
+    #     .q7f2   ← 诱饵
+    # "没有数字后缀"这条线索彻底消失。
+    #
+    # ⚠️ 改完必须【重新收集】段引用：found 里的 dict 是 Elf 解析时的对象，
+    #    _rename_section_inplace 会同时更新 sec['name']，但后续代码用
+    #    head['offset'] / head['size'] 仍然有效（只改了名字）。
+    # ⚠️ 失败必须 fail-fast：若某个诱饵改名失败而其他成功，段表会出现
+    #    "一半随机一半带数字"的形态 —— 那比不改更可疑。
+    if n_groups > 0:
+        taken = set(s['name'] for s in elf.sections)
+        for head, slot, ro, code, idx in found:
+            for secobj in (head, slot, ro, code):
+                old_nm = secobj['name']
+                base_nm = old_nm.rstrip('0123456789')
+                want_len = len(_REAL_NAME_FOR_LEN.get(base_nm, base_nm))
+                new_nm = _random_section_name(elf, len(old_nm), taken,
+                                              want_len)
+                if not new_nm or not _rename_section_inplace(elf, secobj, new_nm):
+                    print('❌ 诱饵段 %s 改名失败 —— 拒绝产出半随机的段表'
+                          % old_nm, file=sys.stderr)
+                    return 1
+                taken.discard(old_nm)
+                taken.add(new_nm)
+        print('   诱饵段名已随机化（真段保留 %s，诱饵无命名规律）'
+              % SECTION_NAME)
 
     for gi, (head, slot, ro, code, idx) in enumerate(found):
         # 每组独立的随机密钥材料——组间绝不能复用（复用 = two-time pad）
@@ -1988,6 +2245,13 @@ def main(argv=None):
     ap.add_argument('--lock-head', action='store_true',
                     help='二级锁箱：把 unlock 本体也锁进 %s（自解谜，需先跑过一级锁箱）'
                          % HEAD_NAME)
+    ap.add_argument('--strsec', action='store_true',
+                    help='加密 %s 段（字符串段）：只加密显式标记的字符串，'
+                         '不碰 .rodata。需配合 --master-hex 与 --from-apk/'
+                         '--cert-hex。必须在 --section 之后跑。'
+                         % NC_SEC_STR)
+    ap.add_argument('--master-hex', default='',
+                    help='32 字节 master（hex）。--strsec 需要它与 lock() 一致')
     ap.add_argument('--strip-meta', action='store_true',
                     help='元数据清理：删 .eh_frame（709 个函数边界）/ .comment'
                          '（工具链指纹）/ .debug_*（源码路径）。'
@@ -2015,6 +2279,17 @@ def main(argv=None):
         cert = b'\x00' * 32
 
     try:
+        if args.strsec:
+            if not args.master_hex:
+                print('❌ --strsec 需要 --master-hex（与 lock() 用的同一个）',
+                      file=sys.stderr)
+                return 1
+            if len(cert) != 32 or not any(cert):
+                print('❌ --strsec 需要真证书（--from-apk 或 --cert-hex）',
+                      file=sys.stderr)
+                return 1
+            return strsec(args.input, args.output, args.master_hex,
+                          cert.hex(), package or '')
         if args.strip_meta:
             return strip_meta(args.input, args.output)
         if args.lock_head:
