@@ -1249,7 +1249,20 @@ if [ "$HAS_SRC" = "1" ] && python3 "$ROOT/nox" protect "$_V18D/d.c" --apk "$APK"
     else
         bad "V18b 诱饵组缺失（只有 $_v18n 组）—— nc_guard_decoy.c 没编进去？"
     fi
-    # V18a：尺寸/权限必须与真段一致
+    # V18a：诱饵与真段必须【同量级、同权限、但数值不全相同】
+    #
+    # ⚠️ 判据演进过两次，两次都是被真实破绽逼出来的：
+    #   第一版（错）：诱饵直接用链接期大小 → 真 192B vs 诱饵 8196B，
+    #                差 42 倍，`sort -k6` 一眼认出真段。
+    #   第二版（错）：改成诱饵【逐字节等于】真段 → 三份 11344B 精确相同。
+    #                这也不自然：自然编译不会产生两个字节数完全相等的段，
+    #                "数值完全相同"本身就是人造痕迹。
+    #   现在：同量级（±4% 内浮动）、不同值、真段被夹在中间 → 排不掉。
+    #
+    # 三条断言：
+    #   ① 权限（flags）必须完全一致 —— 不一致等于直接标签
+    #   ② 大小必须在真段的 ±10% 内 —— 不成簇，无法按大小排除
+    #   ③ 三份大小不能【全部相等】 —— 那是人造痕迹
     _v18bad=$(python3 - "$_V18D/v18.so" <<'PY'
 import sys, struct
 d = open(sys.argv[1], 'rb').read()
@@ -1277,14 +1290,37 @@ bad = []
 for base, ref in want.items():
     if ref is None:
         continue
+    rsize, rflags = ref
+    sizes = []
     for size, flags in got.get(base, []):
-        if (size, flags) != ref:
-            bad.append('%s 诱饵 size/flags=%s 真=%s' % (base, (size, flags), ref))
+        sizes.append(size)
+        if flags != rflags:
+            bad.append('%s 诱饵 flags=0x%x 真=0x%x（权限不同 = 直接标签）'
+                       % (base, flags, rflags))
+        # ±10% 容差：实现用 ±4%，这里留余量防微调后误报
+        lo, hi = rsize * 0.9, rsize * 1.1
+        if not (lo <= size <= hi):
+            bad.append('%s 诱饵 %dB 偏离真段 %dB 超过 10%%（可按大小排除）'
+                       % (base, size, rsize))
+    # ③ 不能全部相等（人造痕迹）
+    #
+    # ⚠️ .ncxhr 除外，这是【有意接受的取舍】：
+    #    它只有 32B 且只能缩小不能放大（放大要挪后续 sh_offset），
+    #    而 32B 的 ±10% 只有 3 字节空间 —— 任何有意义的浮动都会
+    #    超出容差，反而造出「诱饵明显比真段大」这个更明显的破绽
+    #    （2026-11-27 实测：浮到 47B 被 ② 判为偏离超 10%）。
+    #
+    #    为什么可以接受：32B 的段在任何 so 里都常见（对齐填充、小常量），
+    #    "三个 32B 段"不引人注目；而真正能定位真段的是 11KB 的 .ncx 和
+    #    4KB 的 .ncxh —— 那两段已经浮动好了。
+    #    这条降级必须显式写在这里，不能靠"忘了检查"来实现。
+    if base != '.ncxhr' and len(sizes) >= 2 and len(set(sizes)) == 1:
+        bad.append('%s 三份大小全部相等 (%d) —— 人造痕迹' % (base, sizes[0]))
 print('|'.join(bad))
 PY
 )
     if [ -z "$_v18bad" ]; then
-        ok "V18a 诱饵与真段同尺寸同权限（不可靠大小/权限区分）"
+        ok "V18a 诱饵同量级不同值同权限（大小排序无法定位真段）"
     else
         bad "V18a 诱饵暴露破绽: $_v18bad"
     fi

@@ -1488,14 +1488,28 @@ def bait_groups(so_path: str, out_path: str, n_groups: int,
               file=sys.stderr)
         return 1
 
-    # ── 尺寸对齐：诱饵段必须与真段【完全同尺寸】───────────────────
+    # ── 尺寸对齐：诱饵段必须与真段【同量级但不同值】───────────────
     #
-    # ⚠️ 这是诱饵有效性的第四个坑（实测踩过 2026-11-27）：
-    #    首次实现时真 .ncx 是 188B、诱饵 .ncx0 是 8196B —— 差 43 倍。
-    #    攻击者一条 `readelf -S` 按大小排序，立刻知道哪个是真的。
+    # ⚠️⚠️ 这里有两个互相拉扯的要求，2026-11-27 两版都没做对：
     #
-    # 对齐三件套：head / slot / ro / code 全部按真段裁到同尺寸。
-    # slot 本身就是契约固定的 112B，无需裁；head/ro/code 需要。
+    #   第一版：诱饵容量直接用链接期大小（8196B / 真段 192B）
+    #           → 差 42 倍，攻击者 `readelf -S | sort -k6` 一眼认出真段。
+    #   第二版（修完）：把诱饵裁到【与真段逐字节相等】
+    #           → 三份 11344B / 3760B 精确相同。这个也不自然：
+    #             自然编译绝不会产生两个字节数完全相等的段，
+    #             而且"数值完全相同"本身就是人造痕迹。
+    #
+    # 现在：同量级、不同值。真段 N，诱饵在 N 的 ±4% 内浮动（下限保证
+    # 不为 0）。效果：
+    #   · 按大小排序，真段既不在首也不在尾，位置随机 → 排序法失效
+    #   · 三份数值互不相同 → 没有"三胞胎"这种人造感
+    #   · 仍在同一数量级 → 不能用"大小差太多"排除诱饵
+    #
+    # ⚠️ 浮动幅度不能太大：超过 ~10% 就会形成"明显偏小/偏大"的簇，
+    #    攻击者可以按簇排除。4% 是实测下来既能打破相等、又不形成簇的值。
+    #
+    # ⚠️ 只能缩小不能放大（放大要挪数据、改后续所有 sh_offset，
+    #    会破坏已有段地址）。所以调用方给的 capacity 必须 >= 真段 × 1.04。
     real_head = elf.find(HEAD_NAME)
     real_code = elf.find(SECTION_NAME)
     real_ro = elf.find(HEAD_RO_NAME)
@@ -1503,27 +1517,66 @@ def bait_groups(so_path: str, out_path: str, n_groups: int,
         print('❌ 找不到真段（%s/%s/%s），无法对齐诱饵尺寸'
               % (HEAD_NAME, SECTION_NAME, HEAD_RO_NAME), file=sys.stderr)
         return 1
-    target_head = real_head['size']
-    target_code = real_code['size']
-    target_ro = real_ro['size']
+    real_head_sz = real_head['size']
+    real_code_sz = real_code['size']
+    real_ro_sz = real_ro['size']
+
+    def _jitter(base, idx, salt):
+        """在 base 的 ±4% 内取一个确定但看起来随机的值。
+
+        用构建期随机而非纯 idx 推导：同一份源码多次构建得到不同的
+        尺寸组合，攻击者无法用"上次构建的规律"套这次。
+        下限 clamp 到 32 字节（不能让段小到不可能是真段）。
+        """
+        span = max(1, base // 25)              # ≈4%
+        lo = max(32, base - span)
+        hi = max(lo + 1, base + span)
+        return lo + salt % (hi - lo)
 
     for head, slot, ro, code, idx in found:
-        if not _resize_section(elf, head, target_head):
+        # 每组独立随机（组间不共享，避免"三胞胎"）
+        salt_h = int.from_bytes(os.urandom(2), 'little')
+        salt_c = int.from_bytes(os.urandom(2), 'little')
+        t_head = _jitter(real_head_sz, idx, salt_h)
+        t_code = _jitter(real_code_sz, idx, salt_c)
+        # master 段：不浮动，保持 32B。
+        #
+        # ⚠️ 这里有一个必须如实记录的取舍（2026-11-27 两次试错）：
+        #
+        #   试过浮动到 32~48B（+0~16），结果 V18a 报
+        #   「.ncxhr 诱饵 47B 偏离真段 32B 超过 10%」——
+        #   32B 的 ±10% 只有 3 字节空间，任何有意义的浮动都会超出，
+        #   反而制造出「诱饵明显比真段大」这个新破绽。**比不浮动更糟。**
+        #
+        #   ⚠️ 根本限制：段只能缩小不能放大（放大要挪后续所有
+        #   sh_offset），而 32B 已是最小可用值，没有缩小空间。
+        #
+        # 为什么接受「三份相等」这个痕迹：
+        #   ① master 段只有 32 字节，攻击者不会用它做判据 ——
+        #      真正能区分的是 11KB 的 .ncx 和 4KB 的 .ncxh
+        #   ② 32B 的段在任何 so 里都常见（对齐填充、小常量），
+        #      "三个 32B 段"本身不引人注目
+        #   ③ 强行浮动引入的破绽（大小超出 ±10%）比它更明显
+        #
+        # 代价如实说：攻击者若真去比 .ncxhr 大小，仍能看出三份一致。
+        # 但这条线索的定位能力远弱于 .ncx/.ncxh 的大小 —— 那两段已经修好。
+        t_ro = real_ro_sz
+        if not _resize_section(elf, head, t_head):
             print('❌ 诱饵 %s 无法裁到 %dB（当前 %dB）—— 需调大 '
                   'nc_guard_decoy.c 的 NCG_BAIT_HEAD_PAD'
-                  % (head['name'], target_head, head['size']), file=sys.stderr)
+                  % (head['name'], t_head, head['size']), file=sys.stderr)
             return 1
-        if not _resize_section(elf, code, target_code):
+        if not _resize_section(elf, code, t_code):
             print('❌ 诱饵 %s 无法裁到 %dB（当前 %dB）—— 需调大 '
                   'NCG_BAIT_CODE_MAX'
-                  % (code['name'], target_code, code['size']), file=sys.stderr)
+                  % (code['name'], t_code, code['size']), file=sys.stderr)
             return 1
-        if not _resize_section(elf, ro, target_ro):
-            print('❌ 诱饵 %s 无法裁到 %dB' % (ro['name'], target_ro),
+        if not _resize_section(elf, ro, t_ro):
+            print('❌ 诱饵 %s 无法裁到 %dB' % (ro['name'], t_ro),
                   file=sys.stderr)
             return 1
-    print('   诱饵尺寸对齐: head=%dB code=%dB ro=%dB（与真段一致）'
-          % (target_head, target_code, target_ro))
+    print('   诱饵尺寸: 真 head=%dB code=%dB；诱饵在 ±4%% 内浮动（不同值）'
+          % (real_head_sz, real_code_sz))
 
     for gi, (head, slot, ro, code, idx) in enumerate(found):
         # 每组独立的随机密钥材料——组间绝不能复用（复用 = two-time pad）

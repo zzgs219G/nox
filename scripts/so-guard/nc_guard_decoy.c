@@ -59,6 +59,13 @@
  *    真段超了会明确报「需调大 NCG_BAIT_HEAD_PAD」，不会静默出错。 */
 #define NCG_BAIT_HEAD_PAD  16352
 
+/* 诱饵 master 段的容量上限（真段固定 32B）。
+ * 诱饵在 32~48B 之间随机 —— 必须是【大于等于】真段，因为裁只能缩小。
+ * 为什么要浮动：三份精确等于 32B 本身就是人造痕迹（V18a 抓到过）。
+ * 为什么上限只给 48B：master 段太小，浮动空间大了反而不自然
+ *   （真段 32B 而诱饵 64B 就成簇了）。 */
+#define NCG_BAIT_RO_PAD  48
+
 /* 诱饵业务代码段（.ncxN）。必须也是 AXR（可执行）——真 .ncx 是代码段，
  * 用数组会变 AR，属性不同就等于在段表上标了「这条是假的」。
  *
@@ -88,7 +95,7 @@ static void ncg_bait_head_0(void) {
 __attribute__((section(".ncks0"), used, retain, aligned(1)))
 const volatile unsigned char ncg_bait_slot_0[NC_STUB_SIZE] = {0};
 __attribute__((section(".ncxhr0"), used, retain, aligned(16)))
-volatile unsigned char ncg_bait_ro_0[32] = {0};
+volatile unsigned char ncg_bait_ro_0[NCG_BAIT_RO_PAD] = {0};
 __attribute__((section(".ncx0"), used, retain, noinline))
 static void ncg_bait_code_0(void) {
     __asm__ __volatile__(".space %c0, 0" :: "i"(NCG_BAIT_CODE_MAX));
@@ -103,7 +110,7 @@ static void ncg_bait_head_1(void) {
 __attribute__((section(".ncks1"), used, retain, aligned(1)))
 const volatile unsigned char ncg_bait_slot_1[NC_STUB_SIZE] = {0};
 __attribute__((section(".ncxhr1"), used, retain, aligned(16)))
-volatile unsigned char ncg_bait_ro_1[32] = {0};
+volatile unsigned char ncg_bait_ro_1[NCG_BAIT_RO_PAD] = {0};
 __attribute__((section(".ncx1"), used, retain, noinline))
 static void ncg_bait_code_1(void) {
     __asm__ __volatile__(".space %c0, 0" :: "i"(NCG_BAIT_CODE_MAX));
