@@ -529,6 +529,9 @@ static void ncg_rc4(const uint8_t *key, size_t keylen,
         c = S[(S[i] + S[j]) & 0xFF];
         *out++ = *in++ ^ c;
     }
+    /* 用后即毁：S 盒 + 密钥流状态是 RC4 的全部秘密，函数返回后
+     * 不应留在栈上等 dump。支持就地调用（in == out）。 */
+    ncg_wipe(S, sizeof(S));
 }
 
 /* 判断 [addr, addr+len) 覆盖的页范围内，是否存在其它 SHF_WRITE 的段。
@@ -947,7 +950,9 @@ static int ncg_verify_seg_mac(const uint8_t master[32],
  *
  * ⚠️ 语义逐字保留，特别是「数据段若与可写段同页则保持 RW」那段
  *    （2026-10-30 修 SIGSEGV 的实证结论，不要简化）。
- * ⚠️ 返回码同原实现：-8 (mprotect RW) / -9 (malloc) / -10 (mprotect 恢复) / -12 (派生)。
+ * ⚠️ 返回码：-8 (mprotect RW) / -10 (mprotect 恢复) / -12 (派生)。
+ *    -9 原为 malloc 失败；2026-11-27 改成就地解密后不再分配堆，-9 不再出现
+ *    （保留码值不复用，避免上层诊断文案错位）。
  */
 /* ── ncg_decrypt_one_seg 的上下文（2026-11-12）────────────────────────
  *
@@ -1065,12 +1070,16 @@ static int ncg_decrypt_one_seg(const void *base,
                 return -12;
             }
         }
-        uint8_t *buf = (uint8_t *)malloc(len);
-        if (!buf) { ncg_wipe(k_out, 16); return -9; }
-        ncg_rc4(segkey, 16, tgt, buf, len);
+        /* 就地解密：不再 malloc 一块临时明文堆缓冲。
+         *
+         * 旧实现 `malloc(len)` → 解密 → memcpy → free，会在堆里留下一整段
+         * 明文（.ncx 业务代码 / .ncxr 常量表），且 free 不会擦除；root/Frida
+         * 一次堆扫描即可绕过静态链直接拿到明文。
+         *
+         * ncg_rc4 的读写是逐字节锁步（*out++ = *in++ ^ c），in == out 安全。
+         * 段此前已 mprotect 成可写，就地覆盖不会额外放宽权限。 */
+        ncg_rc4(segkey, 16, tgt, tgt, len);
         ncg_wipe(segkey, sizeof(segkey));
-        memcpy(tgt, buf, len);
-        free(buf);
         if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
         /* ⚠️ 段权限恢复的坑（实测复现，别简化）
          *
@@ -1469,12 +1478,20 @@ int ncg_head_unlock(const void *self_addr) {
                                        pkg_buf, segs, nseg, has_nct, has_ncq,
                                        key);
         if (drc != 0) {
+            /* 失败也要擦：key 此时可能已是完整 k_so（前几段已解成功）。 */
+            ncg_wipe(key, sizeof(key));
+            ncg_wipe(slotdata, sizeof(slotdata));
             ncg_trace_i(NCG_TR_U15_FAIL, (long long)drc);
             return drc;
         }
         ncg_trace(NCG_TR_U15_OK);
     }
-    memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
+    /* 成功路径同样擦：此前只在失败分支擦，k_so 会一直留在栈上，
+     * 一次栈 dump 就能拿它解 .ncx/.ncxr，等于绕过整条静态链。 */
+    ncg_wipe(key, sizeof(key));
+    /* 全 96 字节都擦：旧实现只清前 16 字节（magic 区），后 80 字节仍含
+     * MAC / 包名指纹 / 诱饵槽，不符合「用后即毁」纪律。 */
+    ncg_wipe(slotdata, sizeof(slotdata));
     ncg_unlocked = 1;
     ncg_trace(NCG_TR_U16_DONE);
 
@@ -1889,6 +1906,16 @@ int ncguard_unlock(void) {
             }
         }
     }
+    /* ── 用后即毁：一级密钥槽副本 ─────────────────────────────────────
+     *
+     * slot_buf 里是【已解密】的 .ncks 内容：XOR 碎片（可重组 k_stub）、
+     * wrapped 值、代码区间元数据。此前它从读入到函数返回一直留在栈上，
+     * 一次栈 dump 就能重建二级锁箱密钥 —— 比静态逆整条链便宜得多。
+     *
+     * 位置：必须在所有使用点之后（最后一次读在自绑定 CRC 块），
+     * 且在任何 return 之前。本函数只有一个出口，放在这里即可。 */
+    ncg_wipe(slot_buf, sizeof(slot_buf));
+
     /* 死亡/结果通告（2026-11-24）：无论成败，logcat 必有一条锁箱结论。
      * 失败时这是唯一的可靠通道（文件日志撞 FUSE 竞态，见 ncg_death_notice）。 */
     ncg_death_notice(rc);

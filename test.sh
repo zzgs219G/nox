@@ -1198,6 +1198,125 @@ else
     fi
 fi
 
+# ── V18 诱饵组完整性（2026-11-27 新增）────────────────────────────────
+# 诱饵的全部价值建立在一个前提上：【攻击者无法用静态手段区分真假】。
+# 一旦某条属性不一致（大小/权限/命名/MAC 自洽性），诱饵立刻失效，
+# 而且失效是【静默】的 —— 产物照样能跑、测试照样全绿，只是防护归零。
+# 所以必须有产物侧断言，不能只靠"我觉得填对了"。
+#
+# 三组断言：
+#   V18a 段表里诱饵组与真段【同尺寸同权限】（大小差是最好认的破绽）
+#   V18b 诱饵组数 > 0（确认 nc_guard_decoy.c 真的编进去了）
+#   V18c 诱饵槽的 HMAC 自洽（攻击者的校验会通过 —— 这是诱饵有效的核心）
+#
+# ⚠️ V18c 是最关键的一条：若诱饵 HMAC 不通过，攻击者第一步就排除它，
+#    诱饵等于没做。这条断言直接模拟攻击者的校验动作。
+echo "── V18 诱饵组完整性 ──"
+_V18D=$(mktemp -d)
+cat > "$_V18D/d.c" <<'V18SRC'
+__attribute__((section(".ncx"), used, retain))
+int v18_secret(int a) { return (a ^ 0x5A) * 3 + a; }
+__attribute__((visibility("default")))
+int v18_call(int a) { return v18_secret(a); }
+V18SRC
+if [ "$HAS_SRC" = "1" ] && python3 "$ROOT/nox" protect "$_V18D/d.c" --apk "$APK" \
+        --package "$PKG_FIX" -o "$_V18D/v18.so" >"$_V18D/v18.log" 2>&1; then
+    # V18b：诱饵组数
+    _v18n=$(readelf -SW "$_V18D/v18.so" 2>/dev/null | grep -cE '\.ncxh[0-9]+ ')
+    if [ "$_v18n" -ge 2 ]; then
+        ok "V18b 诱饵组存在（$_v18n 组 head 段）"
+    else
+        bad "V18b 诱饵组缺失（只有 $_v18n 组）—— nc_guard_decoy.c 没编进去？"
+    fi
+    # V18a：尺寸/权限必须与真段一致
+    _v18bad=$(python3 - "$_V18D/v18.so" <<'PY'
+import sys, struct
+d = open(sys.argv[1], 'rb').read()
+sh = struct.unpack_from('<Q', d, 0x28)[0]
+es = struct.unpack_from('<H', d, 0x3a)[0]
+en = struct.unpack_from('<H', d, 0x3c)[0]
+si = struct.unpack_from('<H', d, 0x3e)[0]
+def hdr(i):
+    o = sh + i * es
+    return struct.unpack_from('<IIQQQQ', d, o)
+so = hdr(si)[4]
+def nm(o):
+    n = struct.unpack_from('<I', d, sh + o * es)[0]
+    return d[so + n: d.index(b'\0', so + n)].decode()
+want = {'.ncx': None, '.ncxh': None, '.ncxhr': None}
+got = {}
+for i in range(en):
+    name = nm(i)
+    f = hdr(i)
+    if name in want:
+        want[name] = (f[5], f[2])          # (size, flags)
+    elif name and name[-1].isdigit() and name.rstrip('0123456789') in want:
+        got.setdefault(name.rstrip('0123456789'), []).append((f[5], f[2]))
+bad = []
+for base, ref in want.items():
+    if ref is None:
+        continue
+    for size, flags in got.get(base, []):
+        if (size, flags) != ref:
+            bad.append('%s 诱饵 size/flags=%s 真=%s' % (base, (size, flags), ref))
+print('|'.join(bad))
+PY
+)
+    if [ -z "$_v18bad" ]; then
+        ok "V18a 诱饵与真段同尺寸同权限（不可靠大小/权限区分）"
+    else
+        bad "V18a 诱饵暴露破绽: $_v18bad"
+    fi
+    # V18c：诱饵槽 HMAC 自洽（模拟攻击者的校验）
+    # ⚠️ 一律调用 so-section-lock.py 自己的函数，不手抄算法。
+    #    手写校验脚本踩过（2026-11-27）：硬编码 FRAG_TABLE 而真相源
+    #    在 layout.h → 校验脚本自己算错，把正确的诱饵报成失败。
+    _v18mac=$(python3 - "$_V18D/v18.so" "$APK" "$LOCK" <<'PY'
+import sys, struct, zlib, importlib.util
+spec = importlib.util.spec_from_file_location('lk', sys.argv[3])
+lk = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lk)
+so = open(sys.argv[1], 'rb').read()
+elf = lk.Elf(so)
+S = {s['name']: so[s['offset']:s['offset'] + s['size']] for s in elf.sections}
+bk = lk._derive_boot_key(elf)
+TAB = lk._LAYOUT['NC_XOR_FRAG_INIT']
+bad = []
+checked = 0
+i = 0
+while '.ncxh%d' % i in S:
+    sn, hn = '.ncks%d' % i, '.ncxh%d' % i
+    if sn not in S:
+        break
+    nd = S[sn][:8] + lk.rc4(bk, S[sn][8:])
+    f16 = struct.unpack('<4H', nd[104:112])
+    xk = bytes(((f16[TAB[k]] & 0xFF) if k < 4 else ((f16[TAB[k]] >> 8) & 0xFF))
+               for k in range(8))
+    kmac = bytes(a ^ b for a, b in zip(nd[48:64], xk * 2))
+    checked += 1
+    if lk.hmac_sha256(kmac, S[hn]) != nd[64:96]:
+        bad.append(hn)
+    i += 1
+# ⚠️ checked==0 必须单独报错：脚本没找到诱饵段时输出空串，
+#    shell 侧 `[ -z ]` 会判定通过 = 假绿（2026-11-27 实测踩过）。
+if checked == 0:
+    print('NONE_CHECKED')
+else:
+    print('|'.join(bad))
+PY
+)
+    if [ -z "$_v18mac" ]; then
+        ok "V18c 诱饵槽 HMAC 自洽（攻击者校验会通过，无法靠 MAC 排除诱饵）"
+    elif [ "$_v18mac" = "NONE_CHECKED" ]; then
+        bad "V18c 未检查到任何诱饵槽 —— 断言无效（不许当通过）"
+    else
+        bad "V18c 诱饵 HMAC 不自洽: $_v18mac → 攻击者第一步就能排除诱饵"
+    fi
+else
+    skip "V18 需要源码形态且可执行（.a 形态/交叉产物跳过）"
+fi
+rm -rf "$_V18D"
+
 # ── V17 路径密文 × 生产拼接同源断言（2026-11-25 新增）──────────────────
 # 为什么单独一组且不走逃生口：
 #   v0.9.50（拼接双写 /files）与 v0.9.51（counter 位宽跨块错位）两个

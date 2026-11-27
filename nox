@@ -338,7 +338,12 @@ def do_protect(args, workdir):
     # ── 4. 二级锁箱（解锁本体）──
     step2 = os.path.join(workdir, 'step2.so')
     print('[3/5] 二级锁箱（unlock 本体）')
-    run([sys.executable, lock_py, step1, step2, '--lock-head'])
+    # ⚠️ 必须传 --from-apk：诱饵 .ncx 要用【真证书 + 真包名】派生 k_so。
+    #    不传的话诱饵 .ncx 只能用全零证书 → 攻击者拿真证书解得乱码
+    #    → 立刻排除诱饵组 → 诱饵失效（2026-11-27 实测）。
+    run([sys.executable, lock_py, step1, step2, '--lock-head',
+         '--from-apk', os.path.abspath(args.apk)] +
+        (['--package', args.package] if args.package else []))
 
     # ── 5. 元数据清理（2026-11-06 补：此前 CLI 从未调用过 --strip-meta）──
     # 为什么必须有这一步：六段加密把【字节】变成了密文，但 .eh_frame 里

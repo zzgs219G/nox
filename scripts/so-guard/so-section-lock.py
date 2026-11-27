@@ -1029,7 +1029,8 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
 
 
 # ── 二级锁箱：把 unlock 本体也锁进密文（自解谜）───────────────────
-def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
+def lock_head(so_path: str, out_path: str, force: bool = False,
+              cert: bytes = b'', package: str = '') -> int:
     """锁 .ncxh 段，并给明文 stub 写它的密钥槽。
 
     这是"把开锁器锁进它开的那只箱子"的构建期半边：
@@ -1306,6 +1307,44 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     ent = check_entropy_or_fail(elf, HEAD_NAME)
     print('   熵值安检: %.3f（下限 %.1f）✅' % (ent, ENTROPY_MIN))
 
+    # ── 诱饵组（2026-11-27）─────────────────────────────────────────
+    #
+    # 必须在真锁箱【全部完成之后】：诱饵要用真 .text 的 CRC32 做自绑定，
+    # 而 .text 在 lock_head 期间不变（只有 .ncxh/.ncxhr/.ncks 被改），
+    # 所以此时取 .text 与真路径看到的完全一致。
+    #
+    # ⚠️ 必须在 _encrypt_slots() 之后：否则诱饵槽会被 T4 的 boot_key
+    #    加密，而诱饵链的派生规则里没有这一步 → 攻击者解不出诱饵槽
+    #    → 诱饵立刻露馅（这正是「必须先做完真的再做假的」的原因）。
+    #
+    # ⚠️ 失败必须 fail-fast：诱饵段存在却填不进内容 = 段表里有 N 组
+    #    【全零】的平行段，攻击者一眼看出哪些是真的（全零的必然是没填的）。
+    #    这比不做诱饵更糟——它反过来成了「真段在这里」的路标。
+    n_bait = _detect_bait_groups(elf)
+    if n_bait > 0:
+        _txt = _text_bytes_of(elf)
+        # 先落盘再读回：诱饵段不在当前 elf 视图里被改过，直接原地改即可，
+        # 但 bait_groups 需要完整的"真锁箱已完成"状态，所以先写临时文件。
+        _tmp = out_path + '.bait.tmp'
+        with open(_tmp, 'wb') as f:
+            f.write(bytes(elf.data))
+        if bait_groups(_tmp, _tmp, n_bait, _txt, cert, package) != 0:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            print('❌ 诱饵生成失败 —— 拒绝产出「有诱饵段但没内容」的产物'
+                  '（那本身就是真段路标）', file=sys.stderr)
+            return 1
+        with open(_tmp, 'rb') as f:
+            elf.data = bytearray(f.read())
+        try:
+            os.unlink(_tmp)
+        except OSError:
+            pass
+    else:
+        print('   诱饵: 0 组（nc_guard_decoy.c 未编入或 NCG_BAIT_N=0）')
+
     with open(out_path, 'wb') as f:
         f.write(bytes(elf.data))
 
@@ -1317,6 +1356,415 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
           % (slot['addr'], head['addr'], head['size']))
     print('   ⚠️ 静态视角：unlock 本体已不可读，只剩明文 stub')
     return 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 诱饵组（bait groups）—— 拉长攻击路径
+# ══════════════════════════════════════════════════════════════════════
+#
+# 设计目标：让「零信息静态逆向」从「认出唯一一组加密段」变成
+# 「在 N+1 组同构段里逐组排除」。核心不是挡住，是把时间转移到错路上。
+#
+# 关键纪律（缺一条诱饵就失效）：
+#   ① 结构自洽：诱饵槽里的 expect_mac_head 必须用【诱饵自己的】
+#      k_mac_head 正确计算。攻击者的 HMAC 校验会通过 → 他确信走对了。
+#   ② 内容可信：诱饵 head 解出来必须是【真实 ARM64 代码】（从 .text
+#      抄一段），能反汇编、序言合法 → 他确信解开了。
+#   ③ 最后才失败：只有用诱饵 master 派生 k_so 解 .ncx 时才失败。
+#      此时他已投入大量工作，会怀疑【自己实现错了】而不是怀疑诱饵。
+#
+# 若违反 ①②（比如填随机字节），攻击者解出来是乱码，5 秒排除 → 等于没做。
+#
+# ⚠️ 诱饵 master 必须是随机的：若与真 master 相同，等于把真 master
+#    多抄了 N 份，攻击者用诱饵链反而直接命中。
+
+def _bait_specs(n):
+    """返回 [(head_name, slot_name, ro_name, code_name, idx), ...]。
+
+    ⚠️ 段名必须与真段【平行】（.ncx → .ncx0），不能叫 .decoy/.bait——
+    那等于在段表上写「这条是假的」。
+    ⚠️ 与 nc_guard_decoy.c 的 section 名逐字一致。改这个名单
+    必须同步那个 .c 文件，以及 test.sh 的 V18 断言。
+    """
+    return [('.ncxh%d' % i, '.ncks%d' % i, '.ncxhr%d' % i, '.ncx%d' % i, i)
+            for i in range(n)]
+
+
+def _resize_section(elf: 'Elf', sec, new_size: int) -> bool:
+    """把段的 sh_size 改成 new_size（只改段表，不挪数据）。
+
+    ⚠️ 为什么必须这么做：诱饵段在 C 里声明成固定大小（8192B 的 .ncx0），
+    而真 .ncx 实测只有 188B。若不裁，段表上是
+        .ncx   0xbc    ← 真
+        .ncx0  0x2004  ← 诱饵
+    大小差 43 倍，攻击者 `readelf -S | sort -k2` 一眼就认出哪个是真的，
+    诱饵全部失效。裁到同尺寸后两组无法区分。
+
+    ⚠️ 只能缩小不能放大（放大要挪数据、改 sh_offset，会破坏后续段）。
+    调用方负责保证 new_size <= 当前 size。
+
+    ⚠️ 改了 sh_size 之后，段内超出 new_size 的字节仍在文件里，
+    但不再是"段内容" —— 这不影响任何东西：诱饵不被任何代码引用，
+    也没有程序会去读它。攻击者按段表读，看到的正是 new_size 字节。
+    """
+    if new_size > sec['size']:
+        return False
+    off = elf.e_shoff + (sec['index'] if 'index' in sec else 0) * elf.e_shentsize
+    # 用段在 sections 列表中的位置定位（Elf 解析时未存 index，这里回溯）
+    idx = None
+    for i, s in enumerate(elf.sections):
+        if s is sec:
+            idx = i
+            break
+    if idx is None:
+        return False
+    off = elf.e_shoff + idx * elf.e_shentsize
+    if elf.is64:
+        # Elf64_Shdr: name(4) type(4) flags(8) addr(8) offset(8) size(8) ...
+        # sh_size 在偏移 32
+        struct.pack_into('<Q', elf.data, off + 32, new_size)
+    else:
+        # Elf32_Shdr: name(4) type(4) flags(4) addr(4) offset(4) size(4) ...
+        # sh_size 在偏移 20
+        struct.pack_into('<I', elf.data, off + 20, new_size)
+    sec['size'] = new_size
+    return True
+
+
+def bait_groups(so_path: str, out_path: str, n_groups: int,
+                text_src: bytes = b'', cert: bytes = b'',
+                package: str = '') -> int:
+    """给诱饵段填入自洽内容（在 --lock-head 之后调用）。
+
+    参数：
+      text_src  用于派生诱饵 head 明文的【真实代码字节】。必须来自
+                已链接的 .text（攻击者反汇编确认是 ARM64 后才会相信）。
+      cert      真证书 SHA-256（32B）。诱饵 .ncx 必须用【真证书】派生
+                k_so —— 否则攻击者拿真证书解得乱码，立刻排除这组。
+      package   真包名。同上，HKDF info 里含包名。
+
+    返回 0 成功 / 1 失败。**失败必须 fail-fast**：静默跳过会让「以为
+    加了诱饵其实没加」重演（.comment 失效三个月那次就是这类错误）。
+    """
+    if len(cert) != 32:
+        print('❌ bait_groups 需要 32 字节证书（诱饵 .ncx 必须用真证书派生）',
+              file=sys.stderr)
+        return 1
+    with open(so_path, 'rb') as f:
+        raw = f.read()
+    elf = Elf(raw)
+
+    specs = _bait_specs(n_groups)
+    # 先确认全部段都在——缺一个就整体失败，不做「能填几个填几个」的
+    # 部分成功（那会产生「有的组像真的、有的明显是假的」的段表，
+    # 反而给攻击者送筛除线索）。
+    found = []
+    for head_n, slot_n, ro_n, code_n, idx in specs:
+        h, s = elf.find(head_n), elf.find(slot_n)
+        r, c = elf.find(ro_n), elf.find(code_n)
+        if h is None or s is None or r is None or c is None:
+            print('❌ 诱饵段缺失：%s / %s / %s / %s（nc_guard_decoy.c 是否编入？'
+                  'NCG_BAIT_N 是否为 %d？）'
+                  % (head_n, slot_n, ro_n, code_n, n_groups), file=sys.stderr)
+            return 1
+        if h['size'] == 0 or s['size'] < _LAYOUT['NC_STUB_SIZE'] or r['size'] < 32:
+            print('❌ 诱饵段 %s 尺寸异常（head=%d slot=%d ro=%d）'
+                  % (head_n, h['size'], s['size'], r['size']), file=sys.stderr)
+            return 1
+        found.append((h, s, r, c, idx))
+
+    # ── 诱饵 head 的明文：必须是真实 ARM64 代码 ─────────────────────
+    #
+    # 为什么抄 .text：攻击者验证「解开没有」的标准动作是
+    # `objdump -D -b binary -m aarch64` 看能否反汇编成合法指令。
+    # 若诱饵明文是随机字节，反汇编会得到海量非法指令 → 立刻排除。
+    # 抄一段真实 .text 后，他将看到 stp/sub/ldr 等标准序言，无法区分。
+    #
+    # ⚠️ 不能抄 .text 的【开头】：那是明文，攻击者可以逐字节比对，
+    #    发现诱饵 head 明文与 .text 首字节相同 → 立刻识破是复制。
+    #    所以从 .text 中段取，且每组的取法不同。
+    if not text_src:
+        print('❌ bait_groups 缺少 .text 样本（无法构造可信的诱饵明文）',
+              file=sys.stderr)
+        return 1
+
+    # ── 尺寸对齐：诱饵段必须与真段【完全同尺寸】───────────────────
+    #
+    # ⚠️ 这是诱饵有效性的第四个坑（实测踩过 2026-11-27）：
+    #    首次实现时真 .ncx 是 188B、诱饵 .ncx0 是 8196B —— 差 43 倍。
+    #    攻击者一条 `readelf -S` 按大小排序，立刻知道哪个是真的。
+    #
+    # 对齐三件套：head / slot / ro / code 全部按真段裁到同尺寸。
+    # slot 本身就是契约固定的 112B，无需裁；head/ro/code 需要。
+    real_head = elf.find(HEAD_NAME)
+    real_code = elf.find(SECTION_NAME)
+    real_ro = elf.find(HEAD_RO_NAME)
+    if real_head is None or real_code is None or real_ro is None:
+        print('❌ 找不到真段（%s/%s/%s），无法对齐诱饵尺寸'
+              % (HEAD_NAME, SECTION_NAME, HEAD_RO_NAME), file=sys.stderr)
+        return 1
+    target_head = real_head['size']
+    target_code = real_code['size']
+    target_ro = real_ro['size']
+
+    for head, slot, ro, code, idx in found:
+        if not _resize_section(elf, head, target_head):
+            print('❌ 诱饵 %s 无法裁到 %dB（当前 %dB）—— 需调大 '
+                  'nc_guard_decoy.c 的 NCG_BAIT_HEAD_PAD'
+                  % (head['name'], target_head, head['size']), file=sys.stderr)
+            return 1
+        if not _resize_section(elf, code, target_code):
+            print('❌ 诱饵 %s 无法裁到 %dB（当前 %dB）—— 需调大 '
+                  'NCG_BAIT_CODE_MAX'
+                  % (code['name'], target_code, code['size']), file=sys.stderr)
+            return 1
+        if not _resize_section(elf, ro, target_ro):
+            print('❌ 诱饵 %s 无法裁到 %dB' % (ro['name'], target_ro),
+                  file=sys.stderr)
+            return 1
+    print('   诱饵尺寸对齐: head=%dB code=%dB ro=%dB（与真段一致）'
+          % (target_head, target_code, target_ro))
+
+    for gi, (head, slot, ro, code, idx) in enumerate(found):
+        # 每组独立的随机密钥材料——组间绝不能复用（复用 = two-time pad）
+        k_stub_g = os.urandom(16)
+        k_mac_g = os.urandom(16)
+        master_g = os.urandom(32)
+        # 每组的 XOR_KEY 也独立，避免靠"碎片相同"识别真段
+        xkey_g = os.urandom(8)
+
+        # 诱饵 head 明文：必须【以真实函数序言开头】的 .text 片段。
+        # 详见 _pick_code_region 的注释（实测踩过：随便取一段会落在
+        # 字面量池，反汇编出非法指令，诱饵被一眼识破）。
+        headlen = head['size']
+        plain = _pick_code_region(text_src, headlen, idx)
+        assert len(plain) == headlen
+
+        # 代码自绑定：与真路径同构（CRC32(.text) 折进密钥）。
+        # ⚠️ 用同一个 .text 的 CRC，因为诱饵槽里的 code_addr 也指向 .text——
+        #    这样攻击者算出来的 CRC 与真路径一致，不会因「CRC 对不上」露馅。
+        text = elf.find('.text')
+        code_crc = zlib.crc32(bytes(text_src)) & 0xFFFFFFFF
+        # ⚠️ 这里用诱饵自己的 k_stub，但折叠规则与真路径逐字节相同
+        k_stub_eff = bytes(
+            k_stub_g[i] ^ ((code_crc >> ((i & 3) * 8)) & 0xFF) for i in range(16)
+        )
+
+        # 用与真路径【完全相同】的算法加密诱饵 head
+        head_cipher = ctr_xor(k_stub_eff, CTR_DOM_HEAD, plain)
+        elf.data[head['offset']:head['offset'] + headlen] = head_cipher
+        # ── 诱饵业务代码段（.ncxN）──────────────────────────────────
+        #
+        # 为什么必须有它：若只有 .ncx 一份、诱饵 head 有 N 份，攻击者
+        # 发现「解 .ncx 的段只有一组」就能直接锁定真链，诱饵全部白做。
+        # 加了诱饵 .ncx 后，段表里出现 N+1 组完整的 (.ncx,.ncxh,.ncks,.ncxhr)
+        # 四元组，他必须逐组跑完全链才能排除。
+        #
+        # 加密方式必须与真 .ncx 【逐字节同构】：
+        #   k_so = HKDF(master_g, SHA256(certDER), "nc-so-v1" + pkg)
+        #   cipher = RC4(k_so, plain)
+        # 攻击者按同一规则解，会得到合法 ARM64 代码（因为明文是从 .text
+        # 抄的真实函数），从而确信这组是真的 —— 直到他去执行它。
+        #
+        # ⚠️ 明文不能用 _pick_code_region 的同一段（否则各组 .ncx 明文相同，
+        #    攻击者一比就知道是复制的）。用不同 seed 错开。
+        code_len = code['size']
+        code_plain = _pick_code_region(text_src, code_len, idx + max(1, n_groups))
+        assert len(code_plain) == code_len
+        # 与真路径同规则派生 k_so（cert 与 pkg 在诱饵这里无关紧要 ——
+        # 攻击者会用真证书算，若我们不用真证书，他解得乱码就会排除。
+        # 所以这里必须用【真证书 + 真包名】派生，才能让他解得通。）
+        k_so_g = derive_app_keys(master_g, cert, package)['so']
+        code_cipher = rc4(k_so_g, code_plain)
+        elf.data[code['offset']:code['offset'] + code_len] = code_cipher
+        # 诱饵 master 用同样方式锁（dom 相同——攻击者按同样规则解）
+        ro_cipher = ctr_xor(k_stub_eff, CTR_DOM_HEADRO, master_g)
+        elf.data[ro['offset']:ro['offset'] + 32] = ro_cipher
+
+        # ── 关键：expect_mac_head 用【诱饵自己的】k_mac_head 正确计算 ──
+        # 这一行决定了诱饵值不值得做。若这里填 0 或随机值，
+        # 攻击者的 HMAC 校验必然失败 → 立刻排除这组 → 诱饵无效。
+        expect_mac_g = hmac_sha256(k_mac_g, head_cipher)
+        wrapped_g = bytes(b ^ xkey_g[i % len(xkey_g)]
+                          for i, b in enumerate(k_stub_g))
+        wrapped_mac_g = bytes(b ^ xkey_g[i % len(xkey_g)]
+                              for i, b in enumerate(k_mac_g))
+
+        # ── 诱饵碎片区：必须按 C 侧 FRAG_TABLE 规则反推生成 ──────────
+        #
+        # ⚠️⚠️ 这是最容易写错、且错了诱饵就完全失效的一处。
+        #
+        # 攻击者解诱饵槽的流程与解真槽【完全一样】：
+        #   frag[104:112) → 按 NC_XOR_FRAG 查表重组成 XOR_KEY
+        #   → k_stub = wrapped ^ XOR_KEY → 解 head
+        #
+        # 所以诱饵碎片必须满足：按同一张表重组后 == xkey_g。
+        # 若直接写 xkey_g 的原始字节，重组结果会是别的值 → k_stub 错
+        # → head 解出乱码 → 攻击者 5 秒排除这组 → 诱饵白做。
+        #
+        # 生成规则与真路径逐字节相同（见 lock_head 里 frag_slots 那段）：
+        #   逻辑字节 i 的真实值放在 frag[FRAG_TABLE[i]] 的低 8 位（i<4）
+        #   或高 8 位（i>=4）
+        import struct as _s
+        frag_table = _LAYOUT.get('NC_XOR_FRAG_INIT')
+        if not frag_table or len(frag_table) != 8:
+            print('❌ NC_XOR_FRAG_INIT 缺失，无法生成自洽的诱饵碎片',
+                  file=sys.stderr)
+            return 1
+        frag_slots = [None, None, None, None]
+        for logical, slot_idx in enumerate(frag_table):
+            target = xkey_g[logical]
+            placed = frag_slots[slot_idx]
+            if logical < 4:
+                hi = (placed >> 8) if placed is not None else os.urandom(1)[0]
+                frag_slots[slot_idx] = (hi << 8) | target
+            else:
+                lo = (placed & 0xFF) if placed is not None else os.urandom(1)[0]
+                frag_slots[slot_idx] = (target << 8) | lo
+        frag_bytes = b''.join(
+            _s.pack('<H', v if v is not None else int.from_bytes(os.urandom(2), 'little'))
+            for v in frag_slots)
+        # 自检：按攻击者会用的规则重组，必须 == xkey_g。
+        # 这条断言是诱饵有效性的最后一道保险——它失败说明诱饵会在
+        # 解 head 阶段就露馅（而不是在解 .ncx 阶段），价值归零。
+        _chk = bytearray(8)
+        for logical, slot_idx in enumerate(frag_table):
+            v = _s.unpack('<H', frag_bytes[slot_idx * 2: slot_idx * 2 + 2])[0]
+            _chk[logical] = (v & 0xFF) if logical < 4 else ((v >> 8) & 0xFF)
+        if bytes(_chk) != xkey_g:
+            print('❌ 诱饵碎片自检失败：按 FRAG_TABLE 重组 != 预期 XOR_KEY',
+                  file=sys.stderr)
+            return 1
+
+        # 诱饵槽：与真 .ncks 逐字段同构
+        import struct as _s2
+        blob = (STUB_MAGIC_SEED
+                + wrapped_g
+                + _s2.pack('<I', slot['addr'])     # stub_sh_addr（指向自己）
+                + _s2.pack('<I', head['addr'])
+                + _s2.pack('<I', headlen)
+                + _s2.pack('<I', text['addr'])     # code_addr：指向真 .text
+                + _s2.pack('<I', text['size'])     # code_len
+                + _s2.pack('<I', 0)
+                + wrapped_mac_g
+                + expect_mac_g
+                + _s2.pack('<I', ro['addr'])
+                + _s2.pack('<I', 32)
+                + frag_bytes)                      # 碎片区 8 字节（NC_OFF_FRAGS）
+        if len(blob) != _LAYOUT['NC_STUB_SIZE']:
+            print('❌ 诱饵槽长度 %d != %d'
+                  % (len(blob), _LAYOUT['NC_STUB_SIZE']), file=sys.stderr)
+            return 1
+
+        # ⚠️⚠️ 诱饵槽也必须过 T4（boot_key RC4），与真 .ncks 一模一样。
+        #
+        # 这一处是诱饵有效性的第二个坑（第一个是碎片重构规则）：
+        # 攻击者解【任何】槽的第一步都是
+        #     slot_plain = magic + rc4(boot_key, slot[8:])
+        # 因为真槽就是这么加密的（_encrypt_slots）。
+        # 若诱饵槽写明文，攻击者对诱饵也做一次 rc4 → 拿到乱码碎片
+        # → XOR_KEY 错 → k_stub 错 → head 乱码 → 第一步就排除诱饵。
+        #
+        # 所以诱饵必须复现「锁箱期加密」这一步，让攻击者的解密【成功】。
+        boot_key_g = _derive_boot_key(elf)
+        enc = rc4(boot_key_g, bytes(blob[_LAYOUT['NC_OFF_FRAGS_ENC']:]))
+        blob_final = blob[:_LAYOUT['NC_OFF_FRAGS_ENC']] + enc
+        elf.data[slot['offset']:slot['offset'] + len(blob_final)] = blob_final
+        # 每组独立报告（排障需要知道哪一组填了、多大）
+        print('   诱饵组 %d: %s/%s/%s 已填入（head=%dB，MAC 自洽）'
+              % (idx, head['name'], slot['name'], ro['name'], headlen))
+
+    with open(out_path, 'wb') as f:
+        f.write(bytes(elf.data))
+    print('✅ 诱饵: %d 组已生成 → %s' % (len(found), out_path))
+    print('   攻击者需逐组跑完整派生链才能排除，单组成本 ≈ 真链')
+    return 0
+
+
+def _text_bytes_of(elf: 'Elf') -> bytes:
+    """取 .text 内容（供诱饵构造可信明文）。缺段返回空。"""
+    t = elf.find('.text')
+    if t is None or t['size'] == 0:
+        return b''
+    return bytes(elf.data[t['offset']:t['offset'] + t['size']])
+
+
+# ── 诱饵明文取样：必须落在【真正的函数入口】──────────────────────────
+#
+# ⚠️⚠️ 这是诱饵有效性的第三个坑，也是最隐蔽的一个。
+#
+# 攻击者判断「解出来是不是代码」的标准动作是反汇编前几条指令。
+# 若诱饵从 .text 中段随便取一段，很可能取到字面量池 / 跳转表 /
+# 长指令中间 —— 反汇编出来是 `0x0b0d016b` 这类非法指令，
+# 他立刻知道「这组是假的」，诱饵白做。
+#
+# 实测踩过（2026-11-27）：诱饵0 取 .text[5728:] 落在字面量池，
+# 解出来前 16 字节 `6b010d0b 6b010c0b 4b4100b9 efffff17` —— 0/4 合法。
+#
+# 修法：只在【函数序言签名】处取样。ARM64 两种标准序言：
+#   stp x29, x30, [sp, #-N]!   编码 0xA9..7BFD（低 16 位 = 0x7BFD）
+#   sub sp, sp, #N             编码 0xD10.....
+# 这类字节序列在 .text 里有很多（每个非叶函数都有），取之即得合法代码。
+
+_ARM64_PROLOGUE_STP = 0xA9   # stp 家族高字节
+_ARM64_PROLOGUE_SUBSP = 0xD1  # sub (immediate) 高字节
+
+
+def _is_prologue_at(text: bytes, off: int) -> bool:
+    """判断 text[off:off+4] 是否是 ARM64 函数序言的第一条指令。"""
+    if off + 4 > len(text):
+        return False
+    import struct as _s
+    w = _s.unpack_from('<I', text, off)[0]
+    # stp x29, x30, [sp, #-N]!  →  1010 1001 1xxx xxxx 0111 1011 1111 1101
+    if (w & 0xFFC07FFF) == 0xA9807BFD:
+        return True
+    # sub sp, sp, #imm  →  1101 0001 00xx xxxx xxxx xxxx xxx1 1111
+    if (w & 0xFF8003FF) == 0xD10003FF:
+        return True
+    return False
+
+
+def _pick_code_region(text: bytes, want: int, seed: int) -> bytes:
+    """从 .text 里挑一段【以真实函数序言开头】的 want 字节。
+
+    找不到合格序言时退化为按 seed 取样并给出警告（调用方应 fail-fast，
+    这里只保证不返回垃圾）。返回长度恒为 want。
+    """
+    if want <= 0:
+        return b''
+    cands = [o for o in range(0, max(1, len(text) - 16), 4)
+             if _is_prologue_at(text, o)]
+    if not cands:
+        return text[:want] if len(text) >= want else (text * (want // max(1, len(text)) + 1))[:want]
+    # 用 seed 决定挑第几个，保证每组取到不同位置（避免诱饵之间明文相同 ——
+    # 三组 head 明文一样会立刻暴露「这是复制粘贴的诱饵」）
+    off = cands[seed % len(cands)]
+    if off + want <= len(text):
+        return text[off:off + want]
+    # 尾部不够长，拼一圈（仍以序言开头，前 want 字节内都是真实指令）
+    return (text[off:] + text[:want])[:want]
+
+
+def _detect_bait_groups(elf: 'Elf') -> int:
+    """数产物里实际存在几组诱饵段（.ncxhN/.ncksN/.ncxhrN 三个都在才算一组）。
+
+    ⚠️ 不能靠 NCG_BAIT_N 宏取数：宏在 C 编译单元里，Python 侧看不到，
+    而且产物可能是用旧版 nc_guard_decoy.c 编的（组数不同）。
+    以【产物段表为准】才与"实际要填几组"一致。
+
+    只有三件套齐全才计入：缺一组的产物无法构成"平行同构"的干扰，
+    强行填反而会在段表上留下不对称痕迹。
+    """
+    n = 0
+    while True:
+        if (elf.find('.ncxh%d' % n) is not None
+                and elf.find('.ncks%d' % n) is not None
+                and elf.find('.ncxhr%d' % n) is not None):
+            n += 1
+        else:
+            break
+    return n
 
 
 # ── 元数据清理：删 .eh_frame / 源码路径（2026-11-02）──────────────────
@@ -1480,7 +1928,8 @@ def main(argv=None):
         if args.strip_meta:
             return strip_meta(args.input, args.output)
         if args.lock_head:
-            return lock_head(args.input, args.output, args.force)
+            return lock_head(args.input, args.output, args.force,
+                             cert, package)
         return lock(args.input, args.output, args.section, cert,
                     package, args.force, args.dry_run)
     except ElfError as e:
